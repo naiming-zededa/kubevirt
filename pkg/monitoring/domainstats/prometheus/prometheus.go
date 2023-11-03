@@ -43,11 +43,11 @@ import (
 
 const (
 	PrometheusCollectionTimeout            = vms.CollectionTimeout
-	MigrateVmiDataRemainingMetricName      = "kubevirt_migrate_vmi_data_remaining_bytes"
-	MigrateVmiDataProcessedMetricName      = "kubevirt_migrate_vmi_data_processed_bytes"
-	MigrateVmiDirtyMemoryRateMetricName    = "kubevirt_migrate_vmi_dirty_memory_rate_bytes"
-	MigrateVmiMemoryTransferRateMetricName = "kubevirt_migrate_vmi_memory_transfer_rate_bytes"
-	MigrateVmiDiskTransferRateMetricName   = "kubevirt_migrate_vmi_disk_transfer_rate_bytes"
+	MigrateVmiDataRemainingMetricName      = "kubevirt_vmi_migration_data_remaining_bytes"
+	MigrateVmiDataProcessedMetricName      = "kubevirt_vmi_migration_data_processed_bytes"
+	MigrateVmiDirtyMemoryRateMetricName    = "kubevirt_vmi_migration_dirty_memory_rate_bytes"
+	MigrateVmiMemoryTransferRateMetricName = "kubevirt_vmi_migration_disk_transfer_rate_bytes"
+	MigrateVmiDiskTransferRateMetricName   = "kubevirt_vmi_migration_memory_transfer_rate_bytes"
 )
 
 var (
@@ -69,7 +69,7 @@ var (
 
 func tryToPushMetric(desc *prometheus.Desc, mv prometheus.Metric, err error, ch chan<- prometheus.Metric) {
 	if err != nil {
-		log.Log.V(4).Warningf("Error creating the new const metric for %s: %s", desc, err)
+		log.Log.Warningf("Error creating the new const metric for %s: %s", desc, err)
 		return
 	}
 	ch <- mv
@@ -150,9 +150,18 @@ func (metrics *vmiMetrics) updateMemory(mem *stats.DomainStatsMemory) {
 		)
 	}
 
+	if mem.CachedSet {
+		metrics.pushCommonMetric(
+			"kubevirt_vmi_memory_cached_bytes",
+			"The amount of memory that is being used to cache I/O and is available to be reclaimed, corresponds to the sum of `Buffers` + `Cached` + `SwapCached` in `/proc/meminfo`.",
+			prometheus.GaugeValue,
+			float64(mem.Cached)*1024,
+		)
+	}
+
 	if mem.SwapInSet {
 		metrics.pushCommonMetric(
-			"kubevirt_vmi_memory_swap_in_traffic_bytes_total",
+			"kubevirt_vmi_memory_swap_in_traffic_bytes",
 			"The total amount of data read from swap space of the guest in bytes.",
 			prometheus.GaugeValue,
 			float64(mem.SwapIn)*1024,
@@ -161,7 +170,7 @@ func (metrics *vmiMetrics) updateMemory(mem *stats.DomainStatsMemory) {
 
 	if mem.SwapOutSet {
 		metrics.pushCommonMetric(
-			"kubevirt_vmi_memory_swap_out_traffic_bytes_total",
+			"kubevirt_vmi_memory_swap_out_traffic_bytes",
 			"The total amount of memory written out to swap space of the guest in bytes.",
 			prometheus.GaugeValue,
 			float64(mem.SwapOut)*1024,
@@ -170,7 +179,7 @@ func (metrics *vmiMetrics) updateMemory(mem *stats.DomainStatsMemory) {
 
 	if mem.MajorFaultSet {
 		metrics.pushCommonMetric(
-			"kubevirt_vmi_memory_pgmajfault",
+			"kubevirt_vmi_memory_pgmajfault_total",
 			"The number of page faults when disk IO was required. Page faults occur when a process makes a valid access to virtual memory that is not available. When servicing the page fault, if disk IO is required, it is considered as major fault.",
 			prometheus.CounterValue,
 			float64(mem.MajorFault),
@@ -179,7 +188,7 @@ func (metrics *vmiMetrics) updateMemory(mem *stats.DomainStatsMemory) {
 
 	if mem.MinorFaultSet {
 		metrics.pushCommonMetric(
-			"kubevirt_vmi_memory_pgminfault",
+			"kubevirt_vmi_memory_pgminfault_total",
 			"The number of other page faults, when disk IO was not required. Page faults occur when a process makes a valid access to virtual memory that is not available. When servicing the page fault, if disk IO is NOT required, it is considered as minor fault.",
 			prometheus.CounterValue,
 			float64(mem.MinorFault),
@@ -206,7 +215,7 @@ func (metrics *vmiMetrics) updateMemory(mem *stats.DomainStatsMemory) {
 
 	if mem.TotalSet {
 		metrics.pushCommonMetric(
-			"kubevirt_vmi_memory_domain_bytes_total",
+			"kubevirt_vmi_memory_domain_bytes",
 			"The amount of memory in bytes allocated to the domain. The `memory` value in domain xml file.",
 			prometheus.GaugeValue,
 			float64(mem.Total)*1024,
@@ -215,54 +224,57 @@ func (metrics *vmiMetrics) updateMemory(mem *stats.DomainStatsMemory) {
 }
 
 func (metrics *vmiMetrics) updateCPUAffinity(cpuMap [][]bool) {
-	affinityLabels := []string{}
-	affinityValues := []string{}
+	affinityCount := 0.0
 
 	for vidx := 0; vidx < len(cpuMap); vidx++ {
 		for cidx := 0; cidx < len(cpuMap[vidx]); cidx++ {
-			affinityLabels = append(affinityLabels, fmt.Sprintf("vcpu_%v_cpu_%v", vidx, cidx))
-			affinityValues = append(affinityValues, fmt.Sprintf("%t", cpuMap[vidx][cidx]))
+			if cpuMap[vidx][cidx] {
+				affinityCount++
+			}
 		}
 	}
 
 	metrics.pushCustomMetric(
-		"kubevirt_vmi_cpu_affinity",
-		"Details the cpu pinning map via boolean labels in the form of vcpu_X_cpu_Y.",
-		prometheus.CounterValue, 1,
-		affinityLabels,
-		affinityValues,
+		"kubevirt_vmi_node_cpu_affinity",
+		"Number of VMI CPU affinities to node physical cores.",
+		prometheus.GaugeValue, affinityCount,
+		nil, nil,
 	)
+}
+
+func nanosecondsToSeconds(ns uint64) float64 {
+	return float64(ns) / 1000000000
 }
 
 func (metrics *vmiMetrics) updateCPU(vmi *k6tv1.VirtualMachineInstance, domainCPUStats *stats.DomainStatsCPU) {
 	if !domainCPUStats.TimeSet && !domainCPUStats.UserSet && !domainCPUStats.SystemSet {
-		log.Log.V(4).Warningf("No domain CPU stats is set for %s VMI.", vmi.Name)
+		log.Log.Warningf("No domain CPU stats is set for %s VMI.", vmi.Name)
 	}
 
 	if domainCPUStats.TimeSet {
 		metrics.pushCommonMetric(
-			"kubevirt_vmi_cpu_usage_seconds",
+			"kubevirt_vmi_cpu_usage_seconds_total",
 			"Total CPU time spent in all modes (sum of both vcpu and hypervisor usage).",
-			prometheus.GaugeValue,
-			float64(domainCPUStats.Time/1000000000),
+			prometheus.CounterValue,
+			nanosecondsToSeconds(domainCPUStats.Time),
 		)
 	}
 
 	if domainCPUStats.UserSet {
 		metrics.pushCommonMetric(
-			"kubevirt_vmi_cpu_user_usage_seconds",
+			"kubevirt_vmi_cpu_user_usage_seconds_total",
 			"Total CPU time spent in user mode.",
-			prometheus.GaugeValue,
-			float64(domainCPUStats.User/1000000000),
+			prometheus.CounterValue,
+			nanosecondsToSeconds(domainCPUStats.User),
 		)
 	}
 
 	if domainCPUStats.SystemSet {
 		metrics.pushCommonMetric(
-			"kubevirt_vmi_cpu_system_usage_seconds",
+			"kubevirt_vmi_cpu_system_usage_seconds_total",
 			"Total CPU time spent in system mode.",
-			prometheus.GaugeValue,
-			float64(domainCPUStats.System/1000000000),
+			prometheus.CounterValue,
+			nanosecondsToSeconds(domainCPUStats.System),
 		)
 	}
 }
@@ -273,7 +285,7 @@ func (metrics *vmiMetrics) updateVcpu(vcpuStats []stats.DomainStatsVcpu) {
 
 		if vcpu.StateSet && vcpu.TimeSet {
 			metrics.pushCustomMetric(
-				"kubevirt_vmi_vcpu_seconds",
+				"kubevirt_vmi_vcpu_seconds_total",
 				"Total amount of time spent in each state by each vcpu (cpu_time excluding hypervisor time). Where `id` is the vcpu identifier and `state` can be one of the following: [`OFFLINE`, `RUNNING`, `BLOCKED`].",
 				prometheus.CounterValue,
 				float64(vcpu.Time/1000000000),
@@ -284,10 +296,20 @@ func (metrics *vmiMetrics) updateVcpu(vcpuStats []stats.DomainStatsVcpu) {
 
 		if vcpu.WaitSet {
 			metrics.pushCustomMetric(
-				"kubevirt_vmi_vcpu_wait_seconds",
+				"kubevirt_vmi_vcpu_wait_seconds_total",
 				"Amount of time spent by each vcpu while waiting on I/O.",
 				prometheus.CounterValue,
-				float64(vcpu.Wait/1000000),
+				float64(vcpu.Wait)/float64(1000000000),
+				[]string{"id"},
+				[]string{stringVcpuIdx},
+			)
+		}
+		if vcpu.DelaySet {
+			metrics.pushCustomMetric(
+				"kubevirt_vmi_vcpu_delay_seconds_total",
+				"Amount of time spent by each vcpu waiting in the queue instead of running.",
+				prometheus.CounterValue,
+				float64(vcpu.Delay)/float64(1000000000),
 				[]string{"id"},
 				[]string{stringVcpuIdx},
 			)
@@ -298,7 +320,7 @@ func (metrics *vmiMetrics) updateVcpu(vcpuStats []stats.DomainStatsVcpu) {
 func (metrics *vmiMetrics) updateBlock(blkStats []stats.DomainStatsBlock) {
 	for blockIdx, block := range blkStats {
 		if !block.NameSet {
-			log.Log.V(4).Warningf("Name not set for block device#%d", blockIdx)
+			log.Log.Warningf("Name not set for block device#%d", blockIdx)
 			continue
 		}
 
@@ -355,10 +377,10 @@ func (metrics *vmiMetrics) updateBlock(blkStats []stats.DomainStatsBlock) {
 
 		if block.RdTimesSet {
 			metrics.pushCustomMetric(
-				"kubevirt_vmi_storage_read_times_ms_total",
-				"Total time (ms) spent on read operations.",
+				"kubevirt_vmi_storage_read_times_seconds_total",
+				"Total time spent on read operations.",
 				prometheus.CounterValue,
-				float64(block.RdTimes)/1000000,
+				float64(block.RdTimes)/1000000000,
 				blkLabels,
 				blkLabelValues,
 			)
@@ -366,10 +388,10 @@ func (metrics *vmiMetrics) updateBlock(blkStats []stats.DomainStatsBlock) {
 
 		if block.WrTimesSet {
 			metrics.pushCustomMetric(
-				"kubevirt_vmi_storage_write_times_ms_total",
-				"Total time (ms) spent on write operations.",
+				"kubevirt_vmi_storage_write_times_seconds_total",
+				"Total time spent on write operations.",
 				prometheus.CounterValue,
-				float64(block.WrTimes)/1000000,
+				float64(block.WrTimes)/1000000000,
 				blkLabels,
 				blkLabelValues,
 			)
@@ -388,10 +410,10 @@ func (metrics *vmiMetrics) updateBlock(blkStats []stats.DomainStatsBlock) {
 
 		if block.FlTimesSet {
 			metrics.pushCustomMetric(
-				"kubevirt_vmi_storage_flush_times_ms_total",
-				"Total time (ms) spent on cache flushing.",
+				"kubevirt_vmi_storage_flush_times_seconds_total",
+				"Total time spent on cache flushing.",
 				prometheus.CounterValue,
-				float64(block.FlTimes)/1000000,
+				float64(block.FlTimes)/1000000000,
 				blkLabels,
 				blkLabelValues,
 			)
@@ -524,7 +546,7 @@ func (metrics *vmiMetrics) updateFilesystem(vmFSStats k6tv1.VirtualMachineInstan
 		fsLabelValues := []string{fsStat.DiskName, fsStat.MountPoint, fsStat.FileSystemType}
 
 		metrics.pushCustomMetric(
-			"kubevirt_vmi_filesystem_capacity_bytes_total",
+			"kubevirt_vmi_filesystem_capacity_bytes",
 			"Total VM filesystem capacity in bytes.",
 			prometheus.GaugeValue,
 			float64(fsStat.TotalBytes),
@@ -665,7 +687,7 @@ func (ps *prometheusScraper) Report(socketFile string, vmi *k6tv1.VirtualMachine
 	// Since this is a known failure condition, let's handle it explicitly.
 	defer func() {
 		if err := recover(); err != nil {
-			log.Log.V(2).Warningf("collector goroutine panicked for VM %s: %s", socketFile, err)
+			log.Log.Warningf("collector goroutine panicked for VM %s: %s", socketFile, err)
 		}
 	}()
 

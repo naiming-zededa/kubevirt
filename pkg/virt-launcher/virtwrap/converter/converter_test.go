@@ -20,6 +20,7 @@
 package converter
 
 import (
+	_ "embed"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -44,6 +45,7 @@ import (
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks"
 	"kubevirt.io/kubevirt/pkg/virt-controller/services"
 
+	"kubevirt.io/kubevirt/pkg/downwardmetrics"
 	"kubevirt.io/kubevirt/pkg/ephemeral-disk/fake"
 	"kubevirt.io/kubevirt/pkg/testutils"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
@@ -52,6 +54,30 @@ import (
 	kvapi "kubevirt.io/client-go/api"
 
 	cmdv1 "kubevirt.io/kubevirt/pkg/handler-launcher-com/cmd/v1"
+	kubevirtpointer "kubevirt.io/kubevirt/pkg/pointer"
+	sev "kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/launchsecurity"
+)
+
+var (
+	//go:embed testdata/domain_x86_64.xml.tmpl
+	embedDomainTemplateX86_64 string
+	//go:embed testdata/domain_ppc64le.xml.tmpl
+	embedDomainTemplatePPC64le string
+	//go:embed testdata/domain_arm64.xml.tmpl
+	embedDomainTemplateARM64 string
+	//go:embed testdata/domain_x86_64_root.xml.tmpl
+	embedDomainTemplateRootBus string
+)
+
+const (
+	argNoMemBalloon      = `<memballoon model="none"></memballoon>`
+	argMemBalloon0period = `<memballoon model="virtio-non-transitional" freePageReporting="on"></memballoon>`
+	argMemBalloon5period = `<memballoon model="virtio-non-transitional" freePageReporting="on">
+      <stats period="5"></stats>
+    </memballoon>`
+	argMemBalloon10period = `<memballoon model="virtio-non-transitional" freePageReporting="on">
+      <stats period="10"></stats>
+    </memballoon>`
 )
 
 var _ = Describe("getOptimalBlockIO", func() {
@@ -137,6 +163,32 @@ var _ = Describe("Converter", func() {
 			Entry("Lower request than capacity", int64(1111), int64(9999)),
 		)
 
+		DescribeTable("Should assign scsi controller to", func(diskDevice v1.DiskDevice) {
+			context := &ConverterContext{}
+			v1Disk := v1.Disk{
+				Name:       "myvolume",
+				DiskDevice: diskDevice,
+			}
+			apiDisk := api.Disk{}
+			devicePerBus := map[string]deviceNamer{}
+			numQueues := uint(2)
+			volumeStatusMap := make(map[string]v1.VolumeStatus)
+			volumeStatusMap["myvolume"] = v1.VolumeStatus{}
+			Convert_v1_Disk_To_api_Disk(context, &v1Disk, &apiDisk, devicePerBus, &numQueues, volumeStatusMap)
+			Expect(apiDisk.Address).ToNot(BeNil())
+			Expect(apiDisk.Address.Bus).To(Equal("0"))
+			Expect(apiDisk.Address.Controller).To(Equal("0"))
+			Expect(apiDisk.Address.Type).To(Equal("drive"))
+			Expect(apiDisk.Address.Unit).To(Equal("0"))
+		},
+			Entry("LUN-type disk", v1.DiskDevice{
+				LUN: &v1.LunTarget{Bus: "scsi"},
+			}),
+			Entry("Disk-type disk", v1.DiskDevice{
+				Disk: &v1.DiskTarget{Bus: "scsi"},
+			}),
+		)
+
 		It("Should add boot order when provided", func() {
 			order := uint(1)
 			kubevirtDisk := &v1.Disk{
@@ -151,7 +203,7 @@ var _ = Describe("Converter", func() {
 			var convertedDisk = `<Disk device="disk" type="" model="virtio-non-transitional">
   <source></source>
   <target bus="virtio" dev="vda"></target>
-  <driver error_policy="stop" name="qemu" type="" discard="unmap"></driver>
+  <driver name="qemu" type="" discard="unmap"></driver>
   <alias name="ua-mydisk"></alias>
   <boot order="1"></boot>
 </Disk>`
@@ -167,7 +219,7 @@ var _ = Describe("Converter", func() {
 			expectedXML := `<Disk device="" type="">
   <source></source>
   <target></target>
-  <driver error_policy="stop" io="native" name="qemu" type=""></driver>
+  <driver io="native" name="qemu" type=""></driver>
   <alias name="ua-"></alias>
 </Disk>`
 			Expect(xml).To(Equal(expectedXML))
@@ -179,7 +231,7 @@ var _ = Describe("Converter", func() {
 			expectedXML := `<Disk device="" type="">
   <source></source>
   <target></target>
-  <driver error_policy="stop" name="qemu" type=""></driver>
+  <driver name="qemu" type=""></driver>
   <alias name="ua-"></alias>
 </Disk>`
 			Expect(xml).To(Equal(expectedXML))
@@ -197,7 +249,7 @@ var _ = Describe("Converter", func() {
 			var convertedDisk = `<Disk device="disk" type="" model="virtio-non-transitional">
   <source></source>
   <target bus="virtio" dev="vda"></target>
-  <driver error_policy="stop" name="qemu" type="" discard="unmap"></driver>
+  <driver name="qemu" type="" discard="unmap"></driver>
   <alias name="ua-mydisk"></alias>
 </Disk>`
 			xml := diskToDiskXML(kubevirtDisk)
@@ -238,7 +290,7 @@ var _ = Describe("Converter", func() {
 			var expectedXML = `<Disk device="disk" type="" model="virtio-non-transitional">
   <source></source>
   <target bus="virtio" dev="vda"></target>
-  <driver cache="none" error_policy="stop" name="qemu" type="" discard="unmap"></driver>
+  <driver cache="none" name="qemu" type="" discard="unmap"></driver>
   <alias name="ua-mydisk"></alias>
   <shareable></shareable>
 </Disk>`
@@ -548,810 +600,28 @@ var _ = Describe("Converter", func() {
 			vmi.ObjectMeta.UID = "f4686d2c-6e8d-4335-b8fd-81bee22f4814"
 		})
 
-		var convertedDomain = fmt.Sprintf(`<domain type="%s" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
-  <name>mynamespace_testvmi</name>
-  <memory unit="b">8388608</memory>
-  <os>
-    <type arch="x86_64" machine="q35">hvm</type>
-    <smbios mode="sysinfo"></smbios>
-  </os>
-  <sysinfo type="smbios">
-    <system>
-      <entry name="uuid">e4686d2c-6e8d-4335-b8fd-81bee22f4814</entry>
-      <entry name="serial">e4686d2c-6e8d-4335-b8fd-81bee22f4815</entry>
-      <entry name="manufacturer"></entry>
-      <entry name="family"></entry>
-      <entry name="product"></entry>
-      <entry name="sku"></entry>
-      <entry name="version"></entry>
-    </system>
-    <bios></bios>
-    <baseBoard></baseBoard>
-    <chassis></chassis>
-  </sysinfo>
-  <devices>
-    <interface type="ethernet">
-      <source></source>
-      <model type="virtio-non-transitional"></model>
-      <alias name="ua-default"></alias>
-      <rom enabled="no"></rom>
-    </interface>
-    <channel type="unix">
-      <target name="org.qemu.guest_agent.0" type="virtio"></target>
-    </channel>
-    <controller type="usb" index="0" model="none"></controller>
-    <controller type="virtio-serial" index="0" model="virtio-non-transitional"></controller>
-    <video>
-      <model type="vga" heads="1" vram="16384"></model>
-    </video>
-    <graphics type="vnc">
-      <listen type="socket" socket="/var/run/kubevirt-private/f4686d2c-6e8d-4335-b8fd-81bee22f4814/virt-vnc"></listen>
-    </graphics>
-    %s
-    <disk device="disk" type="file" model="virtio-non-transitional">
-      <source file="/var/run/kubevirt-private/vmi-disks/myvolume/disk.img"></source>
-      <target bus="virtio" dev="vda"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="2" discard="unmap"></driver>
-      <alias name="ua-myvolume"></alias>
-    </disk>
-    <disk device="disk" type="file" model="virtio-non-transitional">
-      <source file="/var/run/libvirt/cloud-init-dir/mynamespace/testvmi/noCloud.iso"></source>
-      <target bus="virtio" dev="vdb"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="3" discard="unmap"></driver>
-      <alias name="ua-nocloud"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/libvirt/cloud-init-dir/mynamespace/testvmi/noCloud.iso"></source>
-      <target bus="sata" dev="sda" tray="closed"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <alias name="ua-cdrom_tray_unspecified"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/kubevirt-private/vmi-disks/cdrom_tray_open/disk.img"></source>
-      <target bus="sata" dev="sdb" tray="open"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <readonly></readonly>
-      <alias name="ua-cdrom_tray_open"></alias>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/kubevirt-private/vmi-disks/should_default_to_disk/disk.img"></source>
-      <target bus="sata" dev="sdc"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-should_default_to_disk"></alias>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/libvirt/kubevirt-ephemeral-disk/ephemeral_pvc/disk.qcow2"></source>
-      <target bus="sata" dev="sdd"></target>
-      <driver cache="none" error_policy="stop" name="qemu" type="qcow2" iothread="1" discard="unmap"></driver>
-      <alias name="ua-ephemeral_pvc"></alias>
-      <backingStore type="file">
-        <format type="raw"></format>
-        <source file="/var/run/kubevirt-private/vmi-disks/ephemeral_pvc/disk.img"></source>
-      </backingStore>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/kubevirt-private/secret-disks/secret_test.iso"></source>
-      <target bus="sata" dev="sde"></target>
-      <serial>D23YZ9W6WA5DJ487</serial>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-secret_test"></alias>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/kubevirt-private/config-map-disks/configmap_test.iso"></source>
-      <target bus="sata" dev="sdf"></target>
-      <serial>CVLY623300HK240D</serial>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-configmap_test"></alias>
-    </disk>
-    <disk device="disk" type="block">
-      <source dev="/dev/pvc_block_test" name="pvc_block_test"></source>
-      <target bus="sata" dev="sdg"></target>
-      <driver cache="writethrough" error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-pvc_block_test"></alias>
-    </disk>
-    <disk device="disk" type="block">
-      <source dev="/dev/dv_block_test" name="dv_block_test"></source>
-      <target bus="sata" dev="sdh"></target>
-      <driver cache="writethrough" error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-dv_block_test"></alias>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/kubevirt-private/service-account-disk/service-account.iso"></source>
-      <target bus="sata" dev="sdi"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-serviceaccount_test"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/kubevirt-private/sysprep-disks/sysprep.iso"></source>
-      <target bus="sata" dev="sdj" tray="closed"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <alias name="ua-sysprep"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/kubevirt-private/sysprep-disks/sysprep_secret.iso"></source>
-      <target bus="sata" dev="sdk" tray="closed"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <alias name="ua-sysprep_secret"></alias>
-    </disk>
-    <input type="tablet" bus="virtio" model="virtio">
-      <alias name="ua-tablet0"></alias>
-    </input>
-    <serial type="unix">
-      <target port="0"></target>
-      <source mode="bind" path="/var/run/kubevirt-private/f4686d2c-6e8d-4335-b8fd-81bee22f4814/virt-serial0"></source>
-    </serial>
-    <console type="pty">
-      <target type="serial" port="0"></target>
-    </console>
-    <watchdog model="i6300esb" action="poweroff">
-      <alias name="ua-mywatchdog"></alias>
-    </watchdog>
-    <rng model="virtio-non-transitional">
-      <backend model="random">/dev/urandom</backend>
-    </rng>
-  </devices>
-  <clock offset="utc" adjustment="reset">
-    <timer name="rtc" tickpolicy="catchup" present="yes" track="guest"></timer>
-    <timer name="pit" tickpolicy="discard" present="no"></timer>
-    <timer name="kvmclock" present="yes"></timer>
-    <timer name="hpet" tickpolicy="delay" present="no"></timer>
-    <timer name="hypervclock" present="yes"></timer>
-  </clock>
-  <metadata>
-    <kubevirt xmlns="http://kubevirt.io">
-      <uid></uid>
-    </kubevirt>
-  </metadata>
-  <features>
-    <acpi></acpi>
-    <apic></apic>
-    <hyperv>
-      <relaxed state="off"></relaxed>
-      <vapic state="on"></vapic>
-      <spinlocks state="on" retries="4096"></spinlocks>
-      <vpindex state="on"></vpindex>
-      <runtime state="off"></runtime>
-      <synic state="on"></synic>
-      <stimer state="on">
-        <direct state="on"></direct>
-      </stimer>
-      <reset state="on"></reset>
-      <vendor_id state="off" value="myvendor"></vendor_id>
-      <frequencies state="off"></frequencies>
-      <reenlightenment state="off"></reenlightenment>
-      <tlbflush state="on"></tlbflush>
-      <ipi state="on"></ipi>
-      <evmcs state="off"></evmcs>
-    </hyperv>
-    <smm></smm>
-    <kvm>
-      <hidden state="on"></hidden>
-    </kvm>
-    <pvspinlock state="off"></pvspinlock>
-  </features>
-  <cpu mode="host-model">
-    <topology sockets="1" cores="1" threads="1"></topology>
-  </cpu>
-  <vcpu placement="static">1</vcpu>
-  <iothreads>3</iothreads>
-</domain>`, domainType, "%s")
-		var convertedDomainWith5Period = fmt.Sprintf(convertedDomain,
-			`<memballoon model="virtio-non-transitional" freePageReporting="on">
-      <stats period="5"></stats>
-    </memballoon>`)
-		var convertedDomainWith0Period = fmt.Sprintf(convertedDomain,
-			`<memballoon model="virtio-non-transitional" freePageReporting="on"></memballoon>`)
-		var convertedDomainWithFalseAutoattach = fmt.Sprintf(convertedDomain,
-			`<memballoon model="none"></memballoon>`)
-		convertedDomain = fmt.Sprintf(convertedDomain,
-			`<memballoon model="virtio-non-transitional" freePageReporting="on">
-      <stats period="10"></stats>
-    </memballoon>`)
+		var convertedDomain = strings.TrimSpace(fmt.Sprintf(embedDomainTemplateX86_64, domainType, "%s"))
+		var convertedDomainWith5Period = fmt.Sprintf(convertedDomain, argMemBalloon5period)
+		var convertedDomainWith0Period = fmt.Sprintf(convertedDomain, argMemBalloon0period)
+		var convertedDomainWithFalseAutoattach = fmt.Sprintf(convertedDomain, argNoMemBalloon)
 
-		var convertedDomainppc64le = fmt.Sprintf(`<domain type="%s" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
-  <name>mynamespace_testvmi</name>
-  <memory unit="b">8388608</memory>
-  <os>
-    <type arch="ppc64le" machine="pseries">hvm</type>
-  </os>
-  <sysinfo type="smbios">
-    <system>
-      <entry name="uuid">e4686d2c-6e8d-4335-b8fd-81bee22f4814</entry>
-      <entry name="serial">e4686d2c-6e8d-4335-b8fd-81bee22f4815</entry>
-      <entry name="manufacturer"></entry>
-      <entry name="family"></entry>
-      <entry name="product"></entry>
-      <entry name="sku"></entry>
-      <entry name="version"></entry>
-    </system>
-    <bios></bios>
-    <baseBoard></baseBoard>
-    <chassis></chassis>
-  </sysinfo>
-  <devices>
-    <interface type="ethernet">
-      <source></source>
-      <model type="virtio-non-transitional"></model>
-      <alias name="ua-default"></alias>
-      <rom enabled="no"></rom>
-    </interface>
-    <channel type="unix">
-      <target name="org.qemu.guest_agent.0" type="virtio"></target>
-    </channel>
-    <controller type="usb" index="0" model="qemu-xhci"></controller>
-    <controller type="virtio-serial" index="0" model="virtio-non-transitional"></controller>
-    <video>
-      <model type="vga" heads="1" vram="16384"></model>
-    </video>
-    <graphics type="vnc">
-      <listen type="socket" socket="/var/run/kubevirt-private/f4686d2c-6e8d-4335-b8fd-81bee22f4814/virt-vnc"></listen>
-    </graphics>
-    %s
-    <disk device="disk" type="file" model="virtio-non-transitional">
-      <source file="/var/run/kubevirt-private/vmi-disks/myvolume/disk.img"></source>
-      <target bus="virtio" dev="vda"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="2" discard="unmap"></driver>
-      <alias name="ua-myvolume"></alias>
-    </disk>
-    <disk device="disk" type="file" model="virtio-non-transitional">
-      <source file="/var/run/libvirt/cloud-init-dir/mynamespace/testvmi/noCloud.iso"></source>
-      <target bus="virtio" dev="vdb"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="3" discard="unmap"></driver>
-      <alias name="ua-nocloud"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/libvirt/cloud-init-dir/mynamespace/testvmi/noCloud.iso"></source>
-      <target bus="sata" dev="sda" tray="closed"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <alias name="ua-cdrom_tray_unspecified"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/kubevirt-private/vmi-disks/cdrom_tray_open/disk.img"></source>
-      <target bus="sata" dev="sdb" tray="open"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <readonly></readonly>
-      <alias name="ua-cdrom_tray_open"></alias>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/kubevirt-private/vmi-disks/should_default_to_disk/disk.img"></source>
-      <target bus="sata" dev="sdc"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-should_default_to_disk"></alias>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/libvirt/kubevirt-ephemeral-disk/ephemeral_pvc/disk.qcow2"></source>
-      <target bus="sata" dev="sdd"></target>
-      <driver cache="none" error_policy="stop" name="qemu" type="qcow2" iothread="1" discard="unmap"></driver>
-      <alias name="ua-ephemeral_pvc"></alias>
-      <backingStore type="file">
-        <format type="raw"></format>
-        <source file="/var/run/kubevirt-private/vmi-disks/ephemeral_pvc/disk.img"></source>
-      </backingStore>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/kubevirt-private/secret-disks/secret_test.iso"></source>
-      <target bus="sata" dev="sde"></target>
-      <serial>D23YZ9W6WA5DJ487</serial>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-secret_test"></alias>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/kubevirt-private/config-map-disks/configmap_test.iso"></source>
-      <target bus="sata" dev="sdf"></target>
-      <serial>CVLY623300HK240D</serial>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-configmap_test"></alias>
-    </disk>
-    <disk device="disk" type="block">
-      <source dev="/dev/pvc_block_test" name="pvc_block_test"></source>
-      <target bus="sata" dev="sdg"></target>
-      <driver cache="writethrough" error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-pvc_block_test"></alias>
-    </disk>
-    <disk device="disk" type="block">
-      <source dev="/dev/dv_block_test" name="dv_block_test"></source>
-      <target bus="sata" dev="sdh"></target>
-      <driver cache="writethrough" error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-dv_block_test"></alias>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/kubevirt-private/service-account-disk/service-account.iso"></source>
-      <target bus="sata" dev="sdi"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-serviceaccount_test"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/kubevirt-private/sysprep-disks/sysprep.iso"></source>
-      <target bus="sata" dev="sdj" tray="closed"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <alias name="ua-sysprep"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/kubevirt-private/sysprep-disks/sysprep_secret.iso"></source>
-      <target bus="sata" dev="sdk" tray="closed"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <alias name="ua-sysprep_secret"></alias>
-    </disk>
-    <input type="tablet" bus="virtio" model="virtio">
-      <alias name="ua-tablet0"></alias>
-    </input>
-    <serial type="unix">
-      <target port="0"></target>
-      <source mode="bind" path="/var/run/kubevirt-private/f4686d2c-6e8d-4335-b8fd-81bee22f4814/virt-serial0"></source>
-    </serial>
-    <console type="pty">
-      <target type="serial" port="0"></target>
-    </console>
-    <watchdog model="i6300esb" action="poweroff">
-      <alias name="ua-mywatchdog"></alias>
-    </watchdog>
-    <rng model="virtio-non-transitional">
-      <backend model="random">/dev/urandom</backend>
-    </rng>
-  </devices>
-  <clock offset="utc" adjustment="reset">
-    <timer name="rtc" tickpolicy="catchup" present="yes" track="guest"></timer>
-    <timer name="pit" tickpolicy="discard" present="no"></timer>
-    <timer name="kvmclock" present="yes"></timer>
-    <timer name="hpet" tickpolicy="delay" present="no"></timer>
-    <timer name="hypervclock" present="yes"></timer>
-  </clock>
-  <metadata>
-    <kubevirt xmlns="http://kubevirt.io">
-      <uid></uid>
-    </kubevirt>
-  </metadata>
-  <features>
-    <acpi></acpi>
-    <apic></apic>
-    <hyperv>
-      <relaxed state="off"></relaxed>
-      <vapic state="on"></vapic>
-      <spinlocks state="on" retries="4096"></spinlocks>
-      <vpindex state="on"></vpindex>
-      <runtime state="off"></runtime>
-      <synic state="on"></synic>
-      <stimer state="on">
-        <direct state="on"></direct>
-      </stimer>
-      <reset state="on"></reset>
-      <vendor_id state="off" value="myvendor"></vendor_id>
-      <frequencies state="off"></frequencies>
-      <reenlightenment state="off"></reenlightenment>
-      <tlbflush state="on"></tlbflush>
-      <ipi state="on"></ipi>
-      <evmcs state="off"></evmcs>
-    </hyperv>
-    <smm></smm>
-    <kvm>
-      <hidden state="on"></hidden>
-    </kvm>
-    <pvspinlock state="off"></pvspinlock>
-  </features>
-  <cpu mode="host-model">
-    <topology sockets="1" cores="1" threads="1"></topology>
-  </cpu>
-  <vcpu placement="static">1</vcpu>
-  <iothreads>3</iothreads>
-</domain>`, domainType, "%s")
+		convertedDomain = fmt.Sprintf(convertedDomain, argMemBalloon10period)
 
-		var convertedDomainppc64leWith5Period = fmt.Sprintf(convertedDomainppc64le,
-			`<memballoon model="virtio-non-transitional" freePageReporting="on">
-      <stats period="5"></stats>
-    </memballoon>`)
-		var convertedDomainppc64leWith0Period = fmt.Sprintf(convertedDomainppc64le,
-			`<memballoon model="virtio-non-transitional" freePageReporting="on"></memballoon>`)
+		var convertedDomainppc64le = strings.TrimSpace(fmt.Sprintf(embedDomainTemplatePPC64le, domainType, "%s"))
+		var convertedDomainppc64leWith5Period = fmt.Sprintf(convertedDomainppc64le, argMemBalloon5period)
+		var convertedDomainppc64leWith0Period = fmt.Sprintf(convertedDomainppc64le, argMemBalloon0period)
+		var convertedDomainppc64leWithFalseAutoattach = fmt.Sprintf(convertedDomainppc64le, argNoMemBalloon)
 
-		var convertedDomainppc64leWithFalseAutoattach = fmt.Sprintf(convertedDomainppc64le,
-			`<memballoon model="none"></memballoon>`)
-		convertedDomainppc64le = fmt.Sprintf(convertedDomainppc64le,
-			`<memballoon model="virtio-non-transitional" freePageReporting="on">
-      <stats period="10"></stats>
-    </memballoon>`)
+		convertedDomainppc64le = fmt.Sprintf(convertedDomainppc64le, argMemBalloon10period)
 
-		//TODO: Make this xml fit for real arm64 configuration
-		var convertedDomainarm64 = fmt.Sprintf(`<domain type="%s" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
-  <name>mynamespace_testvmi</name>
-  <memory unit="b">8388608</memory>
-  <os>
-    <type arch="aarch64" machine="virt">hvm</type>
-    <loader readonly="yes" secure="no" type="pflash"></loader>
-    <nvram>/tmp/mynamespace_testvmi</nvram>
-  </os>
-  <sysinfo type="smbios">
-    <system>
-      <entry name="uuid">e4686d2c-6e8d-4335-b8fd-81bee22f4814</entry>
-      <entry name="serial">e4686d2c-6e8d-4335-b8fd-81bee22f4815</entry>
-      <entry name="manufacturer"></entry>
-      <entry name="family"></entry>
-      <entry name="product"></entry>
-      <entry name="sku"></entry>
-      <entry name="version"></entry>
-    </system>
-    <bios></bios>
-    <baseBoard></baseBoard>
-    <chassis></chassis>
-  </sysinfo>
-  <devices>
-    <interface type="ethernet">
-      <source></source>
-      <model type="virtio-non-transitional"></model>
-      <alias name="ua-default"></alias>
-      <rom enabled="no"></rom>
-    </interface>
-    <channel type="unix">
-      <target name="org.qemu.guest_agent.0" type="virtio"></target>
-    </channel>
-    <controller type="usb" index="0" model="qemu-xhci"></controller>
-    <controller type="virtio-serial" index="0" model="virtio-non-transitional"></controller>
-    <video>
-      <model type="virtio" heads="1"></model>
-    </video>
-    <graphics type="vnc">
-      <listen type="socket" socket="/var/run/kubevirt-private/f4686d2c-6e8d-4335-b8fd-81bee22f4814/virt-vnc"></listen>
-    </graphics>
-    %s
-    <disk device="disk" type="file" model="virtio-non-transitional">
-      <source file="/var/run/kubevirt-private/vmi-disks/myvolume/disk.img"></source>
-      <target bus="virtio" dev="vda"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="2" discard="unmap"></driver>
-      <alias name="ua-myvolume"></alias>
-    </disk>
-    <disk device="disk" type="file" model="virtio-non-transitional">
-      <source file="/var/run/libvirt/cloud-init-dir/mynamespace/testvmi/noCloud.iso"></source>
-      <target bus="virtio" dev="vdb"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="3" discard="unmap"></driver>
-      <alias name="ua-nocloud"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/libvirt/cloud-init-dir/mynamespace/testvmi/noCloud.iso"></source>
-      <target bus="virtio" dev="vdc" tray="closed"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <alias name="ua-cdrom_tray_unspecified"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/kubevirt-private/vmi-disks/cdrom_tray_open/disk.img"></source>
-      <target bus="virtio" dev="vdd" tray="open"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <readonly></readonly>
-      <alias name="ua-cdrom_tray_open"></alias>
-    </disk>
-    <disk device="disk" type="file" model="virtio-non-transitional">
-      <source file="/var/run/kubevirt-private/vmi-disks/should_default_to_disk/disk.img"></source>
-      <target bus="virtio" dev="vde"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-should_default_to_disk"></alias>
-    </disk>
-    <disk device="disk" type="file" model="virtio-non-transitional">
-      <source file="/var/run/libvirt/kubevirt-ephemeral-disk/ephemeral_pvc/disk.qcow2"></source>
-      <target bus="virtio" dev="vdf"></target>
-      <driver cache="none" error_policy="stop" name="qemu" type="qcow2" iothread="1" discard="unmap"></driver>
-      <alias name="ua-ephemeral_pvc"></alias>
-      <backingStore type="file">
-        <format type="raw"></format>
-        <source file="/var/run/kubevirt-private/vmi-disks/ephemeral_pvc/disk.img"></source>
-      </backingStore>
-    </disk>
-    <disk device="disk" type="file" model="virtio-non-transitional">
-      <source file="/var/run/kubevirt-private/secret-disks/secret_test.iso"></source>
-      <target bus="virtio" dev="vdg"></target>
-      <serial>D23YZ9W6WA5DJ487</serial>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-secret_test"></alias>
-    </disk>
-    <disk device="disk" type="file" model="virtio-non-transitional">
-      <source file="/var/run/kubevirt-private/config-map-disks/configmap_test.iso"></source>
-      <target bus="virtio" dev="vdh"></target>
-      <serial>CVLY623300HK240D</serial>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-configmap_test"></alias>
-    </disk>
-    <disk device="disk" type="block" model="virtio-non-transitional">
-      <source dev="/dev/pvc_block_test" name="pvc_block_test"></source>
-      <target bus="virtio" dev="vdi"></target>
-      <driver cache="writethrough" error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-pvc_block_test"></alias>
-    </disk>
-    <disk device="disk" type="block" model="virtio-non-transitional">
-      <source dev="/dev/dv_block_test" name="dv_block_test"></source>
-      <target bus="virtio" dev="vdj"></target>
-      <driver cache="writethrough" error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-dv_block_test"></alias>
-    </disk>
-    <disk device="disk" type="file" model="virtio-non-transitional">
-      <source file="/var/run/kubevirt-private/service-account-disk/service-account.iso"></source>
-      <target bus="virtio" dev="vdk"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-serviceaccount_test"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/kubevirt-private/sysprep-disks/sysprep.iso"></source>
-      <target bus="virtio" dev="vdl" tray="closed"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <alias name="ua-sysprep"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/kubevirt-private/sysprep-disks/sysprep_secret.iso"></source>
-      <target bus="virtio" dev="vdm" tray="closed"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <alias name="ua-sysprep_secret"></alias>
-    </disk>
-    <input type="tablet" bus="virtio" model="virtio">
-      <alias name="ua-tablet0"></alias>
-    </input>
-    <input type="keyboard" bus="usb"></input>
-    <serial type="unix">
-      <target port="0"></target>
-      <source mode="bind" path="/var/run/kubevirt-private/f4686d2c-6e8d-4335-b8fd-81bee22f4814/virt-serial0"></source>
-    </serial>
-    <console type="pty">
-      <target type="serial" port="0"></target>
-    </console>
-    <watchdog model="i6300esb" action="poweroff">
-      <alias name="ua-mywatchdog"></alias>
-    </watchdog>
-    <rng model="virtio-non-transitional">
-      <backend model="random">/dev/urandom</backend>
-    </rng>
-  </devices>
-  <clock offset="utc" adjustment="reset">
-    <timer name="rtc" tickpolicy="catchup" present="yes" track="guest"></timer>
-    <timer name="pit" tickpolicy="discard" present="no"></timer>
-    <timer name="kvmclock" present="yes"></timer>
-    <timer name="hpet" tickpolicy="delay" present="no"></timer>
-    <timer name="hypervclock" present="yes"></timer>
-  </clock>
-  <metadata>
-    <kubevirt xmlns="http://kubevirt.io">
-      <uid></uid>
-    </kubevirt>
-  </metadata>
-  <features>
-    <acpi></acpi>
-    <apic></apic>
-    <hyperv>
-      <relaxed state="off"></relaxed>
-      <vapic state="on"></vapic>
-      <spinlocks state="on" retries="4096"></spinlocks>
-      <vpindex state="on"></vpindex>
-      <runtime state="off"></runtime>
-      <synic state="on"></synic>
-      <stimer state="on">
-        <direct state="on"></direct>
-      </stimer>
-      <reset state="on"></reset>
-      <vendor_id state="off" value="myvendor"></vendor_id>
-      <frequencies state="off"></frequencies>
-      <reenlightenment state="off"></reenlightenment>
-      <tlbflush state="on"></tlbflush>
-      <ipi state="on"></ipi>
-      <evmcs state="off"></evmcs>
-    </hyperv>
-    <smm></smm>
-    <kvm>
-      <hidden state="on"></hidden>
-    </kvm>
-    <pvspinlock state="off"></pvspinlock>
-  </features>
-  <cpu mode="host-passthrough">
-    <topology sockets="1" cores="1" threads="1"></topology>
-  </cpu>
-  <vcpu placement="static">1</vcpu>
-  <iothreads>3</iothreads>
-</domain>`, domainType, "%s")
-		var convertedDomainarm64With5Period = fmt.Sprintf(convertedDomainarm64,
-			`<memballoon model="virtio-non-transitional" freePageReporting="on">
-      <stats period="5"></stats>
-    </memballoon>`)
-		var convertedDomainarm64With0Period = fmt.Sprintf(convertedDomainarm64,
-			`<memballoon model="virtio-non-transitional" freePageReporting="on"></memballoon>`)
-		var convertedDomainarm64WithFalseAutoattach = fmt.Sprintf(convertedDomainarm64,
-			`<memballoon model="none"></memballoon>`)
-		convertedDomainarm64 = fmt.Sprintf(convertedDomainarm64,
-			`<memballoon model="virtio-non-transitional" freePageReporting="on">
-      <stats period="10"></stats>
-    </memballoon>`)
+		var convertedDomainarm64 = strings.TrimSpace(fmt.Sprintf(embedDomainTemplateARM64, domainType, "%s"))
+		var convertedDomainarm64With5Period = fmt.Sprintf(convertedDomainarm64, argMemBalloon5period)
+		var convertedDomainarm64With0Period = fmt.Sprintf(convertedDomainarm64, argMemBalloon0period)
+		var convertedDomainarm64WithFalseAutoattach = fmt.Sprintf(convertedDomainarm64, argNoMemBalloon)
 
-		var convertedDomainWithDevicesOnRootBus = fmt.Sprintf(`<domain type="%s" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
-  <name>mynamespace_testvmi</name>
-  <memory unit="b">8388608</memory>
-  <os>
-    <type arch="x86_64" machine="q35">hvm</type>
-    <smbios mode="sysinfo"></smbios>
-  </os>
-  <sysinfo type="smbios">
-    <system>
-      <entry name="uuid">e4686d2c-6e8d-4335-b8fd-81bee22f4814</entry>
-      <entry name="serial">e4686d2c-6e8d-4335-b8fd-81bee22f4815</entry>
-      <entry name="manufacturer"></entry>
-      <entry name="family"></entry>
-      <entry name="product"></entry>
-      <entry name="sku"></entry>
-      <entry name="version"></entry>
-    </system>
-    <bios></bios>
-    <baseBoard></baseBoard>
-    <chassis></chassis>
-  </sysinfo>
-  <devices>
-    <interface type="ethernet">
-      <address type="pci" domain="0x0000" bus="0x00" slot="0x02" function="0x0"></address>
-      <source></source>
-      <model type="virtio-non-transitional"></model>
-      <alias name="ua-default"></alias>
-      <rom enabled="no"></rom>
-    </interface>
-    <channel type="unix">
-      <target name="org.qemu.guest_agent.0" type="virtio"></target>
-    </channel>
-    <controller type="usb" index="0" model="none">
-      <address type="pci" domain="0x0000" bus="0x00" slot="0x03" function="0x0"></address>
-    </controller>
-    <controller type="virtio-serial" index="0" model="virtio-non-transitional">
-      <address type="pci" domain="0x0000" bus="0x00" slot="0x04" function="0x0"></address>
-    </controller>
-    <video>
-      <model type="vga" heads="1" vram="16384"></model>
-    </video>
-    <graphics type="vnc">
-      <listen type="socket" socket="/var/run/kubevirt-private/f4686d2c-6e8d-4335-b8fd-81bee22f4814/virt-vnc"></listen>
-    </graphics>
-    <memballoon model="virtio-non-transitional" freePageReporting="on">
-      <stats period="10"></stats>
-      <address type="pci" domain="0x0000" bus="0x00" slot="0x0a" function="0x0"></address>
-    </memballoon>
-    <disk device="disk" type="file" model="virtio-non-transitional">
-      <source file="/var/run/kubevirt-private/vmi-disks/myvolume/disk.img"></source>
-      <target bus="virtio" dev="vda"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="2" discard="unmap"></driver>
-      <alias name="ua-myvolume"></alias>
-      <address type="pci" domain="0x0000" bus="0x00" slot="0x05" function="0x0"></address>
-    </disk>
-    <disk device="disk" type="file" model="virtio-non-transitional">
-      <source file="/var/run/libvirt/cloud-init-dir/mynamespace/testvmi/noCloud.iso"></source>
-      <target bus="virtio" dev="vdb"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="3" discard="unmap"></driver>
-      <alias name="ua-nocloud"></alias>
-      <address type="pci" domain="0x0000" bus="0x00" slot="0x06" function="0x0"></address>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/libvirt/cloud-init-dir/mynamespace/testvmi/noCloud.iso"></source>
-      <target bus="sata" dev="sda" tray="closed"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <alias name="ua-cdrom_tray_unspecified"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/kubevirt-private/vmi-disks/cdrom_tray_open/disk.img"></source>
-      <target bus="sata" dev="sdb" tray="open"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <readonly></readonly>
-      <alias name="ua-cdrom_tray_open"></alias>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/kubevirt-private/vmi-disks/should_default_to_disk/disk.img"></source>
-      <target bus="sata" dev="sdc"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-should_default_to_disk"></alias>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/libvirt/kubevirt-ephemeral-disk/ephemeral_pvc/disk.qcow2"></source>
-      <target bus="sata" dev="sdd"></target>
-      <driver cache="none" error_policy="stop" name="qemu" type="qcow2" iothread="1" discard="unmap"></driver>
-      <alias name="ua-ephemeral_pvc"></alias>
-      <backingStore type="file">
-        <format type="raw"></format>
-        <source file="/var/run/kubevirt-private/vmi-disks/ephemeral_pvc/disk.img"></source>
-      </backingStore>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/kubevirt-private/secret-disks/secret_test.iso"></source>
-      <target bus="sata" dev="sde"></target>
-      <serial>D23YZ9W6WA5DJ487</serial>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-secret_test"></alias>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/kubevirt-private/config-map-disks/configmap_test.iso"></source>
-      <target bus="sata" dev="sdf"></target>
-      <serial>CVLY623300HK240D</serial>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-configmap_test"></alias>
-    </disk>
-    <disk device="disk" type="block">
-      <source dev="/dev/pvc_block_test" name="pvc_block_test"></source>
-      <target bus="sata" dev="sdg"></target>
-      <driver cache="writethrough" error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-pvc_block_test"></alias>
-    </disk>
-    <disk device="disk" type="block">
-      <source dev="/dev/dv_block_test" name="dv_block_test"></source>
-      <target bus="sata" dev="sdh"></target>
-      <driver cache="writethrough" error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-dv_block_test"></alias>
-    </disk>
-    <disk device="disk" type="file">
-      <source file="/var/run/kubevirt-private/service-account-disk/service-account.iso"></source>
-      <target bus="sata" dev="sdi"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1" discard="unmap"></driver>
-      <alias name="ua-serviceaccount_test"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/kubevirt-private/sysprep-disks/sysprep.iso"></source>
-      <target bus="sata" dev="sdj" tray="closed"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <alias name="ua-sysprep"></alias>
-    </disk>
-    <disk device="cdrom" type="file">
-      <source file="/var/run/kubevirt-private/sysprep-disks/sysprep_secret.iso"></source>
-      <target bus="sata" dev="sdk" tray="closed"></target>
-      <driver error_policy="stop" name="qemu" type="raw" iothread="1"></driver>
-      <alias name="ua-sysprep_secret"></alias>
-    </disk>
-    <input type="tablet" bus="virtio" model="virtio">
-      <alias name="ua-tablet0"></alias>
-      <address type="pci" domain="0x0000" bus="0x00" slot="0x07" function="0x0"></address>
-    </input>
-    <serial type="unix">
-      <target port="0"></target>
-      <source mode="bind" path="/var/run/kubevirt-private/f4686d2c-6e8d-4335-b8fd-81bee22f4814/virt-serial0"></source>
-    </serial>
-    <console type="pty">
-      <target type="serial" port="0"></target>
-    </console>
-    <watchdog model="i6300esb" action="poweroff">
-      <alias name="ua-mywatchdog"></alias>
-      <address type="pci" domain="0x0000" bus="0x00" slot="0x08" function="0x0"></address>
-    </watchdog>
-    <rng model="virtio-non-transitional">
-      <backend model="random">/dev/urandom</backend>
-      <address type="pci" domain="0x0000" bus="0x00" slot="0x09" function="0x0"></address>
-    </rng>
-  </devices>
-  <clock offset="utc" adjustment="reset">
-    <timer name="rtc" tickpolicy="catchup" present="yes" track="guest"></timer>
-    <timer name="pit" tickpolicy="discard" present="no"></timer>
-    <timer name="kvmclock" present="yes"></timer>
-    <timer name="hpet" tickpolicy="delay" present="no"></timer>
-    <timer name="hypervclock" present="yes"></timer>
-  </clock>
-  <metadata>
-    <kubevirt xmlns="http://kubevirt.io">
-      <uid></uid>
-    </kubevirt>
-  </metadata>
-  <features>
-    <acpi></acpi>
-    <apic></apic>
-    <hyperv>
-      <relaxed state="off"></relaxed>
-      <vapic state="on"></vapic>
-      <spinlocks state="on" retries="4096"></spinlocks>
-      <vpindex state="on"></vpindex>
-      <runtime state="off"></runtime>
-      <synic state="on"></synic>
-      <stimer state="on">
-        <direct state="on"></direct>
-      </stimer>
-      <reset state="on"></reset>
-      <vendor_id state="off" value="myvendor"></vendor_id>
-      <frequencies state="off"></frequencies>
-      <reenlightenment state="off"></reenlightenment>
-      <tlbflush state="on"></tlbflush>
-      <ipi state="on"></ipi>
-      <evmcs state="off"></evmcs>
-    </hyperv>
-    <smm></smm>
-    <kvm>
-      <hidden state="on"></hidden>
-    </kvm>
-    <pvspinlock state="off"></pvspinlock>
-  </features>
-  <cpu mode="host-model">
-    <topology sockets="1" cores="1" threads="1"></topology>
-  </cpu>
-  <vcpu placement="static">1</vcpu>
-  <iothreads>3</iothreads>
-</domain>`, domainType)
+		convertedDomainarm64 = fmt.Sprintf(convertedDomainarm64, argMemBalloon10period)
+
+		var convertedDomainWithDevicesOnRootBus = strings.TrimSpace(fmt.Sprintf(embedDomainTemplateRootBus, domainType))
 
 		var c *ConverterContext
 
@@ -1359,6 +629,7 @@ var _ = Describe("Converter", func() {
 		isBlockPVCMap["pvc_block_test"] = true
 		isBlockDVMap := make(map[string]bool)
 		isBlockDVMap["dv_block_test"] = true
+
 		BeforeEach(func() {
 			c = &ConverterContext{
 				VirtualMachine: vmi,
@@ -1376,6 +647,7 @@ var _ = Describe("Converter", func() {
 				MemBalloonStatsPeriod: 10,
 				EphemeraldiskCreator:  EphemeralDiskImageCreator,
 				FreePageReporting:     true,
+				SerialConsoleLog:      true,
 			}
 		})
 
@@ -1384,6 +656,7 @@ var _ = Describe("Converter", func() {
 			vmi.Spec.Domain.Devices.Rng = &v1.Rng{}
 			vmi.Spec.Domain.Devices.DisableHotplug = false
 			c.UseVirtioTransitional = true
+			vmi.Spec.Domain.Devices.UseVirtioTransitional = &c.UseVirtioTransitional
 			dom := vmiToDomain(vmi, c)
 			testutils.ExpectVirtioTransitionalOnly(&dom.Spec)
 		})
@@ -1579,6 +852,34 @@ var _ = Describe("Converter", func() {
 				Expect(domainSpec.VCPU.CPUs).To(Equal(uint32(3)), "Expect vcpus")
 			})
 
+			It("should define hotplugable default topology", func() {
+				v1.SetObjectDefaults_VirtualMachineInstance(vmi)
+				vmi.Spec.Domain.CPU = &v1.CPU{
+					Cores:      2,
+					MaxSockets: 3,
+					Sockets:    2,
+				}
+				domainSpec := vmiToDomainXMLToDomainSpec(vmi, c)
+				Expect(domainSpec.CPU.Topology.Cores).To(Equal(uint32(2)), "Expect cores")
+				Expect(domainSpec.CPU.Topology.Sockets).To(Equal(uint32(3)), "Expect sockets")
+				Expect(domainSpec.CPU.Topology.Threads).To(Equal(uint32(1)), "Expect threads")
+				Expect(domainSpec.VCPU.CPUs).To(Equal(uint32(6)), "Expect vcpus")
+				Expect(domainSpec.VCPUs).ToNot(BeNil(), "Expecting topology for hotplug")
+				Expect(domainSpec.VCPUs.VCPU).To(HaveLen(6), "Expecting topology for hotplug")
+				Expect(domainSpec.VCPUs.VCPU[0].Hotpluggable).To(Equal("no"), "Expecting the 1st vcpu to be stable")
+				Expect(domainSpec.VCPUs.VCPU[1].Hotpluggable).To(Equal("no"), "Expecting the 2nd vcpu to be stable")
+				Expect(domainSpec.VCPUs.VCPU[2].Hotpluggable).To(Equal("yes"), "Expecting the 3rd vcpu to be Hotpluggable")
+				Expect(domainSpec.VCPUs.VCPU[3].Hotpluggable).To(Equal("yes"), "Expecting the 4th vcpu to be Hotpluggable")
+				Expect(domainSpec.VCPUs.VCPU[4].Hotpluggable).To(Equal("yes"), "Expecting the 5th vcpu to be Hotpluggable")
+				Expect(domainSpec.VCPUs.VCPU[5].Hotpluggable).To(Equal("yes"), "Expecting the 6th vcpu to be Hotpluggable")
+				Expect(domainSpec.VCPUs.VCPU[0].Enabled).To(Equal("yes"), "Expecting the 1st vcpu to be enabled")
+				Expect(domainSpec.VCPUs.VCPU[1].Enabled).To(Equal("yes"), "Expecting the 2nd vcpu to be enabled")
+				Expect(domainSpec.VCPUs.VCPU[2].Enabled).To(Equal("yes"), "Expecting the 3rd vcpu to be enabled")
+				Expect(domainSpec.VCPUs.VCPU[3].Enabled).To(Equal("yes"), "Expecting the 4th vcpu to be enabled")
+				Expect(domainSpec.VCPUs.VCPU[4].Enabled).To(Equal("no"), "Expecting the 5th vcpu to be disabled")
+				Expect(domainSpec.VCPUs.VCPU[5].Enabled).To(Equal("no"), "Expecting the 6th vcpu to be disabled")
+			})
+
 			DescribeTable("should convert CPU model", func(model string) {
 				v1.SetObjectDefaults_VirtualMachineInstance(vmi)
 				vmi.Spec.Domain.CPU = &v1.CPU{
@@ -1612,6 +913,27 @@ var _ = Describe("Converter", func() {
 				domainSpec := vmiToDomainXMLToDomainSpec(vmi, c)
 
 				Expect(domainSpec.CPU.Mode).To(Equal("host-model"))
+			})
+		})
+
+		Context("when downwardMetrics are exposed via virtio-serial", func() {
+			It("should set socket options", func() {
+				v1.SetObjectDefaults_VirtualMachineInstance(vmi)
+				vmi.Spec.Domain.Devices.DownwardMetrics = &v1.DownwardMetrics{}
+				domain := vmiToDomain(vmi, c)
+
+				Expect(domain.Spec.Devices.Channels).To(ContainElement(
+					api.Channel{
+						Type: "unix",
+						Source: &api.ChannelSource{
+							Mode: "bind",
+							Path: downwardmetrics.DownwardMetricsChannelSocket,
+						},
+						Target: &api.ChannelTarget{
+							Type: v1.VirtIO,
+							Name: downwardmetrics.DownwardMetricsSerialDeviceName,
+						},
+					}))
 			})
 		})
 
@@ -2003,6 +1325,35 @@ var _ = Describe("Converter", func() {
 			Entry("use virtio transitional", true),
 			Entry("use virtio non-transitional", false),
 		)
+		DescribeTable("Should set the error policy", func(epolicy *v1.DiskErrorPolicy, expected string) {
+			vmi.Spec.Domain.Devices.Disks[0] = v1.Disk{
+				Name: "mydisk",
+				DiskDevice: v1.DiskDevice{
+					Disk: &v1.DiskTarget{
+						Bus: v1.VirtIO,
+					},
+				},
+				ErrorPolicy: epolicy,
+			}
+			vmi.Spec.Volumes[0] = v1.Volume{
+				Name: "mydisk",
+				VolumeSource: v1.VolumeSource{
+					Ephemeral: &v1.EphemeralVolumeSource{
+						PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{
+							ClaimName: "testclaim",
+						},
+					},
+				},
+			}
+			domainSpec := vmiToDomainXMLToDomainSpec(vmi, c)
+			Expect(string(domainSpec.Devices.Disks[0].Driver.ErrorPolicy)).To(Equal(expected))
+		},
+			Entry("ErrorPolicy not specified", nil, "stop"),
+			Entry("ErrorPolicy equal to stop", kubevirtpointer.P(v1.DiskErrorPolicyStop), "stop"),
+			Entry("ErrorPolicy equal to ignore", kubevirtpointer.P(v1.DiskErrorPolicyIgnore), "ignore"),
+			Entry("ErrorPolicy equal to report", kubevirtpointer.P(v1.DiskErrorPolicyReport), "report"),
+			Entry("ErrorPolicy equal to enospace", kubevirtpointer.P(v1.DiskErrorPolicyEnospace), "enospace"),
+		)
 
 	})
 	Context("Network convert", func() {
@@ -2031,85 +1382,6 @@ var _ = Describe("Converter", func() {
 			}
 		})
 
-		It("should add tcp if protocol not exist", func() {
-			iface := v1.Interface{Name: "test", InterfaceBindingMethod: v1.InterfaceBindingMethod{}, Ports: []v1.Port{{Port: 80}}}
-			iface.InterfaceBindingMethod.Slirp = &v1.InterfaceSlirp{}
-			qemuArg := api.Arg{Value: fmt.Sprintf("user,id=%s", iface.Name)}
-
-			Expect(configPortForward(&qemuArg, iface)).To(Succeed())
-			Expect(qemuArg.Value).To(Equal(fmt.Sprintf("user,id=%s,hostfwd=tcp::80-:80", iface.Name)))
-		})
-		It("should not fail for duplicate port with different protocol configuration", func() {
-			iface := v1.Interface{Name: "test", InterfaceBindingMethod: v1.InterfaceBindingMethod{}, Ports: []v1.Port{{Port: 80}, {Port: 80, Protocol: "UDP"}}}
-			iface.InterfaceBindingMethod.Slirp = &v1.InterfaceSlirp{}
-			qemuArg := api.Arg{Value: fmt.Sprintf("user,id=%s", iface.Name)}
-
-			Expect(configPortForward(&qemuArg, iface)).To(Succeed())
-			Expect(qemuArg.Value).To(Equal(fmt.Sprintf("user,id=%s,hostfwd=tcp::80-:80,hostfwd=udp::80-:80", iface.Name)))
-		})
-		It("Should create network configuration for slirp device", func() {
-			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
-			name := "otherName"
-			iface := v1.Interface{Name: name, InterfaceBindingMethod: v1.InterfaceBindingMethod{}, Ports: []v1.Port{{Port: 80}, {Port: 80, Protocol: "UDP"}}}
-			iface.InterfaceBindingMethod.Slirp = &v1.InterfaceSlirp{}
-			net := v1.DefaultPodNetwork()
-			net.Name = name
-			vmi.Spec.Networks = []v1.Network{*net}
-			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{iface}
-
-			domain := vmiToDomain(vmi, c)
-			Expect(domain).ToNot(BeNil())
-			Expect(domain.Spec.QEMUCmd.QEMUArg).To(HaveLen(2))
-		})
-		It("Should create two network configuration for slirp device", func() {
-			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
-			name1 := "Name"
-
-			iface1 := v1.Interface{Name: name1, InterfaceBindingMethod: v1.InterfaceBindingMethod{}, Ports: []v1.Port{{Port: 80}, {Port: 80, Protocol: "UDP"}}}
-			iface1.InterfaceBindingMethod.Slirp = &v1.InterfaceSlirp{}
-			net1 := v1.DefaultPodNetwork()
-			net1.Name = name1
-
-			name2 := "otherName"
-			iface2 := v1.Interface{Name: name2, InterfaceBindingMethod: v1.InterfaceBindingMethod{}, Ports: []v1.Port{{Port: 90}}}
-			iface2.InterfaceBindingMethod.Slirp = &v1.InterfaceSlirp{}
-			net2 := v1.DefaultPodNetwork()
-			net2.Name = name2
-
-			vmi.Spec.Networks = []v1.Network{*net1, *net2}
-			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{iface1, iface2}
-
-			domain := vmiToDomain(vmi, c)
-			Expect(domain).ToNot(BeNil())
-			Expect(domain.Spec.QEMUCmd.QEMUArg).To(HaveLen(4))
-		})
-		It("Should create two network configuration one for slirp device and one for bridge device", func() {
-			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
-			name1 := "Name"
-
-			iface1 := v1.DefaultBridgeNetworkInterface()
-			iface1.Name = name1
-			net1 := v1.DefaultPodNetwork()
-			net1.Name = name1
-
-			name2 := "otherName"
-			iface2 := v1.Interface{Name: name2, InterfaceBindingMethod: v1.InterfaceBindingMethod{}, Ports: []v1.Port{{Port: 90}}}
-			iface2.InterfaceBindingMethod.Slirp = &v1.InterfaceSlirp{}
-			net2 := v1.DefaultPodNetwork()
-			net2.Name = name2
-
-			vmi.Spec.Networks = []v1.Network{*net1, *net2}
-			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{*iface1, iface2}
-
-			domain := vmiToDomain(vmi, c)
-			Expect(domain).ToNot(BeNil())
-			Expect(domain.Spec.QEMUCmd.QEMUArg).To(HaveLen(2))
-			Expect(domain.Spec.Devices.Interfaces).To(HaveLen(2))
-			Expect(domain.Spec.Devices.Interfaces[0].Type).To(Equal("ethernet"))
-			Expect(domain.Spec.Devices.Interfaces[0].Model.Type).To(Equal("virtio-non-transitional"))
-			Expect(domain.Spec.Devices.Interfaces[1].Type).To(Equal("user"))
-			Expect(domain.Spec.Devices.Interfaces[1].Model.Type).To(Equal("e1000"))
-		})
 		It("Should set domain interface source correctly for multus", func() {
 			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
 			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{
@@ -2205,7 +1477,6 @@ var _ = Describe("Converter", func() {
 			name1 := "Name"
 
 			iface1 := v1.Interface{Name: name1, InterfaceBindingMethod: v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}}}
-			iface1.InterfaceBindingMethod.Slirp = &v1.InterfaceSlirp{}
 			net1 := v1.DefaultPodNetwork()
 			net1.Name = name1
 
@@ -2222,7 +1493,6 @@ var _ = Describe("Converter", func() {
 			name1 := "Name"
 
 			iface1 := v1.Interface{Name: name1, InterfaceBindingMethod: v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}}}
-			iface1.InterfaceBindingMethod.Slirp = &v1.InterfaceSlirp{}
 			net1 := v1.DefaultPodNetwork()
 			net1.Name = name1
 
@@ -3014,18 +2284,64 @@ var _ = Describe("Converter", func() {
 					},
 				},
 			}
+			vmi.Status.RuntimeUser = 107
 			domainSpec := vmiToDomainXMLToDomainSpec(vmi, c)
 			Expect(domainSpec.OS.BootLoader.ReadOnly).To(Equal("yes"))
 			Expect(domainSpec.OS.BootLoader.Type).To(Equal("pflash"))
 			Expect(domainSpec.OS.BootLoader.Secure).To(Equal(secureLoader))
 			Expect(path.Base(domainSpec.OS.BootLoader.Path)).To(Equal(efiCode))
 			Expect(path.Base(domainSpec.OS.NVRam.Template)).To(Equal(efiVars))
-			Expect(domainSpec.OS.NVRam.NVRam).To(Equal("/tmp/mynamespace_testvmi"))
+			Expect(domainSpec.OS.NVRam.NVRam).To(Equal("/var/run/kubevirt-private/libvirt/qemu/nvram/testvmi_VARS.fd"))
 		},
 			Entry("should use SecureBoot", True(), "OVMF_CODE.secboot.fd", "OVMF_VARS.secboot.fd"),
 			Entry("should use SecureBoot when SB not defined", nil, "OVMF_CODE.secboot.fd", "OVMF_VARS.secboot.fd"),
 			Entry("should not use SecureBoot", False(), "OVMF_CODE.fd", "OVMF_VARS.fd"),
 			Entry("should not use SecureBoot when OVMF_CODE.fd not present", True(), "OVMF_CODE.secboot.fd", "OVMF_VARS.fd"),
+		)
+
+		It("EFI vars should be in the right place when running as root", func() {
+			c.EFIConfiguration = &EFIConfiguration{
+				EFICode:      "OVMF_CODE.fd",
+				EFIVars:      "OVMF_VARS.fd",
+				SecureLoader: false,
+			}
+
+			vmi.Spec.Domain.Firmware = &v1.Firmware{
+				Bootloader: &v1.Bootloader{
+					EFI: &v1.EFI{
+						SecureBoot: pointer.BoolPtr(false),
+					},
+				},
+			}
+			domainSpec := vmiToDomainXMLToDomainSpec(vmi, c)
+			Expect(domainSpec.OS.BootLoader.ReadOnly).To(Equal("yes"))
+			Expect(domainSpec.OS.BootLoader.Type).To(Equal("pflash"))
+			Expect(domainSpec.OS.BootLoader.Secure).To(Equal("no"))
+			Expect(path.Base(domainSpec.OS.BootLoader.Path)).To(Equal(c.EFIConfiguration.EFICode))
+			Expect(path.Base(domainSpec.OS.NVRam.Template)).To(Equal(c.EFIConfiguration.EFIVars))
+			Expect(domainSpec.OS.NVRam.NVRam).To(Equal("/var/lib/libvirt/qemu/nvram/testvmi_VARS.fd"))
+		})
+
+		DescribeTable("display device should be set to", func(bootloader v1.Bootloader, enableFG bool, expectedDevice string) {
+			vmi.Spec.Domain.Firmware = &v1.Firmware{Bootloader: &bootloader}
+			c = &ConverterContext{
+				BochsForEFIGuests: enableFG,
+				VirtualMachine:    vmi,
+				AllowEmulation:    true,
+				EFIConfiguration:  &EFIConfiguration{},
+			}
+			domainSpec := vmiToDomainXMLToDomainSpec(vmi, c)
+			Expect(domainSpec.Devices.Video).To(HaveLen(1))
+			Expect(domainSpec.Devices.Video[0].Model.Type).To(Equal(expectedDevice))
+			if expectedDevice == "bochs" {
+				// Bochs doesn't support the vram option
+				Expect(domainSpec.Devices.Video[0].Model.VRam).To(BeNil())
+			}
+		},
+			Entry("VGA with BIOS and BochsDisplayForEFIGuests unset", v1.Bootloader{BIOS: &v1.BIOS{}}, false, "vga"),
+			Entry("VGA with BIOS and BochsDisplayForEFIGuests set", v1.Bootloader{BIOS: &v1.BIOS{}}, true, "vga"),
+			Entry("VGA with EFI and BochsDisplayForEFIGuests unset", v1.Bootloader{EFI: &v1.EFI{}}, false, "vga"),
+			Entry("Bochs with EFI and BochsDisplayForEFIGuests set", v1.Bootloader{EFI: &v1.EFI{}}, true, "bochs"),
 		)
 	})
 
@@ -3086,83 +2402,176 @@ var _ = Describe("Converter", func() {
 		var vmi *v1.VirtualMachineInstance
 		var c *ConverterContext
 
-		type ConverterFunc = func(name string, disk *api.Disk, c *ConverterContext) error
+		Context("disk", func() {
 
-		BeforeEach(func() {
-			vmi = &v1.VirtualMachineInstance{
-				ObjectMeta: k8smeta.ObjectMeta{
-					Name:      "testvmi",
-					Namespace: "mynamespace",
-				},
-			}
+			type ConverterFunc = func(name string, disk *api.Disk, c *ConverterContext) error
 
-			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
+			BeforeEach(func() {
+				vmi = &v1.VirtualMachineInstance{
+					ObjectMeta: k8smeta.ObjectMeta{
+						Name:      "testvmi",
+						Namespace: "mynamespace",
+					},
+				}
 
-			c = &ConverterContext{
-				VirtualMachine: vmi,
-				AllowEmulation: true,
-				IsBlockPVC: map[string]bool{
-					"test-block-pvc": true,
+				v1.SetObjectDefaults_VirtualMachineInstance(vmi)
+
+				c = &ConverterContext{
+					VirtualMachine: vmi,
+					AllowEmulation: true,
+					IsBlockPVC: map[string]bool{
+						"test-block-pvc": true,
+					},
+					IsBlockDV: map[string]bool{
+						"test-block-dv": true,
+					},
+					VolumesDiscardIgnore: []string{
+						"test-discard-ignore",
+					},
+				}
+			})
+
+			It("should automatically add virtio-scsi controller", func() {
+				domain := vmiToDomain(vmi, c)
+				Expect(domain.Spec.Devices.Controllers).To(HaveLen(3))
+				foundScsiController := false
+				for _, controller := range domain.Spec.Devices.Controllers {
+					if controller.Type == "scsi" {
+						foundScsiController = true
+						Expect(controller.Model).To(Equal("virtio-non-transitional"))
+
+					}
+				}
+				Expect(foundScsiController).To(BeTrue(), "did not find SCSI controller when expected")
+			})
+
+			It("should not automatically add virtio-scsi controller, if hotplug disabled", func() {
+				vmi.Spec.Domain.Devices.DisableHotplug = true
+				domain := vmiToDomain(vmi, c)
+				Expect(domain.Spec.Devices.Controllers).To(HaveLen(2))
+			})
+
+			DescribeTable("should convert",
+				func(converterFunc ConverterFunc, volumeName string, isBlockMode bool, ignoreDiscard bool) {
+					expectedDisk := &api.Disk{}
+					expectedDisk.Driver = &api.DiskDriver{}
+					expectedDisk.Driver.Type = "raw"
+					expectedDisk.Driver.ErrorPolicy = "stop"
+					if isBlockMode {
+						expectedDisk.Type = "block"
+						expectedDisk.Source.Dev = filepath.Join(v1.HotplugDiskDir, volumeName)
+					} else {
+						expectedDisk.Type = "file"
+						expectedDisk.Source.File = fmt.Sprintf("%s.img", filepath.Join(v1.HotplugDiskDir, volumeName))
+					}
+					if !ignoreDiscard {
+						expectedDisk.Driver.Discard = "unmap"
+					}
+
+					disk := &api.Disk{
+						Driver: &api.DiskDriver{},
+					}
+					Expect(converterFunc(volumeName, disk, c)).To(Succeed())
+					Expect(disk).To(Equal(expectedDisk))
 				},
-				IsBlockDV: map[string]bool{
-					"test-block-dv": true,
-				},
-				VolumesDiscardIgnore: []string{
-					"test-discard-ignore",
-				},
-			}
+				Entry("filesystem PVC", Convert_v1_Hotplug_PersistentVolumeClaim_To_api_Disk, "test-fs-pvc", false, false),
+				Entry("block mode PVC", Convert_v1_Hotplug_PersistentVolumeClaim_To_api_Disk, "test-block-pvc", true, false),
+				Entry("'discard ignore' PVC", Convert_v1_Hotplug_PersistentVolumeClaim_To_api_Disk, "test-discard-ignore", false, true),
+				Entry("filesystem DV", Convert_v1_Hotplug_DataVolume_To_api_Disk, "test-fs-dv", false, false),
+				Entry("block mode DV", Convert_v1_Hotplug_DataVolume_To_api_Disk, "test-block-dv", true, false),
+				Entry("'discard ignore' DV", Convert_v1_Hotplug_DataVolume_To_api_Disk, "test-discard-ignore", false, true),
+			)
 		})
 
-		It("should automatically add virtio-scsi controller", func() {
-			domain := vmiToDomain(vmi, c)
-			Expect(domain.Spec.Devices.Controllers).To(HaveLen(3))
-			foundScsiController := false
-			for _, controller := range domain.Spec.Devices.Controllers {
-				if controller.Type == "scsi" {
-					foundScsiController = true
-					Expect(controller.Model).To(Equal("virtio-non-transitional"))
+		Context("memory", func() {
+			var domain *api.Domain
+			var guestMemory resource.Quantity
+			var maxGuestMemory resource.Quantity
 
+			BeforeEach(func() {
+				guestMemory = resource.MustParse("32Mi")
+				maxGuestMemory = resource.MustParse("128Mi")
+
+				vmi = &v1.VirtualMachineInstance{
+					ObjectMeta: k8smeta.ObjectMeta{
+						Name:      "testvmi",
+						Namespace: "mynamespace",
+					},
+					Spec: v1.VirtualMachineInstanceSpec{
+						Domain: v1.DomainSpec{
+							Memory: &v1.Memory{
+								Guest:    &guestMemory,
+								MaxGuest: &maxGuestMemory,
+							},
+						},
+					},
+					Status: v1.VirtualMachineInstanceStatus{
+						Memory: &v1.MemoryStatus{
+							GuestAtBoot:  &guestMemory,
+							GuestCurrent: &guestMemory,
+						},
+					},
 				}
-			}
-			Expect(foundScsiController).To(BeTrue(), "did not find SCSI controller when expected")
+
+				domain = &api.Domain{
+					Spec: api.DomainSpec{
+						VCPU: &api.VCPU{
+							CPUs: 2,
+						},
+					},
+				}
+
+				v1.SetObjectDefaults_VirtualMachineInstance(vmi)
+
+				c = &ConverterContext{
+					VirtualMachine: vmi,
+					AllowEmulation: true,
+				}
+			})
+
+			It("should not setup hotplug when maxGuest is missing", func() {
+				vmi.Spec.Domain.Memory.MaxGuest = nil
+				err := setupDomainMemory(vmi, domain)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(domain.Spec.MaxMemory).To(BeNil())
+			})
+
+			It("should not setup hotplug when maxGuest equals guest memory", func() {
+				vmi.Spec.Domain.Memory.MaxGuest = &guestMemory
+				err := setupDomainMemory(vmi, domain)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(domain.Spec.MaxMemory).To(BeNil())
+			})
+
+			It("should setup hotplug when maxGuest is set", func() {
+				err := setupDomainMemory(vmi, domain)
+				Expect(err).ToNot(HaveOccurred())
+
+				Expect(domain.Spec.MaxMemory).ToNot(BeNil())
+				Expect(domain.Spec.MaxMemory.Unit).To(Equal("b"))
+				Expect(domain.Spec.MaxMemory.Value).To(Equal(uint64(maxGuestMemory.Value())))
+
+				Expect(domain.Spec.Memory).ToNot(BeNil())
+				Expect(domain.Spec.Memory.Unit).To(Equal("b"))
+				Expect(domain.Spec.Memory.Value).To(Equal(uint64(maxGuestMemory.Value())))
+
+				Expect(domain.Spec.CPU.NUMA).ToNot(BeNil())
+				Expect(domain.Spec.CPU.NUMA.Cells).To(HaveLen(1))
+				Expect(domain.Spec.CPU.NUMA.Cells[0].Unit).To(Equal("b"))
+				Expect(domain.Spec.CPU.NUMA.Cells[0].Memory).To(Equal(uint64(guestMemory.Value())))
+
+				pluggableMemory := uint64(maxGuestMemory.Value() - guestMemory.Value())
+
+				Expect(domain.Spec.Devices.Memory).ToNot(BeNil())
+				Expect(domain.Spec.Devices.Memory.Model).To(Equal("virtio-mem"))
+				Expect(domain.Spec.Devices.Memory.Target).ToNot(BeNil())
+				Expect(domain.Spec.Devices.Memory.Target.Node).To(Equal("0"))
+				Expect(domain.Spec.Devices.Memory.Target.Size.Value).To(Equal(pluggableMemory))
+				Expect(domain.Spec.Devices.Memory.Target.Size.Unit).To(Equal("b"))
+				Expect(domain.Spec.Devices.Memory.Target.Block.Value).To(Equal(uint64(MemoryHotplugBlockAlignmentBytes)))
+				Expect(domain.Spec.Devices.Memory.Target.Block.Unit).To(Equal("b"))
+			})
 		})
-
-		It("should not automatically add virtio-scsi controller, if hotplug disabled", func() {
-			vmi.Spec.Domain.Devices.DisableHotplug = true
-			domain := vmiToDomain(vmi, c)
-			Expect(domain.Spec.Devices.Controllers).To(HaveLen(2))
-		})
-
-		DescribeTable("should convert",
-			func(converterFunc ConverterFunc, volumeName string, isBlockMode bool, ignoreDiscard bool) {
-				expectedDisk := &api.Disk{}
-				expectedDisk.Driver = &api.DiskDriver{}
-				expectedDisk.Driver.Type = "raw"
-				expectedDisk.Driver.ErrorPolicy = "stop"
-				if isBlockMode {
-					expectedDisk.Type = "block"
-					expectedDisk.Source.Dev = filepath.Join(v1.HotplugDiskDir, volumeName)
-				} else {
-					expectedDisk.Type = "file"
-					expectedDisk.Source.File = fmt.Sprintf("%s.img", filepath.Join(v1.HotplugDiskDir, volumeName))
-				}
-				if !ignoreDiscard {
-					expectedDisk.Driver.Discard = "unmap"
-				}
-
-				disk := &api.Disk{
-					Driver: &api.DiskDriver{},
-				}
-				Expect(converterFunc(volumeName, disk, c)).To(Succeed())
-				Expect(disk).To(Equal(expectedDisk))
-			},
-			Entry("filesystem PVC", Convert_v1_Hotplug_PersistentVolumeClaim_To_api_Disk, "test-fs-pvc", false, false),
-			Entry("block mode PVC", Convert_v1_Hotplug_PersistentVolumeClaim_To_api_Disk, "test-block-pvc", true, false),
-			Entry("'discard ignore' PVC", Convert_v1_Hotplug_PersistentVolumeClaim_To_api_Disk, "test-discard-ignore", false, true),
-			Entry("filesystem DV", Convert_v1_Hotplug_DataVolume_To_api_Disk, "test-fs-dv", false, false),
-			Entry("block mode DV", Convert_v1_Hotplug_DataVolume_To_api_Disk, "test-block-dv", true, false),
-			Entry("'discard ignore' DV", Convert_v1_Hotplug_DataVolume_To_api_Disk, "test-discard-ignore", false, true),
-		)
 	})
 
 	Context("with AMD SEV LaunchSecurity", func() {
@@ -3176,11 +2585,13 @@ var _ = Describe("Converter", func() {
 			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
 			vmi.Spec.Domain.Devices.Rng = &v1.Rng{}
 			vmi.Spec.Domain.Devices.AutoattachMemBalloon = pointer.BoolPtr(true)
+			nonVirtioIface := v1.Interface{Name: "red", Model: "e1000"}
+			secondaryNetwork := v1.Network{Name: "red"}
 			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{
-				*v1.DefaultBridgeNetworkInterface(), *v1.DefaultSlirpNetworkInterface(),
+				*v1.DefaultBridgeNetworkInterface(), nonVirtioIface,
 			}
 			vmi.Spec.Networks = []v1.Network{
-				*v1.DefaultPodNetwork(), *v1.DefaultPodNetwork(),
+				*v1.DefaultPodNetwork(), secondaryNetwork,
 			}
 			vmi.Spec.Domain.LaunchSecurity = &v1.LaunchSecurity{
 				SEV: &v1.SEV{},
@@ -3209,7 +2620,23 @@ var _ = Describe("Converter", func() {
 			Expect(domain).ToNot(BeNil())
 			Expect(domain.Spec.LaunchSecurity).ToNot(BeNil())
 			Expect(domain.Spec.LaunchSecurity.Type).To(Equal("sev"))
-			Expect(domain.Spec.LaunchSecurity.Policy).To(Equal(SEVPolicyNoDebug))
+			Expect(domain.Spec.LaunchSecurity.Policy).To(Equal("0x" + strconv.FormatUint(uint64(sev.SEVPolicyNoDebug), 16)))
+		})
+
+		It("should set LaunchSecurity domain element with 'sev' type with 'NoDebug' and 'EncryptedState' policy bits", func() {
+			// VMI with SEV-ES
+			vmi.Spec.Domain.LaunchSecurity = &v1.LaunchSecurity{
+				SEV: &v1.SEV{
+					Policy: &v1.SEVPolicy{
+						EncryptedState: pointer.Bool(true),
+					},
+				},
+			}
+			domain := vmiToDomain(vmi, c)
+			Expect(domain).ToNot(BeNil())
+			Expect(domain.Spec.LaunchSecurity).ToNot(BeNil())
+			Expect(domain.Spec.LaunchSecurity.Type).To(Equal("sev"))
+			Expect(domain.Spec.LaunchSecurity.Policy).To(Equal("0x" + strconv.FormatUint(uint64(sev.SEVPolicyNoDebug|sev.SEVPolicyEncryptedState), 16)))
 		})
 
 		It("should set IOMMU attribute of the RngDriver", func() {
@@ -3330,6 +2757,71 @@ var _ = Describe("Converter", func() {
 			domain := vmiToDomain(vmi, c)
 			expectTsc(domain, false)
 		})
+	})
+
+	Context("with FreePageReporting", func() {
+		var (
+			vmi *v1.VirtualMachineInstance
+			c   *ConverterContext
+		)
+
+		BeforeEach(func() {
+			vmi = kvapi.NewMinimalVMI("testvmi")
+			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
+		})
+
+		DescribeTable("should set freePageReporting attribute of memballooning device, accordingly to the context value", func(freePageReporting bool, expectedValue string) {
+			c = &ConverterContext{
+				FreePageReporting: freePageReporting,
+				AllowEmulation:    true,
+			}
+			domain := vmiToDomain(vmi, c)
+			Expect(domain).ToNot(BeNil())
+
+			Expect(domain.Spec.Devices).ToNot(BeNil())
+			Expect(domain.Spec.Devices.Ballooning).ToNot(BeNil())
+			Expect(domain.Spec.Devices.Ballooning.FreePageReporting).To(BeEquivalentTo(expectedValue))
+		},
+			Entry("when true", true, "on"),
+			Entry("when false", false, "off"),
+		)
+	})
+
+	Context("with Paused strategy", func() {
+		var (
+			vmi *v1.VirtualMachineInstance
+			c   *ConverterContext
+		)
+
+		BeforeEach(func() {
+			vmi = kvapi.NewMinimalVMI("testvmi")
+			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
+		})
+
+		DescribeTable("bootmenu should be", func(startPaused bool) {
+			c = &ConverterContext{
+				AllowEmulation: true,
+			}
+
+			if startPaused {
+				strategy := v1.StartStrategyPaused
+				vmi.Spec.StartStrategy = &strategy
+			}
+			domain := vmiToDomain(vmi, c)
+			Expect(domain).ToNot(BeNil())
+
+			if startPaused {
+				Expect(domain.Spec.OS.BootMenu).ToNot(BeNil())
+				Expect(domain.Spec.OS.BootMenu.Enable).To(Equal("yes"))
+				Expect(*domain.Spec.OS.BootMenu.Timeout).To(Equal(BootMenuTimeoutMS))
+			} else {
+				Expect(domain.Spec.OS.BootMenu).To(BeNil())
+			}
+
+		},
+			Entry("enabled when set", true),
+			Entry("disabled when not set", false),
+		)
 	})
 })
 

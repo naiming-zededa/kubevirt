@@ -47,7 +47,7 @@ import (
 
 	virtv1 "kubevirt.io/api/core/v1"
 	exportv1 "kubevirt.io/api/export/v1alpha1"
-	instancetypev1alpha2 "kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 	snapshotv1 "kubevirt.io/api/snapshot/v1alpha1"
 	kubevirtfake "kubevirt.io/client-go/generated/kubevirt/clientset/versioned/fake"
 	"kubevirt.io/client-go/kubecli"
@@ -88,6 +88,8 @@ var _ = Describe("VMSnapshot source", func() {
 		preferenceInformer          cache.SharedIndexInformer
 		clusterPreferenceInformer   cache.SharedIndexInformer
 		controllerRevisionInformer  cache.SharedIndexInformer
+		rqInformer                  cache.SharedIndexInformer
+		nsInformer                  cache.SharedIndexInformer
 		k8sClient                   *k8sfake.Clientset
 		vmExportClient              *kubevirtfake.Clientset
 		fakeVolumeSnapshotProvider  *MockVolumeSnapshotProvider
@@ -125,11 +127,13 @@ var _ = Describe("VMSnapshot source", func() {
 		secretInformer, _ = testutils.NewFakeInformerFor(&k8sv1.Secret{})
 		kvInformer, _ = testutils.NewFakeInformerFor(&virtv1.KubeVirt{})
 		crdInformer, _ = testutils.NewFakeInformerFor(&extv1.CustomResourceDefinition{})
-		instancetypeInformer, _ = testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineInstancetype{})
-		clusterInstancetypeInformer, _ = testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineClusterInstancetype{})
-		preferenceInformer, _ = testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachinePreference{})
-		clusterPreferenceInformer, _ = testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineClusterPreference{})
+		instancetypeInformer, _ = testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineInstancetype{})
+		clusterInstancetypeInformer, _ = testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineClusterInstancetype{})
+		preferenceInformer, _ = testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachinePreference{})
+		clusterPreferenceInformer, _ = testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineClusterPreference{})
 		controllerRevisionInformer, _ = testutils.NewFakeInformerFor(&appsv1.ControllerRevision{})
+		rqInformer, _ = testutils.NewFakeInformerFor(&k8sv1.ResourceQuota{})
+		nsInformer, _ = testutils.NewFakeInformerFor(&k8sv1.Namespace{})
 		fakeVolumeSnapshotProvider = &MockVolumeSnapshotProvider{
 			volumeSnapshots: []*vsv1.VolumeSnapshot{},
 		}
@@ -153,7 +157,7 @@ var _ = Describe("VMSnapshot source", func() {
 			ServiceInformer:             serviceInformer,
 			DataVolumeInformer:          dvInformer,
 			KubevirtNamespace:           "kubevirt",
-			TemplateService:             services.NewTemplateService("a", 240, "b", "c", "d", "e", "f", "g", pvcInformer.GetStore(), virtClient, config, qemuGid, "h"),
+			TemplateService:             services.NewTemplateService("a", 240, "b", "c", "d", "e", "f", "g", pvcInformer.GetStore(), virtClient, config, qemuGid, "h", rqInformer.GetStore(), nsInformer.GetStore()),
 			caCertManager:               bootstrap.NewFileCertificateManager(certFilePath, keyFilePath),
 			RouteCache:                  routeCache,
 			IngressCache:                ingressCache,

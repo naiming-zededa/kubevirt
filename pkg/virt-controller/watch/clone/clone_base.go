@@ -50,7 +50,7 @@ type VMCloneController struct {
 	cloneStatusUpdater *status.CloneStatusUpdater
 }
 
-func NewVmCloneController(client kubecli.KubevirtClient, vmCloneInformer, snapshotInformer, restoreInformer, vmInformer, snapshotContentInformer cache.SharedIndexInformer, recorder record.EventRecorder) *VMCloneController {
+func NewVmCloneController(client kubecli.KubevirtClient, vmCloneInformer, snapshotInformer, restoreInformer, vmInformer, snapshotContentInformer cache.SharedIndexInformer, recorder record.EventRecorder) (*VMCloneController, error) {
 	ctrl := VMCloneController{
 		client:                  client,
 		vmCloneInformer:         vmCloneInformer,
@@ -64,7 +64,7 @@ func NewVmCloneController(client kubecli.KubevirtClient, vmCloneInformer, snapsh
 		cloneStatusUpdater:      status.NewCloneStatusUpdater(client),
 	}
 
-	ctrl.vmCloneInformer.AddEventHandler(
+	_, err := ctrl.vmCloneInformer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    ctrl.handleVMClone,
 			UpdateFunc: func(oldObj, newObj interface{}) { ctrl.handleVMClone(newObj) },
@@ -72,7 +72,11 @@ func NewVmCloneController(client kubecli.KubevirtClient, vmCloneInformer, snapsh
 		},
 	)
 
-	ctrl.snapshotInformer.AddEventHandler(
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = ctrl.snapshotInformer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    ctrl.handleSnapshot,
 			UpdateFunc: func(oldObj, newObj interface{}) { ctrl.handleSnapshot(newObj) },
@@ -80,7 +84,11 @@ func NewVmCloneController(client kubecli.KubevirtClient, vmCloneInformer, snapsh
 		},
 	)
 
-	ctrl.restoreInformer.AddEventHandler(
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = ctrl.restoreInformer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    ctrl.handleRestore,
 			UpdateFunc: func(oldObj, newObj interface{}) { ctrl.handleRestore(newObj) },
@@ -88,7 +96,10 @@ func NewVmCloneController(client kubecli.KubevirtClient, vmCloneInformer, snapsh
 		},
 	)
 
-	return &ctrl
+	if err != nil {
+		return nil, err
+	}
+	return &ctrl, nil
 }
 
 func (ctrl *VMCloneController) handleVMClone(obj interface{}) {
@@ -133,13 +144,19 @@ func (ctrl *VMCloneController) handleSnapshot(obj interface{}) {
 		return
 	}
 
-	keys, err := ctrl.vmCloneInformer.GetIndexer().IndexKeys("snapshotSource", snapshotKey)
+	snapshotSourceKeys, err := ctrl.vmCloneInformer.GetIndexer().IndexKeys("snapshotSource", snapshotKey)
 	if err != nil {
-		log.Log.Object(snapshot).Reason(err).Error("cannot get clone keys from snapshotSource indexer")
+		log.Log.Object(snapshot).Reason(err).Error("cannot get clone snapshotSourceKeys from snapshotSource indexer")
 		return
 	}
 
-	for _, key := range keys {
+	snapshotWaitingKeys, err := ctrl.vmCloneInformer.GetIndexer().IndexKeys(string(clonev1alpha1.SnapshotInProgress), snapshotKey)
+	if err != nil {
+		log.Log.Object(snapshot).Reason(err).Error("cannot get clone snapshotWaitingKeys from " + string(clonev1alpha1.SnapshotInProgress) + " indexer")
+		return
+	}
+
+	for _, key := range append(snapshotSourceKeys, snapshotWaitingKeys...) {
 		ctrl.vmCloneQueue.AddRateLimited(key)
 	}
 }
@@ -156,6 +173,22 @@ func (ctrl *VMCloneController) handleRestore(obj interface{}) {
 	}
 
 	if ownedByClone, key := isOwnedByClone(restore); ownedByClone {
+		ctrl.vmCloneQueue.AddRateLimited(key)
+	}
+
+	restoreKey, err := cache.MetaNamespaceKeyFunc(restore)
+	if err != nil {
+		log.Log.Object(restore).Reason(err).Error("cannot get snapshot key")
+		return
+	}
+
+	restoreWaitingKeys, err := ctrl.vmCloneInformer.GetIndexer().IndexKeys(string(clonev1alpha1.RestoreInProgress), restoreKey)
+	if err != nil {
+		log.Log.Object(restore).Reason(err).Error("cannot get clone restoreWaitingKeys from " + string(clonev1alpha1.RestoreInProgress) + " indexer")
+		return
+	}
+
+	for _, key := range restoreWaitingKeys {
 		ctrl.vmCloneQueue.AddRateLimited(key)
 	}
 }

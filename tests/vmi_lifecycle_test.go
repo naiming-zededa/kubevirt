@@ -70,22 +70,6 @@ import (
 	"kubevirt.io/kubevirt/tests/watcher"
 )
 
-func addNodeAffinityToVMI(vmi *v1.VirtualMachineInstance, nodeName string) {
-	vmi.Spec.Affinity = &k8sv1.Affinity{
-		NodeAffinity: &k8sv1.NodeAffinity{
-			RequiredDuringSchedulingIgnoredDuringExecution: &k8sv1.NodeSelector{
-				NodeSelectorTerms: []k8sv1.NodeSelectorTerm{
-					{
-						MatchExpressions: []k8sv1.NodeSelectorRequirement{
-							{Key: "kubernetes.io/hostname", Operator: k8sv1.NodeSelectorOpIn, Values: []string{nodeName}},
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
 var _ = Describe("[rfe_id:273][crit:high][arm64][vendor:cnv-qe@redhat.com][level:component][sig-compute]VMIlifecycle", decorators.SigCompute, decorators.VMIlifecycle, func() {
 
 	var err error
@@ -239,7 +223,6 @@ var _ = Describe("[rfe_id:273][crit:high][arm64][vendor:cnv-qe@redhat.com][level
 				Expect(vmi.Status.EvacuationNodeName).ToNot(Equal(""))
 				return nil
 			}, 20*time.Second, 1*time.Second).ShouldNot(HaveOccurred())
-
 		})
 
 		It("[test_id:1622]should log libvirtd logs", func() {
@@ -728,7 +711,10 @@ var _ = Describe("[rfe_id:273][crit:high][arm64][vendor:cnv-qe@redhat.com][level
 
 				// Ensure that the VMI is running. This is necessary to ensure that virt-handler is fully responsible for
 				// the VMI. Otherwise virt-controller may move the VMI to failed instead of the node controller.
-				nodeName = libwait.WaitForSuccessfulVMIStartIgnoreWarnings(vmi).Status.NodeName
+				nodeName = libwait.WaitForSuccessfulVMIStart(vmi,
+					libwait.WithFailOnWarnings(false),
+					libwait.WithTimeout(180),
+				).Status.NodeName
 
 				virtHandler, err = libnode.GetVirtHandlerPod(virtClient, nodeName)
 				Expect(err).ToNot(HaveOccurred(), "Should get virthandler client")
@@ -846,17 +832,15 @@ var _ = Describe("[rfe_id:273][crit:high][arm64][vendor:cnv-qe@redhat.com][level
 			})
 
 			It("[test_id:1635]the vmi with tolerations should be scheduled", func() {
-				vmi := libvmi.NewCirros()
+				vmi := libvmi.NewCirros(libvmi.WithNodeAffinityFor(&nodes.Items[0]))
 				vmi.Spec.Tolerations = []k8sv1.Toleration{{Key: "test", Value: "123"}}
-				addNodeAffinityToVMI(vmi, nodes.Items[0].Name)
 				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vmi)
 				Expect(err).ToNot(HaveOccurred(), "Should create VMI")
 				libwait.WaitForSuccessfulVMIStart(vmi)
 			})
 
 			It("[test_id:1636]the vmi without tolerations should not be scheduled", func() {
-				vmi := libvmi.NewCirros()
-				addNodeAffinityToVMI(vmi, nodes.Items[0].Name)
+				vmi := libvmi.NewCirros(libvmi.WithNodeAffinityFor(&nodes.Items[0]))
 				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vmi)
 				Expect(err).ToNot(HaveOccurred(), "Should create VMI")
 				By("Waiting for the VirtualMachineInstance to be unschedulable")
@@ -883,8 +867,7 @@ var _ = Describe("[rfe_id:273][crit:high][arm64][vendor:cnv-qe@redhat.com][level
 			})
 
 			It("[test_id:1637]the vmi with node affinity and no conflicts should be scheduled", func() {
-				vmi := libvmi.NewCirros()
-				addNodeAffinityToVMI(vmi, nodes.Items[0].Name)
+				vmi := libvmi.NewCirros(libvmi.WithNodeAffinityFor(&nodes.Items[0]))
 				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vmi)
 				Expect(err).ToNot(HaveOccurred(), "Should create VMI")
 				libwait.WaitForSuccessfulVMIStart(vmi)
@@ -895,8 +878,7 @@ var _ = Describe("[rfe_id:273][crit:high][arm64][vendor:cnv-qe@redhat.com][level
 			})
 
 			It("[test_id:1638]the vmi with node affinity and anti-pod affinity should not be scheduled", func() {
-				vmi := libvmi.NewCirros()
-				addNodeAffinityToVMI(vmi, nodes.Items[0].Name)
+				vmi := libvmi.NewCirros(libvmi.WithNodeAffinityFor(&nodes.Items[0]))
 				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vmi)
 				Expect(err).ToNot(HaveOccurred(), "Should create VMI")
 				libwait.WaitForSuccessfulVMIStart(vmi)
@@ -904,8 +886,7 @@ var _ = Describe("[rfe_id:273][crit:high][arm64][vendor:cnv-qe@redhat.com][level
 				Expect(err).ToNot(HaveOccurred(), "Should get VMI")
 				Expect(curVMI.Status.NodeName).To(Equal(nodes.Items[0].Name), "VMI should run on the same node")
 
-				vmiB := libvmi.NewCirros()
-				addNodeAffinityToVMI(vmiB, nodes.Items[0].Name)
+				vmiB := libvmi.NewCirros(libvmi.WithNodeAffinityFor(&nodes.Items[0]))
 
 				vmiB.Spec.Affinity.PodAntiAffinity = &k8sv1.PodAntiAffinity{
 					RequiredDuringSchedulingIgnoredDuringExecution: []k8sv1.PodAffinityTerm{
@@ -1258,7 +1239,9 @@ var _ = Describe("[rfe_id:273][crit:high][arm64][vendor:cnv-qe@redhat.com][level
 
 			It("[test_id:3204]the vmi with cpu.feature policy 'forbid' should not be scheduled on a node with that cpu feature label", func() {
 
-				vmi := libvmi.NewCirros()
+				// Add node affinity first to test later on that although there is node affinity to
+				// the specific node - the feature policy 'forbid' will deny shceduling on that node.
+				vmi := libvmi.NewCirros(libvmi.WithNodeAffinityFor(&nodes.Items[0]))
 				vmi.Spec.Domain.CPU = &v1.CPU{
 					Cores: 1,
 					Features: []v1.CPUFeature{
@@ -1268,10 +1251,6 @@ var _ = Describe("[rfe_id:273][crit:high][arm64][vendor:cnv-qe@redhat.com][level
 						},
 					},
 				}
-
-				// Add node affinity first to test later on that although there is node affinity to
-				// the specific node - the feature policy 'forbid' will deny shceduling on that node.
-				addNodeAffinityToVMI(vmi, node.Name)
 
 				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vmi)
 				Expect(err).ToNot(HaveOccurred(), "Should create VMI")
@@ -1755,11 +1734,16 @@ var _ = Describe("[rfe_id:273][crit:high][arm64][vendor:cnv-qe@redhat.com][level
 			// Wait for stop event of the VirtualMachineInstance
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			watcher.New(obj).Timeout(60*time.Second).SinceWatchedObjectResourceVersion().WaitFor(ctx, watcher.WarningEvent, v1.Stopped)
+			objectEventWatcher := watcher.New(obj).Timeout(60 * time.Second).SinceWatchedObjectResourceVersion()
+			wp := watcher.WarningsPolicy{FailOnWarnings: true, WarningsIgnoreList: []string{"server error. command SyncVMI failed", "The VirtualMachineInstance crashed"}}
+			objectEventWatcher.SetWarningsPolicy(wp)
+			objectEventWatcher.WaitFor(ctx, watcher.WarningEvent, v1.Stopped)
 
 			// Wait for some time and see if a sync event happens on the stopped VirtualMachineInstance
 			By("Checking that virt-handler does not try to sync stopped VirtualMachineInstance")
-			event := watcher.New(obj).SinceWatchedObjectResourceVersion().Timeout(10*time.Second).WaitNotFor(ctx, watcher.WarningEvent, v1.SyncFailed)
+			stoppedVMI, err := virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Get(context.Background(), vmi.Name, &metav1.GetOptions{})
+			Expect(err).ToNot(HaveOccurred(), "Should refresh VMI to get its current resourceVersion")
+			event := watcher.New(stoppedVMI).Timeout(10*time.Second).SinceWatchedObjectResourceVersion().WaitNotFor(ctx, watcher.WarningEvent, v1.SyncFailed)
 			Expect(event).To(BeNil(), "virt-handler tried to sync on a VirtualMachineInstance in final state")
 		})
 	})

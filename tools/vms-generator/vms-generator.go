@@ -36,7 +36,7 @@ import (
 	k8sfield "k8s.io/apimachinery/pkg/util/validation/field"
 
 	v1 "kubevirt.io/api/core/v1"
-	instancetypev1alpha2 "kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 	poolv1 "kubevirt.io/api/pool/v1alpha1"
 
 	"kubevirt.io/kubevirt/pkg/testutils"
@@ -53,7 +53,7 @@ func main() {
 
 	config, _, _ := testutils.NewFakeClusterConfigUsingKVConfig(&v1.KubeVirtConfiguration{
 		DeveloperConfiguration: &v1.DeveloperConfiguration{
-			FeatureGates: []string{"DataVolumes", "LiveMigration", "SRIOV", "GPU", "HostDisk", "Macvtap"},
+			FeatureGates: []string{"DataVolumes", "LiveMigration", "SRIOV", "GPU", "HostDisk", "Macvtap", "HostDevices"},
 		},
 		NetworkConfiguration: &v1.NetworkConfiguration{
 			PermitSlirpInterface:              &permit,
@@ -70,16 +70,16 @@ func main() {
 		},
 	})
 
-	var virtualMachineInstancetypes = map[string]*instancetypev1alpha2.VirtualMachineInstancetype{
+	var virtualMachineInstancetypes = map[string]*instancetypev1beta1.VirtualMachineInstancetype{
 		utils.VirtualMachineInstancetypeComputeSmall: utils.GetVirtualMachineInstancetypeComputeSmall(),
 		utils.VirtualMachineInstancetypeComputeLarge: utils.GetVirtualMachineInstancetypeComputeLarge(),
 	}
 
-	var virtualMachineClusterInstancetypes = map[string]*instancetypev1alpha2.VirtualMachineClusterInstancetype{
+	var virtualMachineClusterInstancetypes = map[string]*instancetypev1beta1.VirtualMachineClusterInstancetype{
 		utils.VirtualMachineClusterInstancetypeComputeSmall: utils.GetVirtualMachineClusterInstancetypeComputeSmall(),
 	}
 
-	var vmps = map[string]*instancetypev1alpha2.VirtualMachinePreference{
+	var vmps = map[string]*instancetypev1beta1.VirtualMachinePreference{
 		utils.VirtualMachinePreferenceVirtio:  utils.GetVirtualMachinePreferenceVirtio(),
 		utils.VirtualMachinePreferenceWindows: utils.GetVirtualMachinePreferenceWindows(),
 	}
@@ -104,27 +104,29 @@ func main() {
 	}
 
 	var vmis = map[string]*v1.VirtualMachineInstance{
-		utils.VmiEphemeral:         utils.GetVMIEphemeral(),
-		utils.VmiMigratable:        utils.GetVMIMigratable(),
-		utils.VmiSata:              utils.GetVMISata(),
-		utils.VmiFedora:            utils.GetVMIEphemeralFedora(),
-		utils.VmiFedoraIsolated:    utils.GetVMIEphemeralFedoraIsolated(),
-		utils.VmiSecureBoot:        utils.GetVMISecureBoot(),
-		utils.VmiAlpineEFI:         utils.GetVMIAlpineEFI(),
-		utils.VmiNoCloud:           utils.GetVMINoCloud(),
-		utils.VmiPVC:               utils.GetVMIPvc(),
-		utils.VmiWindows:           utils.GetVMIWindows(),
-		utils.VmiSlirp:             utils.GetVMISlirp(),
-		utils.VmiSRIOV:             utils.GetVMISRIOV(),
-		utils.VmiWithHookSidecar:   utils.GetVMIWithHookSidecar(),
-		utils.VmiMultusPtp:         utils.GetVMIMultusPtp(),
-		utils.VmiMultusMultipleNet: utils.GetVMIMultusMultipleNet(),
-		utils.VmiMasquerade:        utils.GetVMIMasquerade(),
-		utils.VmiHostDisk:          utils.GetVMIHostDisk(),
-		utils.VmiGPU:               utils.GetVMIGPU(),
-		utils.VmiMacvtap:           utils.GetVMIMacvtap(),
-		utils.VmiKernelBoot:        utils.GetVMIKernelBoot(),
-		utils.VmiARM:               utils.GetVMIARM(),
+		utils.VmiEphemeral:                utils.GetVMIEphemeral(),
+		utils.VmiMigratable:               utils.GetVMIMigratable(),
+		utils.VmiSata:                     utils.GetVMISata(),
+		utils.VmiFedora:                   utils.GetVMIEphemeralFedora(),
+		utils.VmiFedoraIsolated:           utils.GetVMIEphemeralFedoraIsolated(),
+		utils.VmiSecureBoot:               utils.GetVMISecureBoot(),
+		utils.VmiAlpineEFI:                utils.GetVMIAlpineEFI(),
+		utils.VmiNoCloud:                  utils.GetVMINoCloud(),
+		utils.VmiPVC:                      utils.GetVMIPvc(),
+		utils.VmiWindows:                  utils.GetVMIWindows(),
+		utils.VmiSlirp:                    utils.GetVMISlirp(),
+		utils.VmiSRIOV:                    utils.GetVMISRIOV(),
+		utils.VmiWithHookSidecar:          utils.GetVMIWithHookSidecar(),
+		utils.VmiWithHookSidecarConfigMap: utils.GetVmiWithHookSidecarConfigMap(),
+		utils.VmiMultusPtp:                utils.GetVMIMultusPtp(),
+		utils.VmiMultusMultipleNet:        utils.GetVMIMultusMultipleNet(),
+		utils.VmiMasquerade:               utils.GetVMIMasquerade(),
+		utils.VmiHostDisk:                 utils.GetVMIHostDisk(),
+		utils.VmiGPU:                      utils.GetVMIGPU(),
+		utils.VmiMacvtap:                  utils.GetVMIMacvtap(),
+		utils.VmiKernelBoot:               utils.GetVMIKernelBoot(),
+		utils.VmiARM:                      utils.GetVMIARM(),
+		utils.VmiUSB:                      utils.GetVMIUSB(),
 	}
 
 	var vmireplicasets = map[string]*v1.VirtualMachineInstanceReplicaSet{

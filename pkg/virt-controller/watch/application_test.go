@@ -31,10 +31,9 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	restful "github.com/emicklei/go-restful"
-	io_prometheus_client "github.com/prometheus/client_model/go"
+	"github.com/emicklei/go-restful/v3"
 	appsv1 "k8s.io/api/apps/v1"
-	kubev1 "k8s.io/api/core/v1"
+	k8sv1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -43,17 +42,18 @@ import (
 	clonev1alpha1 "kubevirt.io/api/clone/v1alpha1"
 	v1 "kubevirt.io/api/core/v1"
 	exportv1 "kubevirt.io/api/export/v1alpha1"
-	instancetypev1alpha2 "kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 	migrationsv1 "kubevirt.io/api/migrations/v1alpha1"
 	snapshotv1 "kubevirt.io/api/snapshot/v1alpha1"
 	"kubevirt.io/client-go/kubecli"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
 	"kubevirt.io/kubevirt/pkg/controller"
+	"kubevirt.io/kubevirt/pkg/monitoring/virt-controller/metrics"
 	"kubevirt.io/kubevirt/pkg/rest"
 	"kubevirt.io/kubevirt/pkg/storage/export/export"
 	"kubevirt.io/kubevirt/pkg/storage/snapshot"
-	testutils "kubevirt.io/kubevirt/pkg/testutils"
+	"kubevirt.io/kubevirt/pkg/testutils"
 	"kubevirt.io/kubevirt/pkg/virt-controller/services"
 	"kubevirt.io/kubevirt/pkg/virt-controller/watch/clone"
 	"kubevirt.io/kubevirt/pkg/virt-controller/watch/drain/disruptionbudget"
@@ -84,17 +84,20 @@ var _ = Describe("Application", func() {
 		vmSnapshotInformer, _ := testutils.NewFakeInformerFor(&snapshotv1.VirtualMachineSnapshot{})
 		vmSnapshotContentInformer, _ := testutils.NewFakeInformerFor(&snapshotv1.VirtualMachineSnapshotContent{})
 		migrationInformer, _ := testutils.NewFakeInformerFor(&v1.VirtualMachineInstanceMigration{})
-		nodeInformer, _ := testutils.NewFakeInformerFor(&kubev1.Node{})
+		nodeInformer, _ := testutils.NewFakeInformerFor(&k8sv1.Node{})
 		recorder := record.NewFakeRecorder(100)
 		recorder.IncludeObject = true
 		config, _, _ := testutils.NewFakeClusterConfigUsingKVConfig(&v1.KubeVirtConfiguration{})
 
 		pdbInformer, _ := testutils.NewFakeInformerFor(&policyv1.PodDisruptionBudget{})
 		migrationPolicyInformer, _ := testutils.NewFakeInformerFor(&migrationsv1.MigrationPolicy{})
-		podInformer, _ := testutils.NewFakeInformerFor(&kubev1.Pod{})
-		pvcInformer, _ := testutils.NewFakeInformerFor(&kubev1.PersistentVolumeClaim{})
+		podInformer, _ := testutils.NewFakeInformerFor(&k8sv1.Pod{})
+		resourceQuotaInformer, _ := testutils.NewFakeInformerFor(&k8sv1.ResourceQuota{})
+		pvcInformer, _ := testutils.NewFakeInformerFor(&k8sv1.PersistentVolumeClaim{})
+		namespaceInformer, _ := testutils.NewFakeInformerFor(&k8sv1.Namespace{})
 		crInformer, _ := testutils.NewFakeInformerFor(&appsv1.ControllerRevision{})
 		dataVolumeInformer, _ := testutils.NewFakeInformerFor(&cdiv1.DataVolume{})
+		dataSourceInformer, _ := testutils.NewFakeInformerFor(&cdiv1.DataSource{})
 		cdiInformer, _ := testutils.NewFakeInformerFor(&cdiv1.DataVolume{})
 		cdiConfigInformer, _ := testutils.NewFakeInformerFor(&cdiv1.DataVolume{})
 		rsInformer, _ := testutils.NewFakeInformerFor(&v1.VirtualMachineInstanceReplicaSet{})
@@ -102,17 +105,17 @@ var _ = Describe("Application", func() {
 		crdInformer, _ := testutils.NewFakeInformerFor(&extv1.CustomResourceDefinition{})
 		vmRestoreInformer, _ := testutils.NewFakeInformerFor(&snapshotv1.VirtualMachineRestore{})
 		vmExportInformer, _ := testutils.NewFakeInformerFor(&exportv1.VirtualMachineExport{})
-		configMapInformer, _ := testutils.NewFakeInformerFor(&kubev1.ConfigMap{})
-		routeConfigMapInformer, _ := testutils.NewFakeInformerFor(&kubev1.ConfigMap{})
+		configMapInformer, _ := testutils.NewFakeInformerFor(&k8sv1.ConfigMap{})
+		routeConfigMapInformer, _ := testutils.NewFakeInformerFor(&k8sv1.ConfigMap{})
 		dvInformer, _ := testutils.NewFakeInformerFor(&cdiv1.DataVolume{})
 		instancetypeMethods := testutils.NewMockInstancetypeMethods()
-		exportServiceInformer, _ := testutils.NewFakeInformerFor(&kubev1.Service{})
+		exportServiceInformer, _ := testutils.NewFakeInformerFor(&k8sv1.Service{})
 		cloneInformer, _ := testutils.NewFakeInformerFor(&clonev1alpha1.VirtualMachineClone{})
-		secretInformer, _ := testutils.NewFakeInformerFor(&kubev1.Secret{})
-		instancetypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineInstancetype{})
-		clusterInstancetypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineClusterInstancetype{})
-		preferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachinePreference{})
-		clusterPreferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineClusterPreference{})
+		secretInformer, _ := testutils.NewFakeInformerFor(&k8sv1.Secret{})
+		instancetypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineInstancetype{})
+		clusterInstancetypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineClusterInstancetype{})
+		preferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachinePreference{})
+		clusterPreferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineClusterPreference{})
 		controllerRevisionInformer, _ := testutils.NewFakeInformerFor(&appsv1.ControllerRevision{})
 
 		var qemuGid int64 = 107
@@ -120,10 +123,10 @@ var _ = Describe("Application", func() {
 		app.vmiInformer = vmiInformer
 		app.nodeTopologyUpdater = topologyUpdater
 		app.informerFactory = controller.NewKubeInformerFactory(nil, nil, nil, "test")
-		app.evacuationController = evacuation.NewEvacuationController(vmiInformer, migrationInformer, nodeInformer, podInformer, recorder, virtClient, config)
-		app.disruptionBudgetController = disruptionbudget.NewDisruptionBudgetController(vmiInformer, pdbInformer, podInformer, migrationInformer, recorder, virtClient, config)
-		app.nodeController = NewNodeController(virtClient, nodeInformer, vmiInformer, recorder)
-		app.vmiController = NewVMIController(services.NewTemplateService("a", 240, "b", "c", "d", "e", "f", "g", pvcInformer.GetStore(), virtClient, config, qemuGid, "h"),
+		app.evacuationController, _ = evacuation.NewEvacuationController(vmiInformer, migrationInformer, nodeInformer, podInformer, recorder, virtClient, config)
+		app.disruptionBudgetController, _ = disruptionbudget.NewDisruptionBudgetController(vmiInformer, pdbInformer, podInformer, migrationInformer, recorder, virtClient, config)
+		app.nodeController, _ = NewNodeController(virtClient, nodeInformer, vmiInformer, recorder)
+		app.vmiController, _ = NewVMIController(services.NewTemplateService("a", 240, "b", "c", "d", "e", "f", "g", pvcInformer.GetStore(), virtClient, config, qemuGid, "h", resourceQuotaInformer.GetStore(), namespaceInformer.GetStore()),
 			vmiInformer,
 			vmInformer,
 			podInformer,
@@ -134,21 +137,22 @@ var _ = Describe("Application", func() {
 			cdiInformer,
 			cdiConfigInformer,
 			config,
-			topology.NewTopologyHinter(&cache.FakeCustomStore{}, &cache.FakeCustomStore{}, "amd64", nil),
-			nil,
-			false,
+			topology.NewTopologyHinter(&cache.FakeCustomStore{}, &cache.FakeCustomStore{}, nil),
 		)
-		app.rsController = NewVMIReplicaSet(vmiInformer, rsInformer, recorder, virtClient, uint(10))
-		app.vmController = NewVMController(vmiInformer,
+		app.rsController, _ = NewVMIReplicaSet(vmiInformer, rsInformer, recorder, virtClient, uint(10))
+		app.vmController, _ = NewVMController(vmiInformer,
 			vmInformer,
 			dataVolumeInformer,
+			dataSourceInformer,
+			namespaceInformer.GetStore(),
 			pvcInformer,
 			crInformer,
+			podInformer,
 			instancetypeMethods,
 			recorder,
 			virtClient,
 			config)
-		app.migrationController = NewMigrationController(services.NewTemplateService("a", 240, "b", "c", "d", "e", "f", "g", pvcInformer.GetStore(), virtClient, config, qemuGid, "h"),
+		app.migrationController, _ = NewMigrationController(services.NewTemplateService("a", 240, "b", "c", "d", "e", "f", "g", pvcInformer.GetStore(), virtClient, config, qemuGid, "h", resourceQuotaInformer.GetStore(), namespaceInformer.GetStore()),
 			vmiInformer,
 			podInformer,
 			migrationInformer,
@@ -156,11 +160,10 @@ var _ = Describe("Application", func() {
 			pvcInformer,
 			pdbInformer,
 			migrationPolicyInformer,
+			resourceQuotaInformer,
 			recorder,
 			virtClient,
 			config,
-			nil,
-			false,
 		)
 		app.snapshotController = &snapshot.VMSnapshotController{
 			Client:                    virtClient,
@@ -176,7 +179,7 @@ var _ = Describe("Application", func() {
 			Recorder:                  recorder,
 			ResyncPeriod:              60 * time.Second,
 		}
-		app.snapshotController.Init()
+		_ = app.snapshotController.Init()
 		app.restoreController = &snapshot.VMRestoreController{
 			Client:                    virtClient,
 			VMRestoreInformer:         vmRestoreInformer,
@@ -189,10 +192,10 @@ var _ = Describe("Application", func() {
 			DataVolumeInformer:        dataVolumeInformer,
 			Recorder:                  recorder,
 		}
-		app.restoreController.Init()
+		_ = app.restoreController.Init()
 		app.exportController = &export.VMExportController{
 			Client:                      virtClient,
-			TemplateService:             services.NewTemplateService("a", 240, "b", "c", "d", "e", "f", "g", pvcInformer.GetStore(), virtClient, config, qemuGid, "h"),
+			TemplateService:             services.NewTemplateService("a", 240, "b", "c", "d", "e", "f", "g", pvcInformer.GetStore(), virtClient, config, qemuGid, "h", resourceQuotaInformer.GetStore(), namespaceInformer.GetStore()),
 			VMExportInformer:            vmExportInformer,
 			PVCInformer:                 pvcInformer,
 			PodInformer:                 podInformer,
@@ -214,10 +217,12 @@ var _ = Describe("Application", func() {
 			ClusterPreferenceInformer:   clusterPreferenceInformer,
 			ControllerRevisionInformer:  controllerRevisionInformer,
 		}
-		app.exportController.Init()
+		_ = app.exportController.Init()
 		app.persistentVolumeClaimInformer = pvcInformer
 		app.nodeInformer = nodeInformer
-		app.vmCloneController = clone.NewVmCloneController(
+		app.resourceQuotaInformer = resourceQuotaInformer
+		app.namespaceInformer = namespaceInformer
+		app.vmCloneController, _ = clone.NewVmCloneController(
 			virtClient,
 			cloneInformer,
 			vmSnapshotInformer,
@@ -233,8 +238,8 @@ var _ = Describe("Application", func() {
 		go app.onStartedLeading()(ctx)
 
 		By("Checking prometheus metric before sync")
-		dto := &io_prometheus_client.Metric{}
-		Expect(leaderGauge.Write(dto)).To(Succeed())
+		dto, err := metrics.GetVirtControllerMetric()
+		Expect(err).ToNot(HaveOccurred())
 
 		zero := 0.0
 		Expect(dto.GetGauge().Value).To(Equal(&zero), "Leader should be reported after virt-controller is fully operational")
@@ -242,11 +247,13 @@ var _ = Describe("Application", func() {
 		// for sync
 		go pvcInformer.Run(ctx.Done())
 		go nodeInformer.Run(ctx.Done())
+		go resourceQuotaInformer.Run(ctx.Done())
+		go namespaceInformer.Run(ctx.Done())
 		time.Sleep(time.Second)
 
 		By("Checking prometheus metric")
-		dto = &io_prometheus_client.Metric{}
-		Expect(leaderGauge.Write(dto)).To(Succeed())
+		dto, err = metrics.GetVirtControllerMetric()
+		Expect(err).ToNot(HaveOccurred())
 
 		one := 1.0
 		Expect(dto.GetGauge().Value).To(Equal(&one))

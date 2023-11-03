@@ -61,19 +61,22 @@ var CRDsValidation map[string]string = map[string]string{
           description: PVC is the PVC specification
           properties:
             accessModes:
-              description: 'AccessModes contains the desired access modes the volume
+              description: 'accessModes contains the desired access modes the volume
                 should have. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#access-modes-1'
               items:
                 type: string
               type: array
             dataSource:
-              description: 'This field can be used to specify either: * An existing
+              description: 'dataSource field can be used to specify either: * An existing
                 VolumeSnapshot object (snapshot.storage.k8s.io/VolumeSnapshot) * An
                 existing PVC (PersistentVolumeClaim) If the provisioner or an external
                 controller can support the specified data source, it will create a
-                new volume based on the contents of the specified data source. If
-                the AnyVolumeDataSource feature gate is enabled, this field will always
-                have the same contents as the DataSourceRef field.'
+                new volume based on the contents of the specified data source. When
+                the AnyVolumeDataSource feature gate is enabled, dataSource contents
+                will be copied to dataSourceRef, and dataSourceRef contents will be
+                copied to dataSource when dataSourceRef.namespace is not specified.
+                If the namespace is specified, then dataSourceRef will not be copied
+                to dataSource.'
               properties:
                 apiGroup:
                   description: APIGroup is the group for the resource being referenced.
@@ -91,23 +94,28 @@ var CRDsValidation map[string]string = map[string]string{
               - name
               type: object
             dataSourceRef:
-              description: 'Specifies the object from which to populate the volume
-                with data, if a non-empty volume is desired. This may be any local
-                object from a non-empty API group (non core object) or a PersistentVolumeClaim
+              description: 'dataSourceRef specifies the object from which to populate
+                the volume with data, if a non-empty volume is desired. This may be
+                any object from a non-empty API group (non core object) or a PersistentVolumeClaim
                 object. When this field is specified, volume binding will only succeed
                 if the type of the specified object matches some installed volume
                 populator or dynamic provisioner. This field will replace the functionality
-                of the DataSource field and as such if both fields are non-empty,
-                they must have the same value. For backwards compatibility, both fields
-                (DataSource and DataSourceRef) will be set to the same value automatically
-                if one of them is empty and the other is non-empty. There are two
-                important differences between DataSource and DataSourceRef: * While
-                DataSource only allows two specific types of objects, DataSourceRef   allows
+                of the dataSource field and as such if both fields are non-empty,
+                they must have the same value. For backwards compatibility, when namespace
+                isn''t specified in dataSourceRef, both fields (dataSource and dataSourceRef)
+                will be set to the same value automatically if one of them is empty
+                and the other is non-empty. When namespace is specified in dataSourceRef,
+                dataSource isn''t set to the same value and must be empty. There are
+                three important differences between dataSource and dataSourceRef:
+                * While dataSource only allows two specific types of objects, dataSourceRef   allows
                 any non-core object, as well as PersistentVolumeClaim objects. * While
-                DataSource ignores disallowed values (dropping them), DataSourceRef   preserves
+                dataSource ignores disallowed values (dropping them), dataSourceRef   preserves
                 all values, and generates an error if a disallowed value is   specified.
-                (Alpha) Using this field requires the AnyVolumeDataSource feature
-                gate to be enabled.'
+                * While dataSource only allows local objects, dataSourceRef allows
+                objects   in any namespaces. (Beta) Using this field requires the
+                AnyVolumeDataSource feature gate to be enabled. (Alpha) Using the
+                namespace field of dataSourceRef requires the CrossNamespaceVolumeDataSource
+                feature gate to be enabled.'
               properties:
                 apiGroup:
                   description: APIGroup is the group for the resource being referenced.
@@ -120,17 +128,45 @@ var CRDsValidation map[string]string = map[string]string{
                 name:
                   description: Name is the name of resource being referenced
                   type: string
+                namespace:
+                  description: Namespace is the namespace of resource being referenced
+                    Note that when a namespace is specified, a gateway.networking.k8s.io/ReferenceGrant
+                    object is required in the referent namespace to allow that namespace's
+                    owner to accept the reference. See the ReferenceGrant documentation
+                    for details. (Alpha) This field requires the CrossNamespaceVolumeDataSource
+                    feature gate to be enabled.
+                  type: string
               required:
               - kind
               - name
               type: object
             resources:
-              description: 'Resources represents the minimum resources the volume
+              description: 'resources represents the minimum resources the volume
                 should have. If RecoverVolumeExpansionFailure feature is enabled users
                 are allowed to specify resource requirements that are lower than previous
                 value but must still be higher than capacity recorded in the status
                 field of the claim. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#resources'
               properties:
+                claims:
+                  description: "Claims lists the names of resources, defined in spec.resourceClaims,
+                    that are used by this container. \n This is an alpha field and
+                    requires enabling the DynamicResourceAllocation feature gate.
+                    \n This field is immutable. It can only be set for containers."
+                  items:
+                    description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                    properties:
+                      name:
+                        description: Name must match the name of one entry in pod.spec.resourceClaims
+                          of the Pod where this field is used. It makes that resource
+                          available inside a container.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                  - name
+                  x-kubernetes-list-type: map
                 limits:
                   additionalProperties:
                     anyOf:
@@ -155,7 +191,8 @@ var CRDsValidation map[string]string = map[string]string{
                   type: object
               type: object
             selector:
-              description: A label query over volumes to consider for binding.
+              description: selector is a label query over volumes to consider for
+                binding.
               properties:
                 matchExpressions:
                   description: matchExpressions is a list of label selector requirements.
@@ -198,15 +235,15 @@ var CRDsValidation map[string]string = map[string]string{
                   type: object
               type: object
             storageClassName:
-              description: 'Name of the StorageClass required by the claim. More info:
-                https://kubernetes.io/docs/concepts/storage/persistent-volumes#class-1'
+              description: 'storageClassName is the name of the StorageClass required
+                by the claim. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#class-1'
               type: string
             volumeMode:
               description: volumeMode defines what type of volume is required by the
                 claim. Value of Filesystem is implied when not included in claim spec.
               type: string
             volumeName:
-              description: VolumeName is the binding reference to the PersistentVolume
+              description: volumeName is the binding reference to the PersistentVolume
                 backing this claim.
               type: string
           type: object
@@ -216,6 +253,20 @@ var CRDsValidation map[string]string = map[string]string{
             blank:
               description: DataVolumeBlankImage provides the parameters to create
                 a new raw blank image for the PVC
+              type: object
+            gcs:
+              description: DataVolumeSourceGCS provides the parameters to create a
+                Data Volume from an GCS source
+              properties:
+                secretRef:
+                  description: SecretRef provides the secret reference needed to access
+                    the GCS source
+                  type: string
+                url:
+                  description: URL is the url of the GCS source
+                  type: string
+              required:
+              - url
               type: object
             http:
               description: DataVolumeSourceHTTP can be either an http or https endpoint,
@@ -329,6 +380,20 @@ var CRDsValidation map[string]string = map[string]string{
               required:
               - url
               type: object
+            snapshot:
+              description: DataVolumeSourceSnapshot provides the parameters to create
+                a Data Volume from an existing VolumeSnapshot
+              properties:
+                name:
+                  description: The name of the source VolumeSnapshot
+                  type: string
+                namespace:
+                  description: The namespace of the source VolumeSnapshot
+                  type: string
+              required:
+              - name
+              - namespace
+              type: object
             upload:
               description: DataVolumeSourceUpload provides the parameters to create
                 a Data Volume by uploading the source
@@ -400,7 +465,9 @@ var CRDsValidation map[string]string = map[string]string{
                 types that implement data population, the AnyVolumeDataSource feature
                 gate must be enabled. If the provisioner or an external controller
                 can support the specified data source, it will create a new volume
-                based on the contents of the specified data source.'
+                based on the contents of the specified data source. If the AnyVolumeDataSource
+                feature gate is enabled, this field will always have the same contents
+                as the DataSourceRef field.'
               properties:
                 apiGroup:
                   description: APIGroup is the group for the resource being referenced.
@@ -417,10 +484,72 @@ var CRDsValidation map[string]string = map[string]string{
               - kind
               - name
               type: object
+            dataSourceRef:
+              description: 'Specifies the object from which to populate the volume
+                with data, if a non-empty volume is desired. This may be any local
+                object from a non-empty API group (non core object) or a PersistentVolumeClaim
+                object. When this field is specified, volume binding will only succeed
+                if the type of the specified object matches some installed volume
+                populator or dynamic provisioner. This field will replace the functionality
+                of the DataSource field and as such if both fields are non-empty,
+                they must have the same value. For backwards compatibility, both fields
+                (DataSource and DataSourceRef) will be set to the same value automatically
+                if one of them is empty and the other is non-empty. There are two
+                important differences between DataSource and DataSourceRef: * While
+                DataSource only allows two specific types of objects, DataSourceRef
+                allows any non-core object, as well as PersistentVolumeClaim objects.
+                * While DataSource ignores disallowed values (dropping them), DataSourceRef
+                preserves all values, and generates an error if a disallowed value
+                is specified. (Beta) Using this field requires the AnyVolumeDataSource
+                feature gate to be enabled.'
+              properties:
+                apiGroup:
+                  description: APIGroup is the group for the resource being referenced.
+                    If APIGroup is not specified, the specified Kind must be in the
+                    core API group. For any other third-party types, APIGroup is required.
+                  type: string
+                kind:
+                  description: Kind is the type of resource being referenced
+                  type: string
+                name:
+                  description: Name is the name of resource being referenced
+                  type: string
+                namespace:
+                  description: Namespace is the namespace of resource being referenced
+                    Note that when a namespace is specified, a gateway.networking.k8s.io/ReferenceGrant
+                    object is required in the referent namespace to allow that namespace's
+                    owner to accept the reference. See the ReferenceGrant documentation
+                    for details. (Alpha) This field requires the CrossNamespaceVolumeDataSource
+                    feature gate to be enabled.
+                  type: string
+              required:
+              - kind
+              - name
+              type: object
             resources:
               description: 'Resources represents the minimum resources the volume
                 should have. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#resources'
               properties:
+                claims:
+                  description: "Claims lists the names of resources, defined in spec.resourceClaims,
+                    that are used by this container. \n This is an alpha field and
+                    requires enabling the DynamicResourceAllocation feature gate.
+                    \n This field is immutable. It can only be set for containers."
+                  items:
+                    description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                    properties:
+                      name:
+                        description: Name must match the name of one entry in pod.spec.resourceClaims
+                          of the Pod where this field is used. It makes that resource
+                          available inside a container.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                  - name
+                  x-kubernetes-list-type: map
                 limits:
                   additionalProperties:
                     anyOf:
@@ -613,6 +742,93 @@ var CRDsValidation map[string]string = map[string]string{
                       type: object
                   type: object
               type: object
+            architectureConfiguration:
+              properties:
+                amd64:
+                  properties:
+                    emulatedMachines:
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    machineType:
+                      type: string
+                    ovmfPath:
+                      type: string
+                  type: object
+                arm64:
+                  properties:
+                    emulatedMachines:
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    machineType:
+                      type: string
+                    ovmfPath:
+                      type: string
+                  type: object
+                defaultArchitecture:
+                  type: string
+                ppc64le:
+                  properties:
+                    emulatedMachines:
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    machineType:
+                      type: string
+                    ovmfPath:
+                      type: string
+                  type: object
+              type: object
+            autoCPULimitNamespaceLabelSelector:
+              description: When set, AutoCPULimitNamespaceLabelSelector will set a
+                CPU limit on virt-launcher for VMIs running inside namespaces that
+                match the label selector. The CPU limit will equal the number of requested
+                vCPUs. This setting does not apply to VMIs with dedicated CPUs.
+              properties:
+                matchExpressions:
+                  description: matchExpressions is a list of label selector requirements.
+                    The requirements are ANDed.
+                  items:
+                    description: A label selector requirement is a selector that contains
+                      values, a key, and an operator that relates the key and values.
+                    properties:
+                      key:
+                        description: key is the label key that the selector applies
+                          to.
+                        type: string
+                      operator:
+                        description: operator represents a key's relationship to a
+                          set of values. Valid operators are In, NotIn, Exists and
+                          DoesNotExist.
+                        type: string
+                      values:
+                        description: values is an array of string values. If the operator
+                          is In or NotIn, the values array must be non-empty. If the
+                          operator is Exists or DoesNotExist, the values array must
+                          be empty. This array is replaced during a strategic merge
+                          patch.
+                        items:
+                          type: string
+                        type: array
+                    required:
+                    - key
+                    - operator
+                    type: object
+                  type: array
+                matchLabels:
+                  additionalProperties:
+                    type: string
+                  description: matchLabels is a map of {key,value} pairs. A single
+                    {key,value} in the matchLabels map is equivalent to an element
+                    of matchExpressions, whose key field is "key", the operator is
+                    "In", and the values array contains only "value". The requirements
+                    are ANDed.
+                  type: object
+              type: object
             controllerConfiguration:
               description: ReloadableComponentConfiguration holds all generic k8s
                 configuration options which can be reloaded by components without
@@ -786,7 +1002,86 @@ var CRDsValidation map[string]string = map[string]string{
               description: PullPolicy describes a policy for if/when to pull a container
                 image
               type: string
+            ksmConfiguration:
+              description: KSMConfiguration holds the information regarding the enabling
+                the KSM in the nodes (if available).
+              properties:
+                nodeLabelSelector:
+                  description: NodeLabelSelector is a selector that filters in which
+                    nodes the KSM will be enabled. Empty NodeLabelSelector will enable
+                    ksm for every node.
+                  properties:
+                    matchExpressions:
+                      description: matchExpressions is a list of label selector requirements.
+                        The requirements are ANDed.
+                      items:
+                        description: A label selector requirement is a selector that
+                          contains values, a key, and an operator that relates the
+                          key and values.
+                        properties:
+                          key:
+                            description: key is the label key that the selector applies
+                              to.
+                            type: string
+                          operator:
+                            description: operator represents a key's relationship
+                              to a set of values. Valid operators are In, NotIn, Exists
+                              and DoesNotExist.
+                            type: string
+                          values:
+                            description: values is an array of string values. If the
+                              operator is In or NotIn, the values array must be non-empty.
+                              If the operator is Exists or DoesNotExist, the values
+                              array must be empty. This array is replaced during a
+                              strategic merge patch.
+                            items:
+                              type: string
+                            type: array
+                        required:
+                        - key
+                        - operator
+                        type: object
+                      type: array
+                    matchLabels:
+                      additionalProperties:
+                        type: string
+                      description: matchLabels is a map of {key,value} pairs. A single
+                        {key,value} in the matchLabels map is equivalent to an element
+                        of matchExpressions, whose key field is "key", the operator
+                        is "In", and the values array contains only "value". The requirements
+                        are ANDed.
+                      type: object
+                  type: object
+              type: object
+            liveUpdateConfiguration:
+              description: LiveUpdateConfiguration holds defaults for live update
+                features
+              properties:
+                maxCpuSockets:
+                  description: MaxCpuSockets holds the maximum amount of sockets that
+                    can be hotplugged
+                  format: int32
+                  type: integer
+                maxGuest:
+                  anyOf:
+                  - type: integer
+                  - type: string
+                  description: MaxGuest defines the maximum amount memory that can
+                    be allocated to the guest using hotplug.
+                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                  x-kubernetes-int-or-string: true
+                maxHotplugRatio:
+                  description: 'MaxHotplugRatio is the ratio used to define the max
+                    amount of a hotplug resource that can be made available to a VM
+                    when the specific Max* setting is not defined (MaxCpuSockets,
+                    MaxGuest) Example: VM is configured with 512Mi of guest memory,
+                    if MaxGuest is not defined and MaxHotplugRatio is 2 then MaxGuest
+                    = 1Gi defaults to 4'
+                  format: int32
+                  type: integer
+              type: object
             machineType:
+              description: Deprecated. Use architectureConfiguration instead.
               type: string
             mediatedDevicesConfiguration:
               description: MediatedDevicesConfiguration holds information about MDEV
@@ -806,7 +1101,7 @@ var CRDsValidation map[string]string = map[string]string{
                 nodeMediatedDeviceTypes:
                   items:
                     description: NodeMediatedDeviceTypesConfig holds information about
-                      MDEV types to be defined in a specifc node that matches the
+                      MDEV types to be defined in a specific node that matches the
                       NodeSelector field.
                     properties:
                       mediatedDeviceTypes:
@@ -861,8 +1156,8 @@ var CRDsValidation map[string]string = map[string]string{
                   - type: integer
                   - type: string
                   description: BandwidthPerMigration limits the amount of network
-                    bandwith live migrations are allowed to use. The value is in quantity
-                    per second. Defaults to 0 (no limit)
+                    bandwidth live migrations are allowed to use. The value is in
+                    quantity per second. Defaults to 0 (no limit)
                   pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                   x-kubernetes-int-or-string: true
                 completionTimeoutPerGiB:
@@ -877,6 +1172,15 @@ var CRDsValidation map[string]string = map[string]string{
                   description: When set to true, DisableTLS will disable the additional
                     layer of live migration encryption provided by KubeVirt. This
                     is usually a bad idea. Defaults to false
+                  type: boolean
+                matchSELinuxLevelOnMigration:
+                  description: By default, the SELinux level of target virt-launcher
+                    pods is forced to the level of the source virt-launcher. When
+                    set to true, MatchSELinuxLevelOnMigration lets the CRI auto-assign
+                    a random level to the target. That will ensure the target virt-launcher
+                    doesn't share categories with another pod on the node. However,
+                    migrations will fail when using RWX volumes that don't automatically
+                    deal with SELinux levels.
                   type: boolean
                 network:
                   description: Network is the name of the CNI network to use for live
@@ -917,6 +1221,22 @@ var CRDsValidation map[string]string = map[string]string{
             network:
               description: NetworkConfiguration holds network options
               properties:
+                binding:
+                  additionalProperties:
+                    properties:
+                      networkAttachmentDefinition:
+                        description: 'NetworkAttachmentDefinition references to a
+                          NetworkAttachmentDefinition CR object. Format: <name>, <namespace>/<name>.
+                          If namespace is not specified, VMI namespace is assumed.
+                          version: 1alphav1'
+                        type: string
+                      sidecarImage:
+                        description: 'SidecarImage references a container image that
+                          runs in the virt-launcher pod. The sidecar handles (libvirt)
+                          domain configuration and optional services. version: 1alphav1'
+                        type: string
+                    type: object
+                  type: object
                 defaultNetworkInterface:
                   type: string
                 permitBridgeInterfaceOnPodNetwork:
@@ -966,13 +1286,39 @@ var CRDsValidation map[string]string = map[string]string{
                       resourceName:
                         description: The name of the resource that is representing
                           the device. Exposed by a device plugin and requested by
-                          VMs. Typically of the form vendor.com/product_nameThe name
-                          of the resource that is representing the device. Exposed
-                          by a device plugin and requested by VMs. Typically of the
-                          form vendor.com/product_name
+                          VMs. Typically of the form vendor.com/product_name
                         type: string
                     required:
                     - pciVendorSelector
+                    - resourceName
+                    type: object
+                  type: array
+                  x-kubernetes-list-type: atomic
+                usb:
+                  items:
+                    properties:
+                      externalResourceProvider:
+                        description: If true, KubeVirt will leave the allocation and
+                          monitoring to an external device plugin
+                        type: boolean
+                      resourceName:
+                        description: 'Identifies the list of USB host devices. e.g:
+                          kubevirt.io/storage, kubevirt.io/bootable-usb, etc'
+                        type: string
+                      selectors:
+                        items:
+                          properties:
+                            product:
+                              type: string
+                            vendor:
+                              type: string
+                          required:
+                          - product
+                          - vendor
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    required:
                     - resourceName
                     type: object
                   type: array
@@ -1027,6 +1373,28 @@ var CRDsValidation map[string]string = map[string]string{
                     description: ResourceRequirements describes the compute resource
                       requirements.
                     properties:
+                      claims:
+                        description: "Claims lists the names of resources, defined
+                          in spec.resourceClaims, that are used by this container.
+                          \n This is an alpha field and requires enabling the DynamicResourceAllocation
+                          feature gate. \n This field is immutable. It can only be
+                          set for containers."
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: Name must match the name of one entry in
+                                pod.spec.resourceClaims of the Pod where this field
+                                is used. It makes that resource available inside a
+                                container.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
                       limits:
                         additionalProperties:
                           anyOf:
@@ -1089,6 +1457,25 @@ var CRDsValidation map[string]string = map[string]string{
               type: object
             virtualMachineInstancesPerNode:
               type: integer
+            virtualMachineOptions:
+              description: VirtualMachineOptions holds the cluster level information
+                regarding the virtual machine.
+              properties:
+                disableFreePageReporting:
+                  description: DisableFreePageReporting disable the free page reporting
+                    of memory balloon device https://libvirt.org/formatdomain.html#memory-balloon-device.
+                    This will have effect only if AutoattachMemBalloon is not false
+                    and the vmi is not requesting any high performance feature (dedicatedCPU/realtime/hugePages),
+                    in which free page reporting is always disabled.
+                  type: object
+                disableSerialConsoleLog:
+                  description: DisableSerialConsoleLog disables logging the auto-attached
+                    default serial console. If not set, serial console logs will be
+                    written to a file and then streamed from a container named 'guest-console-log'.
+                    The value can be individually overridden for each VM, not relevant
+                    if AutoattachSerialConsole is disabled.
+                  type: object
+              type: object
             vmStateStorageClass:
               description: VMStateStorageClass is the name of the storage class to
                 use for the PVCs created to preserve VM state, like TPM. The storage
@@ -1493,9 +1880,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       field and the ones listed in the namespaces
                                       field. null selector and null or empty namespaces
                                       list means "this pod's namespace". An empty
-                                      selector ({}) matches all namespaces. This field
-                                      is beta-level and is only honored when PodAffinityNamespaceSelector
-                                      feature is enabled.
+                                      selector ({}) matches all namespaces.
                                     properties:
                                       matchExpressions:
                                         description: matchExpressions is a list of
@@ -1551,7 +1936,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       listed in this field and the ones selected by
                                       namespaceSelector. null or empty namespaces
                                       list and null namespaceSelector means "this
-                                      pod's namespace"
+                                      pod's namespace".
                                     items:
                                       type: string
                                     type: array
@@ -1652,9 +2037,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   and the ones listed in the namespaces field. null
                                   selector and null or empty namespaces list means
                                   "this pod's namespace". An empty selector ({}) matches
-                                  all namespaces. This field is beta-level and is
-                                  only honored when PodAffinityNamespaceSelector feature
-                                  is enabled.
+                                  all namespaces.
                                 properties:
                                   matchExpressions:
                                     description: matchExpressions is a list of label
@@ -1706,7 +2089,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   is applied to the union of the namespaces listed
                                   in this field and the ones selected by namespaceSelector.
                                   null or empty namespaces list and null namespaceSelector
-                                  means "this pod's namespace"
+                                  means "this pod's namespace".
                                 items:
                                   type: string
                                 type: array
@@ -1809,9 +2192,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       field and the ones listed in the namespaces
                                       field. null selector and null or empty namespaces
                                       list means "this pod's namespace". An empty
-                                      selector ({}) matches all namespaces. This field
-                                      is beta-level and is only honored when PodAffinityNamespaceSelector
-                                      feature is enabled.
+                                      selector ({}) matches all namespaces.
                                     properties:
                                       matchExpressions:
                                         description: matchExpressions is a list of
@@ -1867,7 +2248,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       listed in this field and the ones selected by
                                       namespaceSelector. null or empty namespaces
                                       list and null namespaceSelector means "this
-                                      pod's namespace"
+                                      pod's namespace".
                                     items:
                                       type: string
                                     type: array
@@ -1968,9 +2349,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   and the ones listed in the namespaces field. null
                                   selector and null or empty namespaces list means
                                   "this pod's namespace". An empty selector ({}) matches
-                                  all namespaces. This field is beta-level and is
-                                  only honored when PodAffinityNamespaceSelector feature
-                                  is enabled.
+                                  all namespaces.
                                 properties:
                                   matchExpressions:
                                     description: matchExpressions is a list of label
@@ -2022,7 +2401,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   is applied to the union of the namespaces listed
                                   in this field and the ones selected by namespaceSelector.
                                   null or empty namespaces list and null namespaceSelector
-                                  means "this pod's namespace"
+                                  means "this pod's namespace".
                                 items:
                                   type: string
                                 type: array
@@ -2459,9 +2838,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       field and the ones listed in the namespaces
                                       field. null selector and null or empty namespaces
                                       list means "this pod's namespace". An empty
-                                      selector ({}) matches all namespaces. This field
-                                      is beta-level and is only honored when PodAffinityNamespaceSelector
-                                      feature is enabled.
+                                      selector ({}) matches all namespaces.
                                     properties:
                                       matchExpressions:
                                         description: matchExpressions is a list of
@@ -2517,7 +2894,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       listed in this field and the ones selected by
                                       namespaceSelector. null or empty namespaces
                                       list and null namespaceSelector means "this
-                                      pod's namespace"
+                                      pod's namespace".
                                     items:
                                       type: string
                                     type: array
@@ -2618,9 +2995,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   and the ones listed in the namespaces field. null
                                   selector and null or empty namespaces list means
                                   "this pod's namespace". An empty selector ({}) matches
-                                  all namespaces. This field is beta-level and is
-                                  only honored when PodAffinityNamespaceSelector feature
-                                  is enabled.
+                                  all namespaces.
                                 properties:
                                   matchExpressions:
                                     description: matchExpressions is a list of label
@@ -2672,7 +3047,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   is applied to the union of the namespaces listed
                                   in this field and the ones selected by namespaceSelector.
                                   null or empty namespaces list and null namespaceSelector
-                                  means "this pod's namespace"
+                                  means "this pod's namespace".
                                 items:
                                   type: string
                                 type: array
@@ -2775,9 +3150,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       field and the ones listed in the namespaces
                                       field. null selector and null or empty namespaces
                                       list means "this pod's namespace". An empty
-                                      selector ({}) matches all namespaces. This field
-                                      is beta-level and is only honored when PodAffinityNamespaceSelector
-                                      feature is enabled.
+                                      selector ({}) matches all namespaces.
                                     properties:
                                       matchExpressions:
                                         description: matchExpressions is a list of
@@ -2833,7 +3206,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       listed in this field and the ones selected by
                                       namespaceSelector. null or empty namespaces
                                       list and null namespaceSelector means "this
-                                      pod's namespace"
+                                      pod's namespace".
                                     items:
                                       type: string
                                     type: array
@@ -2934,9 +3307,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   and the ones listed in the namespaces field. null
                                   selector and null or empty namespaces list means
                                   "this pod's namespace". An empty selector ({}) matches
-                                  all namespaces. This field is beta-level and is
-                                  only honored when PodAffinityNamespaceSelector feature
-                                  is enabled.
+                                  all namespaces.
                                 properties:
                                   matchExpressions:
                                     description: matchExpressions is a list of label
@@ -2988,7 +3359,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   is applied to the union of the namespaces listed
                                   in this field and the ones selected by namespaceSelector.
                                   null or empty namespaces list and null namespaceSelector
-                                  means "this pod's namespace"
+                                  means "this pod's namespace".
                                 items:
                                   type: string
                                 type: array
@@ -3097,6 +3468,8 @@ var CRDsValidation map[string]string = map[string]string{
             - type
             type: object
           type: array
+        defaultArchitecture:
+          type: string
         generations:
           items:
             description: GenerationStatus keeps track of the generation for a given
@@ -3303,20 +3676,23 @@ var CRDsValidation map[string]string = map[string]string{
                     description: PVC is the PVC specification
                     properties:
                       accessModes:
-                        description: 'AccessModes contains the desired access modes
+                        description: 'accessModes contains the desired access modes
                           the volume should have. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#access-modes-1'
                         items:
                           type: string
                         type: array
                       dataSource:
-                        description: 'This field can be used to specify either: *
-                          An existing VolumeSnapshot object (snapshot.storage.k8s.io/VolumeSnapshot)
+                        description: 'dataSource field can be used to specify either:
+                          * An existing VolumeSnapshot object (snapshot.storage.k8s.io/VolumeSnapshot)
                           * An existing PVC (PersistentVolumeClaim) If the provisioner
                           or an external controller can support the specified data
                           source, it will create a new volume based on the contents
-                          of the specified data source. If the AnyVolumeDataSource
-                          feature gate is enabled, this field will always have the
-                          same contents as the DataSourceRef field.'
+                          of the specified data source. When the AnyVolumeDataSource
+                          feature gate is enabled, dataSource contents will be copied
+                          to dataSourceRef, and dataSourceRef contents will be copied
+                          to dataSource when dataSourceRef.namespace is not specified.
+                          If the namespace is specified, then dataSourceRef will not
+                          be copied to dataSource.'
                         properties:
                           apiGroup:
                             description: APIGroup is the group for the resource being
@@ -3335,26 +3711,32 @@ var CRDsValidation map[string]string = map[string]string{
                         - name
                         type: object
                       dataSourceRef:
-                        description: 'Specifies the object from which to populate
-                          the volume with data, if a non-empty volume is desired.
-                          This may be any local object from a non-empty API group
-                          (non core object) or a PersistentVolumeClaim object. When
-                          this field is specified, volume binding will only succeed
+                        description: 'dataSourceRef specifies the object from which
+                          to populate the volume with data, if a non-empty volume
+                          is desired. This may be any object from a non-empty API
+                          group (non core object) or a PersistentVolumeClaim object.
+                          When this field is specified, volume binding will only succeed
                           if the type of the specified object matches some installed
                           volume populator or dynamic provisioner. This field will
-                          replace the functionality of the DataSource field and as
+                          replace the functionality of the dataSource field and as
                           such if both fields are non-empty, they must have the same
-                          value. For backwards compatibility, both fields (DataSource
-                          and DataSourceRef) will be set to the same value automatically
-                          if one of them is empty and the other is non-empty. There
-                          are two important differences between DataSource and DataSourceRef:
-                          * While DataSource only allows two specific types of objects,
-                          DataSourceRef   allows any non-core object, as well as PersistentVolumeClaim
-                          objects. * While DataSource ignores disallowed values (dropping
-                          them), DataSourceRef   preserves all values, and generates
-                          an error if a disallowed value is   specified. (Alpha) Using
-                          this field requires the AnyVolumeDataSource feature gate
-                          to be enabled.'
+                          value. For backwards compatibility, when namespace isn''t
+                          specified in dataSourceRef, both fields (dataSource and
+                          dataSourceRef) will be set to the same value automatically
+                          if one of them is empty and the other is non-empty. When
+                          namespace is specified in dataSourceRef, dataSource isn''t
+                          set to the same value and must be empty. There are three
+                          important differences between dataSource and dataSourceRef:
+                          * While dataSource only allows two specific types of objects,
+                          dataSourceRef   allows any non-core object, as well as PersistentVolumeClaim
+                          objects. * While dataSource ignores disallowed values (dropping
+                          them), dataSourceRef   preserves all values, and generates
+                          an error if a disallowed value is   specified. * While dataSource
+                          only allows local objects, dataSourceRef allows objects   in
+                          any namespaces. (Beta) Using this field requires the AnyVolumeDataSource
+                          feature gate to be enabled. (Alpha) Using the namespace
+                          field of dataSourceRef requires the CrossNamespaceVolumeDataSource
+                          feature gate to be enabled.'
                         properties:
                           apiGroup:
                             description: APIGroup is the group for the resource being
@@ -3368,18 +3750,50 @@ var CRDsValidation map[string]string = map[string]string{
                           name:
                             description: Name is the name of resource being referenced
                             type: string
+                          namespace:
+                            description: Namespace is the namespace of resource being
+                              referenced Note that when a namespace is specified,
+                              a gateway.networking.k8s.io/ReferenceGrant object is
+                              required in the referent namespace to allow that namespace's
+                              owner to accept the reference. See the ReferenceGrant
+                              documentation for details. (Alpha) This field requires
+                              the CrossNamespaceVolumeDataSource feature gate to be
+                              enabled.
+                            type: string
                         required:
                         - kind
                         - name
                         type: object
                       resources:
-                        description: 'Resources represents the minimum resources the
+                        description: 'resources represents the minimum resources the
                           volume should have. If RecoverVolumeExpansionFailure feature
                           is enabled users are allowed to specify resource requirements
                           that are lower than previous value but must still be higher
                           than capacity recorded in the status field of the claim.
                           More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#resources'
                         properties:
+                          claims:
+                            description: "Claims lists the names of resources, defined
+                              in spec.resourceClaims, that are used by this container.
+                              \n This is an alpha field and requires enabling the
+                              DynamicResourceAllocation feature gate. \n This field
+                              is immutable. It can only be set for containers."
+                            items:
+                              description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                              properties:
+                                name:
+                                  description: Name must match the name of one entry
+                                    in pod.spec.resourceClaims of the Pod where this
+                                    field is used. It makes that resource available
+                                    inside a container.
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
                           limits:
                             additionalProperties:
                               anyOf:
@@ -3405,7 +3819,8 @@ var CRDsValidation map[string]string = map[string]string{
                             type: object
                         type: object
                       selector:
-                        description: A label query over volumes to consider for binding.
+                        description: selector is a label query over volumes to consider
+                          for binding.
                         properties:
                           matchExpressions:
                             description: matchExpressions is a list of label selector
@@ -3450,8 +3865,8 @@ var CRDsValidation map[string]string = map[string]string{
                             type: object
                         type: object
                       storageClassName:
-                        description: 'Name of the StorageClass required by the claim.
-                          More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#class-1'
+                        description: 'storageClassName is the name of the StorageClass
+                          required by the claim. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#class-1'
                         type: string
                       volumeMode:
                         description: volumeMode defines what type of volume is required
@@ -3459,7 +3874,7 @@ var CRDsValidation map[string]string = map[string]string{
                           in claim spec.
                         type: string
                       volumeName:
-                        description: VolumeName is the binding reference to the PersistentVolume
+                        description: volumeName is the binding reference to the PersistentVolume
                           backing this claim.
                         type: string
                     type: object
@@ -3469,6 +3884,20 @@ var CRDsValidation map[string]string = map[string]string{
                       blank:
                         description: DataVolumeBlankImage provides the parameters
                           to create a new raw blank image for the PVC
+                        type: object
+                      gcs:
+                        description: DataVolumeSourceGCS provides the parameters to
+                          create a Data Volume from an GCS source
+                        properties:
+                          secretRef:
+                            description: SecretRef provides the secret reference needed
+                              to access the GCS source
+                            type: string
+                          url:
+                            description: URL is the url of the GCS source
+                            type: string
+                        required:
+                        - url
                         type: object
                       http:
                         description: DataVolumeSourceHTTP can be either an http or
@@ -3585,6 +4014,20 @@ var CRDsValidation map[string]string = map[string]string{
                         required:
                         - url
                         type: object
+                      snapshot:
+                        description: DataVolumeSourceSnapshot provides the parameters
+                          to create a Data Volume from an existing VolumeSnapshot
+                        properties:
+                          name:
+                            description: The name of the source VolumeSnapshot
+                            type: string
+                          namespace:
+                            description: The namespace of the source VolumeSnapshot
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        type: object
                       upload:
                         description: DataVolumeSourceUpload provides the parameters
                           to create a Data Volume by uploading the source
@@ -3658,7 +4101,10 @@ var CRDsValidation map[string]string = map[string]string{
                           population, the AnyVolumeDataSource feature gate must be
                           enabled. If the provisioner or an external controller can
                           support the specified data source, it will create a new
-                          volume based on the contents of the specified data source.'
+                          volume based on the contents of the specified data source.
+                          If the AnyVolumeDataSource feature gate is enabled, this
+                          field will always have the same contents as the DataSourceRef
+                          field.'
                         properties:
                           apiGroup:
                             description: APIGroup is the group for the resource being
@@ -3676,10 +4122,80 @@ var CRDsValidation map[string]string = map[string]string{
                         - kind
                         - name
                         type: object
+                      dataSourceRef:
+                        description: 'Specifies the object from which to populate
+                          the volume with data, if a non-empty volume is desired.
+                          This may be any local object from a non-empty API group
+                          (non core object) or a PersistentVolumeClaim object. When
+                          this field is specified, volume binding will only succeed
+                          if the type of the specified object matches some installed
+                          volume populator or dynamic provisioner. This field will
+                          replace the functionality of the DataSource field and as
+                          such if both fields are non-empty, they must have the same
+                          value. For backwards compatibility, both fields (DataSource
+                          and DataSourceRef) will be set to the same value automatically
+                          if one of them is empty and the other is non-empty. There
+                          are two important differences between DataSource and DataSourceRef:
+                          * While DataSource only allows two specific types of objects,
+                          DataSourceRef allows any non-core object, as well as PersistentVolumeClaim
+                          objects. * While DataSource ignores disallowed values (dropping
+                          them), DataSourceRef preserves all values, and generates
+                          an error if a disallowed value is specified. (Beta) Using
+                          this field requires the AnyVolumeDataSource feature gate
+                          to be enabled.'
+                        properties:
+                          apiGroup:
+                            description: APIGroup is the group for the resource being
+                              referenced. If APIGroup is not specified, the specified
+                              Kind must be in the core API group. For any other third-party
+                              types, APIGroup is required.
+                            type: string
+                          kind:
+                            description: Kind is the type of resource being referenced
+                            type: string
+                          name:
+                            description: Name is the name of resource being referenced
+                            type: string
+                          namespace:
+                            description: Namespace is the namespace of resource being
+                              referenced Note that when a namespace is specified,
+                              a gateway.networking.k8s.io/ReferenceGrant object is
+                              required in the referent namespace to allow that namespace's
+                              owner to accept the reference. See the ReferenceGrant
+                              documentation for details. (Alpha) This field requires
+                              the CrossNamespaceVolumeDataSource feature gate to be
+                              enabled.
+                            type: string
+                        required:
+                        - kind
+                        - name
+                        type: object
                       resources:
                         description: 'Resources represents the minimum resources the
                           volume should have. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#resources'
                         properties:
+                          claims:
+                            description: "Claims lists the names of resources, defined
+                              in spec.resourceClaims, that are used by this container.
+                              \n This is an alpha field and requires enabling the
+                              DynamicResourceAllocation feature gate. \n This field
+                              is immutable. It can only be set for containers."
+                            items:
+                              description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                              properties:
+                                name:
+                                  description: Name must match the name of one entry
+                                    in pod.spec.resourceClaims of the Pod where this
+                                    field is used. It makes that resource available
+                                    inside a container.
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
                           limits:
                             additionalProperties:
                               anyOf:
@@ -3783,6 +4299,12 @@ var CRDsValidation map[string]string = map[string]string{
                 annotations on the underlying resource. Once applied to the InstancetypeMatcher
                 this field is removed.
               type: string
+            inferFromVolumeFailurePolicy:
+              description: 'InferFromVolumeFailurePolicy controls what should happen
+                on failure when inferring the instancetype. Allowed values are: "RejectInferFromVolumeFailure"
+                and "IgnoreInferFromVolumeFailure". If not specified, "RejectInferFromVolumeFailure"
+                is used by default.'
+              type: string
             kind:
               description: 'Kind specifies which instancetype resource is referenced.
                 Allowed values are: "VirtualMachineInstancetype" and "VirtualMachineClusterInstancetype".
@@ -3798,6 +4320,40 @@ var CRDsValidation map[string]string = map[string]string{
                 is applied to the VirtualMachineInstance.
               type: string
           type: object
+        liveUpdateFeatures:
+          description: LiveUpdateFeatures references a configuration of hotpluggable
+            resources
+          properties:
+            affinity:
+              description: Affinity allows live updating the virtual machines node
+                affinity
+              type: object
+            cpu:
+              description: LiveUpdateCPU holds hotplug configuration for the CPU resource.
+                Empty struct indicates that default will be used for maxSockets. Default
+                is specified on cluster level. Absence of the struct means opt-out
+                from CPU hotplug functionality.
+              properties:
+                maxSockets:
+                  description: The maximum amount of sockets that can be hot-plugged
+                    to the Virtual Machine
+                  format: int32
+                  type: integer
+              type: object
+            memory:
+              description: MemoryLiveUpdateConfiguration defines the live update memory
+                features for the VirtualMachine
+              properties:
+                maxGuest:
+                  anyOf:
+                  - type: integer
+                  - type: string
+                  description: MaxGuest defines the maximum amount memory that can
+                    be allocated for the VM.
+                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                  x-kubernetes-int-or-string: true
+              type: object
+          type: object
         preference:
           description: PreferenceMatcher references a set of preference that is used
             to fill fields in Template
@@ -3807,6 +4363,12 @@ var CRDsValidation map[string]string = map[string]string{
                 be used to infer or discover the preference to be used through known
                 annotations on the underlying resource. Once applied to the PreferenceMatcher
                 this field is removed.
+              type: string
+            inferFromVolumeFailurePolicy:
+              description: 'InferFromVolumeFailurePolicy controls what should happen
+                on failure when preference the instancetype. Allowed values are: "RejectInferFromVolumeFailure"
+                and "IgnoreInferFromVolumeFailure". If not specified, "RejectInferFromVolumeFailure"
+                is used by default.'
               type: string
             kind:
               description: 'Kind specifies which preference resource is referenced.
@@ -3862,6 +4424,11 @@ var CRDsValidation map[string]string = map[string]string{
                                 description: ConfigDrivePropagation means that the
                                   ssh public keys are injected into the VM using metadata
                                   using the configDrive cloud-init provider
+                                type: object
+                              noCloud:
+                                description: NoCloudPropagation means that the ssh
+                                  public keys are injected into the VM using metadata
+                                  using the noCloud cloud-init provider
                                 type: object
                               qemuGuestAgent:
                                 description: QemuGuestAgentAccessCredentailPropagation
@@ -4232,9 +4799,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       field and the ones listed in the namespaces
                                       field. null selector and null or empty namespaces
                                       list means "this pod's namespace". An empty
-                                      selector ({}) matches all namespaces. This field
-                                      is beta-level and is only honored when PodAffinityNamespaceSelector
-                                      feature is enabled.
+                                      selector ({}) matches all namespaces.
                                     properties:
                                       matchExpressions:
                                         description: matchExpressions is a list of
@@ -4290,7 +4855,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       listed in this field and the ones selected by
                                       namespaceSelector. null or empty namespaces
                                       list and null namespaceSelector means "this
-                                      pod's namespace"
+                                      pod's namespace".
                                     items:
                                       type: string
                                     type: array
@@ -4391,9 +4956,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   and the ones listed in the namespaces field. null
                                   selector and null or empty namespaces list means
                                   "this pod's namespace". An empty selector ({}) matches
-                                  all namespaces. This field is beta-level and is
-                                  only honored when PodAffinityNamespaceSelector feature
-                                  is enabled.
+                                  all namespaces.
                                 properties:
                                   matchExpressions:
                                     description: matchExpressions is a list of label
@@ -4445,7 +5008,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   is applied to the union of the namespaces listed
                                   in this field and the ones selected by namespaceSelector.
                                   null or empty namespaces list and null namespaceSelector
-                                  means "this pod's namespace"
+                                  means "this pod's namespace".
                                 items:
                                   type: string
                                 type: array
@@ -4548,9 +5111,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       field and the ones listed in the namespaces
                                       field. null selector and null or empty namespaces
                                       list means "this pod's namespace". An empty
-                                      selector ({}) matches all namespaces. This field
-                                      is beta-level and is only honored when PodAffinityNamespaceSelector
-                                      feature is enabled.
+                                      selector ({}) matches all namespaces.
                                     properties:
                                       matchExpressions:
                                         description: matchExpressions is a list of
@@ -4606,7 +5167,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       listed in this field and the ones selected by
                                       namespaceSelector. null or empty namespaces
                                       list and null namespaceSelector means "this
-                                      pod's namespace"
+                                      pod's namespace".
                                     items:
                                       type: string
                                     type: array
@@ -4707,9 +5268,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   and the ones listed in the namespaces field. null
                                   selector and null or empty namespaces list means
                                   "this pod's namespace". An empty selector ({}) matches
-                                  all namespaces. This field is beta-level and is
-                                  only honored when PodAffinityNamespaceSelector feature
-                                  is enabled.
+                                  all namespaces.
                                 properties:
                                   matchExpressions:
                                     description: matchExpressions is a list of label
@@ -4761,7 +5320,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   is applied to the union of the namespaces listed
                                   in this field and the ones selected by namespaceSelector.
                                   null or empty namespaces list and null namespaceSelector
-                                  means "this pod's namespace"
+                                  means "this pod's namespace".
                                 items:
                                   type: string
                                 type: array
@@ -4780,6 +5339,11 @@ var CRDsValidation map[string]string = map[string]string{
                           type: array
                       type: object
                   type: object
+                architecture:
+                  description: Specifies the architecture of the vm guest you are
+                    attempting to run. Defaults to the compiled architecture of the
+                    KubeVirt components
+                  type: string
                 dnsConfig:
                   description: Specifies the DNS parameters of a pod. Parameters specified
                     here will be merged to the generated DNS configuration based on
@@ -4985,6 +5549,11 @@ var CRDsValidation map[string]string = map[string]string{
                             pCPU to be allocated for the VMI to place the emulator
                             thread on it.
                           type: boolean
+                        maxSockets:
+                          description: MaxSockets specifies the maximum amount of
+                            sockets that can be hotplugged
+                          format: int32
+                          type: integer
                         model:
                           description: Model specifies the CPU model inside the VMI.
                             List of available models https://github.com/libvirt/libvirt/tree/master/src/cpu_map.
@@ -5048,9 +5617,9 @@ var CRDsValidation map[string]string = map[string]string{
                             Defaults to true.
                           type: boolean
                         autoattachSerialConsole:
-                          description: Whether to attach the default serial console
-                            or not. Serial console access will not be available if
-                            set to false. Defaults to true.
+                          description: Whether to attach the default virtio-serial
+                            console or not. Serial console access will not be available
+                            if set to false. Defaults to true.
                           type: boolean
                         autoattachVSOCK:
                           description: Whether to attach the VSOCK CID to the VM or
@@ -5153,6 +5722,10 @@ var CRDsValidation map[string]string = map[string]string{
                                     description: ReadOnly. Defaults to false.
                                     type: boolean
                                 type: object
+                              errorPolicy:
+                                description: If specified, it can change the default
+                                  error policy (stop) for the disk
+                                type: string
                               io:
                                 description: 'IO specifies which QEMU disk IO mode
                                   should be used. Supported values are: native, default,
@@ -5194,6 +5767,10 @@ var CRDsValidation map[string]string = map[string]string{
                             - name
                             type: object
                           type: array
+                        downwardMetrics:
+                          description: DownwardMetrics creates a virtio serials for
+                            exposing the downward metrics to the vmi.
+                          type: object
                         filesystems:
                           description: Filesystems describes filesystem which is connected
                             to the vmi.
@@ -5307,6 +5884,19 @@ var CRDsValidation map[string]string = map[string]string{
                                   to the device. This value is required to be unique
                                   across all devices and be between 1 and (16*1024-1).
                                 type: integer
+                              binding:
+                                description: 'Binding specifies the binding plugin
+                                  that will be used to connect the interface to the
+                                  guest. It provides an alternative to InterfaceBindingMethod.
+                                  version: 1alphav1'
+                                properties:
+                                  name:
+                                    description: 'Name references to the binding name
+                                      as denined in the kubevirt CR. version: 1alphav1'
+                                    type: string
+                                required:
+                                - name
+                                type: object
                               bootOrder:
                                 description: BootOrder is an integer value > 0, used
                                   to determine ordering of boot devices. Lower values
@@ -5425,6 +6015,12 @@ var CRDsValidation map[string]string = map[string]string{
                                 description: InterfaceSRIOV connects to a given network
                                   by passing-through an SR-IOV PCI device via vfio.
                                 type: object
+                              state:
+                                description: State represents the requested operational
+                                  state of the interface. The (only) value supported
+                                  is 'absent', expressing a request to remove the
+                                  interface.
+                                type: string
                               tag:
                                 description: If specified, the virtual network interface
                                   address and its tag will be provided to the guest
@@ -5434,6 +6030,13 @@ var CRDsValidation map[string]string = map[string]string{
                             - name
                             type: object
                           type: array
+                        logSerialConsole:
+                          description: Whether to log the auto-attached default serial
+                            console or not. Serial console logs will be collect to
+                            a file and then streamed from a named 'guest-console-log'.
+                            Not relevant if autoattachSerialConsole is disabled. Defaults
+                            to cluster wide setting on VirtualMachineOptions.
+                          type: boolean
                         networkInterfaceMultiqueue:
                           description: If specified, virtual network interfaces configured
                             with a virtio bus will also enable the vhost multiqueue
@@ -5734,6 +6337,10 @@ var CRDsValidation map[string]string = map[string]string{
                             efi:
                               description: If set, EFI will be used instead of BIOS.
                               properties:
+                                persistent:
+                                  description: If set to true, Persistent will persist
+                                    the EFI NVRAM across reboots. Defaults to false
+                                  type: boolean
                                 secureBoot:
                                   description: If set, SecureBoot will be enabled
                                     and the OVMF roms will be swapped for SecureBoot-enabled
@@ -5798,6 +6405,29 @@ var CRDsValidation map[string]string = map[string]string{
                       properties:
                         sev:
                           description: AMD Secure Encrypted Virtualization (SEV).
+                          properties:
+                            attestation:
+                              description: If specified, run the attestation process
+                                for a vmi.
+                              type: object
+                            dhCert:
+                              description: Base64 encoded guest owner's Diffie-Hellman
+                                key.
+                              type: string
+                            policy:
+                              description: 'Guest policy flags as defined in AMD SEV
+                                API specification. Note: due to security reasons it
+                                is not allowed to enable guest debugging. Therefore
+                                NoDebug flag is not exposed to users and is always
+                                true.'
+                              properties:
+                                encryptedState:
+                                  description: SEV-ES is required. Defaults to false.
+                                  type: boolean
+                              type: object
+                            session:
+                              description: Base64 encoded session blob.
+                              type: string
                           type: object
                       type: object
                     machine:
@@ -5831,6 +6461,16 @@ var CRDsValidation map[string]string = map[string]string{
                                 x86_64 architecture valid values are 1Gi and 2Mi.
                               type: string
                           type: object
+                        maxGuest:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          description: MaxGuest allows to specify the maximum amount
+                            of memory which is visible inside the Guest OS. The delta
+                            between MaxGuest and Guest is the amount of memory that
+                            can be hot(un)plugged.
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
                       type: object
                     resources:
                       description: Resources describes the Compute Resources required
@@ -6298,29 +6938,97 @@ var CRDsValidation map[string]string = map[string]string{
                               only "value". The requirements are ANDed.
                             type: object
                         type: object
+                      matchLabelKeys:
+                        description: MatchLabelKeys is a set of pod label keys to
+                          select the pods over which spreading will be calculated.
+                          The keys are used to lookup values from the incoming pod
+                          labels, those key-value labels are ANDed with labelSelector
+                          to select the group of existing pods over which spreading
+                          will be calculated for the incoming pod. Keys that don't
+                          exist in the incoming pod labels will be ignored. A null
+                          or empty list means only match against labelSelector.
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: atomic
                       maxSkew:
                         description: 'MaxSkew describes the degree to which pods may
                           be unevenly distributed. When ''whenUnsatisfiable=DoNotSchedule'',
                           it is the maximum permitted difference between the number
                           of matching pods in the target topology and the global minimum.
-                          For example, in a 3-zone cluster, MaxSkew is set to 1, and
-                          pods with the same labelSelector spread as 1/1/0: | zone1
-                          | zone2 | zone3 | |   P   |   P   |       | - if MaxSkew
-                          is 1, incoming pod can only be scheduled to zone3 to become
-                          1/1/1; scheduling it onto zone1(zone2) would make the ActualSkew(2-0)
-                          on zone1(zone2) violate MaxSkew(1). - if MaxSkew is 2, incoming
-                          pod can be scheduled onto any zone. When ''whenUnsatisfiable=ScheduleAnyway'',
-                          it is used to give higher precedence to topologies that
-                          satisfy it. It''s a required field. Default value is 1 and
-                          0 is not allowed.'
+                          The global minimum is the minimum number of matching pods
+                          in an eligible domain or zero if the number of eligible
+                          domains is less than MinDomains. For example, in a 3-zone
+                          cluster, MaxSkew is set to 1, and pods with the same labelSelector
+                          spread as 2/2/1: In this case, the global minimum is 1.
+                          | zone1 | zone2 | zone3 | |  P P  |  P P  |   P   | - if
+                          MaxSkew is 1, incoming pod can only be scheduled to zone3
+                          to become 2/2/2; scheduling it onto zone1(zone2) would make
+                          the ActualSkew(3-1) on zone1(zone2) violate MaxSkew(1).
+                          - if MaxSkew is 2, incoming pod can be scheduled onto any
+                          zone. When ''whenUnsatisfiable=ScheduleAnyway'', it is used
+                          to give higher precedence to topologies that satisfy it.
+                          It''s a required field. Default value is 1 and 0 is not
+                          allowed.'
                         format: int32
                         type: integer
+                      minDomains:
+                        description: "MinDomains indicates a minimum number of eligible
+                          domains. When the number of eligible domains with matching
+                          topology keys is less than minDomains, Pod Topology Spread
+                          treats \"global minimum\" as 0, and then the calculation
+                          of Skew is performed. And when the number of eligible domains
+                          with matching topology keys equals or greater than minDomains,
+                          this value has no effect on scheduling. As a result, when
+                          the number of eligible domains is less than minDomains,
+                          scheduler won't schedule more than maxSkew Pods to those
+                          domains. If value is nil, the constraint behaves as if MinDomains
+                          is equal to 1. Valid values are integers greater than 0.
+                          When value is not nil, WhenUnsatisfiable must be DoNotSchedule.
+                          \n For example, in a 3-zone cluster, MaxSkew is set to 2,
+                          MinDomains is set to 5 and pods with the same labelSelector
+                          spread as 2/2/2: | zone1 | zone2 | zone3 | |  P P  |  P
+                          P  |  P P  | The number of domains is less than 5(MinDomains),
+                          so \"global minimum\" is treated as 0. In this situation,
+                          new pod with the same labelSelector cannot be scheduled,
+                          because computed skew will be 3(3 - 0) if new Pod is scheduled
+                          to any of the three zones, it will violate MaxSkew. \n This
+                          is a beta field and requires the MinDomainsInPodTopologySpread
+                          feature gate to be enabled (enabled by default)."
+                        format: int32
+                        type: integer
+                      nodeAffinityPolicy:
+                        description: "NodeAffinityPolicy indicates how we will treat
+                          Pod's nodeAffinity/nodeSelector when calculating pod topology
+                          spread skew. Options are: - Honor: only nodes matching nodeAffinity/nodeSelector
+                          are included in the calculations. - Ignore: nodeAffinity/nodeSelector
+                          are ignored. All nodes are included in the calculations.
+                          \n If this value is nil, the behavior is equivalent to the
+                          Honor policy. This is a beta-level feature default enabled
+                          by the NodeInclusionPolicyInPodTopologySpread feature flag."
+                        type: string
+                      nodeTaintsPolicy:
+                        description: "NodeTaintsPolicy indicates how we will treat
+                          node taints when calculating pod topology spread skew. Options
+                          are: - Honor: nodes without taints, along with tainted nodes
+                          for which the incoming pod has a toleration, are included.
+                          - Ignore: node taints are ignored. All nodes are included.
+                          \n If this value is nil, the behavior is equivalent to the
+                          Ignore policy. This is a beta-level feature default enabled
+                          by the NodeInclusionPolicyInPodTopologySpread feature flag."
+                        type: string
                       topologyKey:
                         description: TopologyKey is the key of node labels. Nodes
                           that have a label with this key and identical values are
                           considered to be in the same topology. We consider each
                           <key, value> as a "bucket", and try to put balanced number
-                          of pods into each bucket. It's a required field.
+                          of pods into each bucket. We define a domain as a particular
+                          instance of a topology. Also, we define an eligible domain
+                          as a domain whose nodes meet the requirements of nodeAffinityPolicy
+                          and nodeTaintsPolicy. e.g. If TopologyKey is "kubernetes.io/hostname",
+                          each Node is a domain of that topology. And, if TopologyKey
+                          is "topology.kubernetes.io/zone", each zone is a domain
+                          of that topology. It's a required field.
                         type: string
                       whenUnsatisfiable:
                         description: 'WhenUnsatisfiable indicates how to deal with
@@ -6615,13 +7323,13 @@ var CRDsValidation map[string]string = map[string]string{
                               Directly attached to the vmi via qemu. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                             properties:
                               claimName:
-                                description: 'ClaimName is the name of a PersistentVolumeClaim
+                                description: 'claimName is the name of a PersistentVolumeClaim
                                   in the same namespace as the pod using this volume.
                                   More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                                 type: string
                               readOnly:
-                                description: Will force the ReadOnly setting in VolumeMounts.
-                                  Default false.
+                                description: readOnly Will force the ReadOnly setting
+                                  in VolumeMounts. Default false.
                                 type: boolean
                             required:
                             - claimName
@@ -6659,7 +7367,7 @@ var CRDsValidation map[string]string = map[string]string{
                           is populated with a memory dump of the vmi
                         properties:
                           claimName:
-                            description: 'ClaimName is the name of a PersistentVolumeClaim
+                            description: 'claimName is the name of a PersistentVolumeClaim
                               in the same namespace as the pod using this volume.
                               More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                             type: string
@@ -6668,8 +7376,8 @@ var CRDsValidation map[string]string = map[string]string{
                               can be hotplugged and hotunplugged.
                             type: boolean
                           readOnly:
-                            description: Will force the ReadOnly setting in VolumeMounts.
-                              Default false.
+                            description: readOnly Will force the ReadOnly setting
+                              in VolumeMounts. Default false.
                             type: boolean
                         required:
                         - claimName
@@ -6684,7 +7392,7 @@ var CRDsValidation map[string]string = map[string]string{
                           Directly attached to the vmi via qemu. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                         properties:
                           claimName:
-                            description: 'ClaimName is the name of a PersistentVolumeClaim
+                            description: 'claimName is the name of a PersistentVolumeClaim
                               in the same namespace as the pod using this volume.
                               More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                             type: string
@@ -6693,8 +7401,8 @@ var CRDsValidation map[string]string = map[string]string{
                               can be hotplugged and hotunplugged.
                             type: boolean
                           readOnly:
-                            description: Will force the ReadOnly setting in VolumeMounts.
-                              Default false.
+                            description: readOnly Will force the ReadOnly setting
+                              in VolumeMounts. Default false.
                             type: boolean
                         required:
                         - claimName
@@ -6807,31 +7515,6 @@ var CRDsValidation map[string]string = map[string]string{
             updated through an Update() before ObservedGeneration in Status.
           format: int64
           type: integer
-        interfaceRequests:
-          description: InterfaceRequests indicates a list of interfaces added to the
-            VMI template and hot-plugged on an active running VMI.
-          items:
-            properties:
-              addInterfaceOptions:
-                description: AddInterfaceOptions when set indicates a network interface
-                  should be added. The details within this field specify how to add
-                  the interface
-                properties:
-                  name:
-                    description: Name indicates the logical name of the interface.
-                    type: string
-                  networkAttachmentDefinitionName:
-                    description: 'NetworkAttachmentDefinitionName references a NetworkAttachmentDefinition
-                      CRD object. Format: <networkAttachmentDefinitionName>, <namespace>/<networkAttachmentDefinitionName>.
-                      If namespace is not specified, VMI namespace is assumed.'
-                    type: string
-                required:
-                - name
-                - networkAttachmentDefinitionName
-                type: object
-            type: object
-          type: array
-          x-kubernetes-list-type: atomic
         memoryDumpRequest:
           description: MemoryDumpRequest tracks memory dump request phase and info
             of getting a memory dump to the given pvc
@@ -7013,6 +7696,10 @@ var CRDsValidation map[string]string = map[string]string{
                             description: ReadOnly. Defaults to false.
                             type: boolean
                         type: object
+                      errorPolicy:
+                        description: If specified, it can change the default error
+                          policy (stop) for the disk
+                        type: string
                       io:
                         description: 'IO specifies which QEMU disk IO mode should
                           be used. Supported values are: native, default, threads.'
@@ -7092,7 +7779,7 @@ var CRDsValidation map[string]string = map[string]string{
                           Directly attached to the vmi via qemu. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                         properties:
                           claimName:
-                            description: 'ClaimName is the name of a PersistentVolumeClaim
+                            description: 'claimName is the name of a PersistentVolumeClaim
                               in the same namespace as the pod using this volume.
                               More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                             type: string
@@ -7101,8 +7788,8 @@ var CRDsValidation map[string]string = map[string]string{
                               can be hotplugged and hotunplugged.
                             type: boolean
                           readOnly:
-                            description: Will force the ReadOnly setting in VolumeMounts.
-                              Default false.
+                            description: readOnly Will force the ReadOnly setting
+                              in VolumeMounts. Default false.
                             type: boolean
                         required:
                         - claimName
@@ -7180,11 +7867,15 @@ var CRDsValidation map[string]string = map[string]string{
     spec:
       properties:
         annotationFilters:
+          description: 'Example use: "!some/key*". For a detailed description, please
+            refer to https://kubevirt.io/user-guide/operations/clone_api/#label-annotation-filters.'
           items:
             type: string
           type: array
           x-kubernetes-list-type: atomic
         labelFilters:
+          description: 'Example use: "!some/key*". For a detailed description, please
+            refer to https://kubevirt.io/user-guide/operations/clone_api/#label-annotation-filters.'
           items:
             type: string
           type: array
@@ -7202,8 +7893,9 @@ var CRDsValidation map[string]string = map[string]string{
             If this field is not specified, a new serial will be generated automatically.
           type: string
         source:
-          description: TypedLocalObjectReference contains enough information to let
-            you locate the typed referenced object inside the same namespace.
+          description: 'Source is the object that would be cloned. Currently supported
+            source types are: VirtualMachine of kubevirt.io API group, VirtualMachineSnapshot
+            of snapshot.kubevirt.io API group'
           properties:
             apiGroup:
               description: APIGroup is the group for the resource being referenced.
@@ -7221,9 +7913,11 @@ var CRDsValidation map[string]string = map[string]string{
           - name
           type: object
         target:
-          description: If the target is not provided, a random name would be generated
-            for the target. The target's name can be viewed by inspecting status "TargetName"
-            field below.
+          description: 'Target is the outcome of the cloning process. Currently supported
+            source types are: - VirtualMachine of kubevirt.io API group - Empty (nil).
+            If the target is not provided, the target type would default to VirtualMachine
+            and a random name would be generated for the target. The target''s name
+            can be viewed by inspecting status "TargetName" field below.'
           properties:
             apiGroup:
               description: APIGroup is the group for the resource being referenced.
@@ -7311,6 +8005,12 @@ var CRDsValidation map[string]string = map[string]string{
     spec:
       description: Required spec describing the instancetype
       properties:
+        annotations:
+          additionalProperties:
+            type: string
+          description: Optionally defines the required Annotations to be used by the
+            instance type and applied to the VirtualMachineInstance
+          type: object
         cpu:
           description: Required CPU related attributes of the instancetype.
           properties:
@@ -7322,7 +8022,7 @@ var CRDsValidation map[string]string = map[string]string{
             guest:
               description: "Required number of vCPUs to expose to the guest. \n The
                 resulting CPU topology being derived from the optional PreferredCPUTopology
-                attribute of CPUPreferences that itself defaults to PreferCores."
+                attribute of CPUPreferences that itself defaults to PreferSockets."
               format: int32
               type: integer
             isolateEmulatorThread:
@@ -7426,6 +8126,26 @@ var CRDsValidation map[string]string = map[string]string{
           properties:
             sev:
               description: AMD Secure Encrypted Virtualization (SEV).
+              properties:
+                attestation:
+                  description: If specified, run the attestation process for a vmi.
+                  type: object
+                dhCert:
+                  description: Base64 encoded guest owner's Diffie-Hellman key.
+                  type: string
+                policy:
+                  description: 'Guest policy flags as defined in AMD SEV API specification.
+                    Note: due to security reasons it is not allowed to enable guest
+                    debugging. Therefore NoDebug flag is not exposed to users and
+                    is always true.'
+                  properties:
+                    encryptedState:
+                      description: SEV-ES is required. Defaults to false.
+                      type: boolean
+                  type: object
+                session:
+                  description: Base64 encoded session blob.
+                  type: string
               type: object
           type: object
         memory:
@@ -7448,9 +8168,31 @@ var CRDsValidation map[string]string = map[string]string{
                     valid values are 1Gi and 2Mi.
                   type: string
               type: object
+            overcommitPercent:
+              description: OvercommitPercent is the percentage of the guest memory
+                which will be overcommitted. This means that the VMIs parent pod (virt-launcher)
+                will request less physical memory by a factor specified by the OvercommitPercent.
+                Overcommits can lead to memory exhaustion, which in turn can lead
+                to crashes. Use carefully. Defaults to 0
+              maximum: 100
+              minimum: 0
+              type: integer
           required:
           - guest
           type: object
+        nodeSelector:
+          additionalProperties:
+            type: string
+          description: "NodeSelector is a selector which must be true for the vmi
+            to fit on a node. Selector which must match a node's labels for the vmi
+            to be scheduled on that node. More info: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/
+            \n NodeSelector is the name of the custom node selector for the instancetype."
+          type: object
+        schedulerName:
+          description: "If specified, the VMI will be dispatched by specified scheduler.
+            If not specified, the VMI will be dispatched by default scheduler. \n
+            SchedulerName is the name of the custom K8s scheduler for the instancetype."
+          type: string
       required:
       - cpu
       - memory
@@ -7478,6 +8220,12 @@ var CRDsValidation map[string]string = map[string]string{
     spec:
       description: Required spec describing the preferences
       properties:
+        annotations:
+          additionalProperties:
+            type: string
+          description: Optionally defines preferred Annotations to be applied to the
+            VirtualMachineInstance
+          type: object
         clock:
           description: Clock optionally defines preferences associated with the Clock
             attribute of a VirtualMachineInstance DomainSpec
@@ -7574,6 +8322,31 @@ var CRDsValidation map[string]string = map[string]string{
           description: CPU optionally defines preferences associated with the CPU
             attribute of a VirtualMachineInstance DomainSpec
           properties:
+            preferredCPUFeatures:
+              description: PreferredCPUFeatures optionally defines a slice of preferred
+                CPU features.
+              items:
+                description: CPUFeature allows specifying a CPU feature.
+                properties:
+                  name:
+                    description: Name of the CPU feature
+                    type: string
+                  policy:
+                    description: 'Policy is the CPU feature attribute which can have
+                      the following attributes: force    - The virtual CPU will claim
+                      the feature is supported regardless of it being supported by
+                      host CPU. require  - Guest creation will fail unless the feature
+                      is supported by the host CPU or the hypervisor is able to emulate
+                      it. optional - The feature will be supported by virtual CPU
+                      if and only if it is supported by host CPU. disable  - The feature
+                      will not be supported by virtual CPU. forbid   - Guest creation
+                      will fail if the feature is supported by host CPU. Defaults
+                      to require'
+                    type: string
+                required:
+                - name
+                type: object
+              type: array
             preferredCPUTopology:
               description: PreferredCPUTopology optionally defines the preferred guest
                 visible CPU topology, defaults to PreferSockets.
@@ -7664,6 +8437,10 @@ var CRDsValidation map[string]string = map[string]string{
               description: PreferredInputType optionally defines the preferred type
                 for Input devices.
               type: string
+            preferredInterfaceMasquerade:
+              description: PreferredInterfaceMasquerade optionally defines the preferred
+                masquerade configuration to use with each network interface.
+              type: object
             preferredInterfaceModel:
               description: PreferredInterfaceModel optionally defines the preferred
                 model to be used by Interface devices.
@@ -7944,6 +8721,47 @@ var CRDsValidation map[string]string = map[string]string{
               description: PreferredMachineType optionally defines the preferred machine
                 type to use.
               type: string
+          type: object
+        preferSpreadSocketToCoreRatio:
+          description: PreferSpreadSocketToCoreRatio defines the ratio to spread vCPUs
+            between cores and sockets, it defaults to 2.
+          format: int32
+          type: integer
+        preferredSubdomain:
+          description: Subdomain of the VirtualMachineInstance
+          type: string
+        preferredTerminationGracePeriodSeconds:
+          description: Grace period observed after signalling a VirtualMachineInstance
+            to stop after which the VirtualMachineInstance is force terminated.
+          format: int64
+          type: integer
+        requirements:
+          description: Requirements defines the minium amount of instance type defined
+            resources required by a set of preferences
+          properties:
+            cpu:
+              description: Required CPU related attributes of the instancetype.
+              properties:
+                guest:
+                  description: Minimal number of vCPUs required by the preference.
+                  format: int32
+                  type: integer
+              required:
+              - guest
+              type: object
+            memory:
+              description: Required Memory related attributes of the instancetype.
+              properties:
+                guest:
+                  anyOf:
+                  - type: integer
+                  - type: string
+                  description: Minimal amount of memory required by the preference.
+                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                  x-kubernetes-int-or-string: true
+              required:
+              - guest
+              type: object
           type: object
         volumes:
           description: Volumes optionally defines preferences associated with the
@@ -8250,6 +9068,11 @@ var CRDsValidation map[string]string = map[string]string{
                       configDrive:
                         description: ConfigDrivePropagation means that the ssh public
                           keys are injected into the VM using metadata using the configDrive
+                          cloud-init provider
+                        type: object
+                      noCloud:
+                        description: NoCloudPropagation means that the ssh public
+                          keys are injected into the VM using metadata using the noCloud
                           cloud-init provider
                         type: object
                       qemuGuestAgent:
@@ -8598,9 +9421,7 @@ var CRDsValidation map[string]string = map[string]string{
                               union of the namespaces selected by this field and the
                               ones listed in the namespaces field. null selector and
                               null or empty namespaces list means "this pod's namespace".
-                              An empty selector ({}) matches all namespaces. This
-                              field is beta-level and is only honored when PodAffinityNamespaceSelector
-                              feature is enabled.
+                              An empty selector ({}) matches all namespaces.
                             properties:
                               matchExpressions:
                                 description: matchExpressions is a list of label selector
@@ -8650,7 +9471,7 @@ var CRDsValidation map[string]string = map[string]string{
                               to the union of the namespaces listed in this field
                               and the ones selected by namespaceSelector. null or
                               empty namespaces list and null namespaceSelector means
-                              "this pod's namespace"
+                              "this pod's namespace".
                             items:
                               type: string
                             type: array
@@ -8745,9 +9566,7 @@ var CRDsValidation map[string]string = map[string]string{
                           the namespaces selected by this field and the ones listed
                           in the namespaces field. null selector and null or empty
                           namespaces list means "this pod's namespace". An empty selector
-                          ({}) matches all namespaces. This field is beta-level and
-                          is only honored when PodAffinityNamespaceSelector feature
-                          is enabled.
+                          ({}) matches all namespaces.
                         properties:
                           matchExpressions:
                             description: matchExpressions is a list of label selector
@@ -8796,7 +9615,7 @@ var CRDsValidation map[string]string = map[string]string{
                           names that the term applies to. The term is applied to the
                           union of the namespaces listed in this field and the ones
                           selected by namespaceSelector. null or empty namespaces
-                          list and null namespaceSelector means "this pod's namespace"
+                          list and null namespaceSelector means "this pod's namespace".
                         items:
                           type: string
                         type: array
@@ -8888,9 +9707,7 @@ var CRDsValidation map[string]string = map[string]string{
                               union of the namespaces selected by this field and the
                               ones listed in the namespaces field. null selector and
                               null or empty namespaces list means "this pod's namespace".
-                              An empty selector ({}) matches all namespaces. This
-                              field is beta-level and is only honored when PodAffinityNamespaceSelector
-                              feature is enabled.
+                              An empty selector ({}) matches all namespaces.
                             properties:
                               matchExpressions:
                                 description: matchExpressions is a list of label selector
@@ -8940,7 +9757,7 @@ var CRDsValidation map[string]string = map[string]string{
                               to the union of the namespaces listed in this field
                               and the ones selected by namespaceSelector. null or
                               empty namespaces list and null namespaceSelector means
-                              "this pod's namespace"
+                              "this pod's namespace".
                             items:
                               type: string
                             type: array
@@ -9035,9 +9852,7 @@ var CRDsValidation map[string]string = map[string]string{
                           the namespaces selected by this field and the ones listed
                           in the namespaces field. null selector and null or empty
                           namespaces list means "this pod's namespace". An empty selector
-                          ({}) matches all namespaces. This field is beta-level and
-                          is only honored when PodAffinityNamespaceSelector feature
-                          is enabled.
+                          ({}) matches all namespaces.
                         properties:
                           matchExpressions:
                             description: matchExpressions is a list of label selector
@@ -9086,7 +9901,7 @@ var CRDsValidation map[string]string = map[string]string{
                           names that the term applies to. The term is applied to the
                           union of the namespaces listed in this field and the ones
                           selected by namespaceSelector. null or empty namespaces
-                          list and null namespaceSelector means "this pod's namespace"
+                          list and null namespaceSelector means "this pod's namespace".
                         items:
                           type: string
                         type: array
@@ -9104,6 +9919,10 @@ var CRDsValidation map[string]string = map[string]string{
                   type: array
               type: object
           type: object
+        architecture:
+          description: Specifies the architecture of the vm guest you are attempting
+            to run. Defaults to the compiled architecture of the KubeVirt components
+          type: string
         dnsConfig:
           description: Specifies the DNS parameters of a pod. Parameters specified
             here will be merged to the generated DNS configuration based on DNSPolicy.
@@ -9293,6 +10112,11 @@ var CRDsValidation map[string]string = map[string]string{
                   description: IsolateEmulatorThread requests one more dedicated pCPU
                     to be allocated for the VMI to place the emulator thread on it.
                   type: boolean
+                maxSockets:
+                  description: MaxSockets specifies the maximum amount of sockets
+                    that can be hotplugged
+                  format: int32
+                  type: integer
                 model:
                   description: Model specifies the CPU model inside the VMI. List
                     of available models https://github.com/libvirt/libvirt/tree/master/src/cpu_map.
@@ -9352,9 +10176,9 @@ var CRDsValidation map[string]string = map[string]string{
                     to true.
                   type: boolean
                 autoattachSerialConsole:
-                  description: Whether to attach the default serial console or not.
-                    Serial console access will not be available if set to false. Defaults
-                    to true.
+                  description: Whether to attach the default virtio-serial console
+                    or not. Serial console access will not be available if set to
+                    false. Defaults to true.
                   type: boolean
                 autoattachVSOCK:
                   description: Whether to attach the VSOCK CID to the VM or not. VSOCK
@@ -9450,6 +10274,10 @@ var CRDsValidation map[string]string = map[string]string{
                             description: ReadOnly. Defaults to false.
                             type: boolean
                         type: object
+                      errorPolicy:
+                        description: If specified, it can change the default error
+                          policy (stop) for the disk
+                        type: string
                       io:
                         description: 'IO specifies which QEMU disk IO mode should
                           be used. Supported values are: native, default, threads.'
@@ -9488,6 +10316,10 @@ var CRDsValidation map[string]string = map[string]string{
                     - name
                     type: object
                   type: array
+                downwardMetrics:
+                  description: DownwardMetrics creates a virtio serials for exposing
+                    the downward metrics to the vmi.
+                  type: object
                 filesystems:
                   description: Filesystems describes filesystem which is connected
                     to the vmi.
@@ -9597,6 +10429,18 @@ var CRDsValidation map[string]string = map[string]string{
                           in PCI addresses assigned to the device. This value is required
                           to be unique across all devices and be between 1 and (16*1024-1).
                         type: integer
+                      binding:
+                        description: 'Binding specifies the binding plugin that will
+                          be used to connect the interface to the guest. It provides
+                          an alternative to InterfaceBindingMethod. version: 1alphav1'
+                        properties:
+                          name:
+                            description: 'Name references to the binding name as denined
+                              in the kubevirt CR. version: 1alphav1'
+                            type: string
+                        required:
+                        - name
+                        type: object
                       bootOrder:
                         description: BootOrder is an integer value > 0, used to determine
                           ordering of boot devices. Lower values take precedence.
@@ -9711,6 +10555,11 @@ var CRDsValidation map[string]string = map[string]string{
                         description: InterfaceSRIOV connects to a given network by
                           passing-through an SR-IOV PCI device via vfio.
                         type: object
+                      state:
+                        description: State represents the requested operational state
+                          of the interface. The (only) value supported is 'absent',
+                          expressing a request to remove the interface.
+                        type: string
                       tag:
                         description: If specified, the virtual network interface address
                           and its tag will be provided to the guest via config drive
@@ -9719,6 +10568,12 @@ var CRDsValidation map[string]string = map[string]string{
                     - name
                     type: object
                   type: array
+                logSerialConsole:
+                  description: Whether to log the auto-attached default serial console
+                    or not. Serial console logs will be collect to a file and then
+                    streamed from a named 'guest-console-log'. Not relevant if autoattachSerialConsole
+                    is disabled. Defaults to cluster wide setting on VirtualMachineOptions.
+                  type: boolean
                 networkInterfaceMultiqueue:
                   description: If specified, virtual network interfaces configured
                     with a virtio bus will also enable the vhost multiqueue feature
@@ -9993,6 +10848,10 @@ var CRDsValidation map[string]string = map[string]string{
                     efi:
                       description: If set, EFI will be used instead of BIOS.
                       properties:
+                        persistent:
+                          description: If set to true, Persistent will persist the
+                            EFI NVRAM across reboots. Defaults to false
+                          type: boolean
                         secureBoot:
                           description: If set, SecureBoot will be enabled and the
                             OVMF roms will be swapped for SecureBoot-enabled ones.
@@ -10052,6 +10911,27 @@ var CRDsValidation map[string]string = map[string]string{
               properties:
                 sev:
                   description: AMD Secure Encrypted Virtualization (SEV).
+                  properties:
+                    attestation:
+                      description: If specified, run the attestation process for a
+                        vmi.
+                      type: object
+                    dhCert:
+                      description: Base64 encoded guest owner's Diffie-Hellman key.
+                      type: string
+                    policy:
+                      description: 'Guest policy flags as defined in AMD SEV API specification.
+                        Note: due to security reasons it is not allowed to enable
+                        guest debugging. Therefore NoDebug flag is not exposed to
+                        users and is always true.'
+                      properties:
+                        encryptedState:
+                          description: SEV-ES is required. Defaults to false.
+                          type: boolean
+                      type: object
+                    session:
+                      description: Base64 encoded session blob.
+                      type: string
                   type: object
               type: object
             machine:
@@ -10083,6 +10963,15 @@ var CRDsValidation map[string]string = map[string]string{
                         architecture valid values are 1Gi and 2Mi.
                       type: string
                   type: object
+                maxGuest:
+                  anyOf:
+                  - type: integer
+                  - type: string
+                  description: MaxGuest allows to specify the maximum amount of memory
+                    which is visible inside the Guest OS. The delta between MaxGuest
+                    and Guest is the amount of memory that can be hot(un)plugged.
+                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                  x-kubernetes-int-or-string: true
               type: object
             resources:
               description: Resources describes the Compute Resources required by this
@@ -10527,27 +11416,89 @@ var CRDsValidation map[string]string = map[string]string{
                       are ANDed.
                     type: object
                 type: object
+              matchLabelKeys:
+                description: MatchLabelKeys is a set of pod label keys to select the
+                  pods over which spreading will be calculated. The keys are used
+                  to lookup values from the incoming pod labels, those key-value labels
+                  are ANDed with labelSelector to select the group of existing pods
+                  over which spreading will be calculated for the incoming pod. Keys
+                  that don't exist in the incoming pod labels will be ignored. A null
+                  or empty list means only match against labelSelector.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: atomic
               maxSkew:
                 description: 'MaxSkew describes the degree to which pods may be unevenly
                   distributed. When ''whenUnsatisfiable=DoNotSchedule'', it is the
                   maximum permitted difference between the number of matching pods
-                  in the target topology and the global minimum. For example, in a
-                  3-zone cluster, MaxSkew is set to 1, and pods with the same labelSelector
-                  spread as 1/1/0: | zone1 | zone2 | zone3 | |   P   |   P   |       |
+                  in the target topology and the global minimum. The global minimum
+                  is the minimum number of matching pods in an eligible domain or
+                  zero if the number of eligible domains is less than MinDomains.
+                  For example, in a 3-zone cluster, MaxSkew is set to 1, and pods
+                  with the same labelSelector spread as 2/2/1: In this case, the global
+                  minimum is 1. | zone1 | zone2 | zone3 | |  P P  |  P P  |   P   |
                   - if MaxSkew is 1, incoming pod can only be scheduled to zone3 to
-                  become 1/1/1; scheduling it onto zone1(zone2) would make the ActualSkew(2-0)
+                  become 2/2/2; scheduling it onto zone1(zone2) would make the ActualSkew(3-1)
                   on zone1(zone2) violate MaxSkew(1). - if MaxSkew is 2, incoming
                   pod can be scheduled onto any zone. When ''whenUnsatisfiable=ScheduleAnyway'',
                   it is used to give higher precedence to topologies that satisfy
                   it. It''s a required field. Default value is 1 and 0 is not allowed.'
                 format: int32
                 type: integer
+              minDomains:
+                description: "MinDomains indicates a minimum number of eligible domains.
+                  When the number of eligible domains with matching topology keys
+                  is less than minDomains, Pod Topology Spread treats \"global minimum\"
+                  as 0, and then the calculation of Skew is performed. And when the
+                  number of eligible domains with matching topology keys equals or
+                  greater than minDomains, this value has no effect on scheduling.
+                  As a result, when the number of eligible domains is less than minDomains,
+                  scheduler won't schedule more than maxSkew Pods to those domains.
+                  If value is nil, the constraint behaves as if MinDomains is equal
+                  to 1. Valid values are integers greater than 0. When value is not
+                  nil, WhenUnsatisfiable must be DoNotSchedule. \n For example, in
+                  a 3-zone cluster, MaxSkew is set to 2, MinDomains is set to 5 and
+                  pods with the same labelSelector spread as 2/2/2: | zone1 | zone2
+                  | zone3 | |  P P  |  P P  |  P P  | The number of domains is less
+                  than 5(MinDomains), so \"global minimum\" is treated as 0. In this
+                  situation, new pod with the same labelSelector cannot be scheduled,
+                  because computed skew will be 3(3 - 0) if new Pod is scheduled to
+                  any of the three zones, it will violate MaxSkew. \n This is a beta
+                  field and requires the MinDomainsInPodTopologySpread feature gate
+                  to be enabled (enabled by default)."
+                format: int32
+                type: integer
+              nodeAffinityPolicy:
+                description: "NodeAffinityPolicy indicates how we will treat Pod's
+                  nodeAffinity/nodeSelector when calculating pod topology spread skew.
+                  Options are: - Honor: only nodes matching nodeAffinity/nodeSelector
+                  are included in the calculations. - Ignore: nodeAffinity/nodeSelector
+                  are ignored. All nodes are included in the calculations. \n If this
+                  value is nil, the behavior is equivalent to the Honor policy. This
+                  is a beta-level feature default enabled by the NodeInclusionPolicyInPodTopologySpread
+                  feature flag."
+                type: string
+              nodeTaintsPolicy:
+                description: "NodeTaintsPolicy indicates how we will treat node taints
+                  when calculating pod topology spread skew. Options are: - Honor:
+                  nodes without taints, along with tainted nodes for which the incoming
+                  pod has a toleration, are included. - Ignore: node taints are ignored.
+                  All nodes are included. \n If this value is nil, the behavior is
+                  equivalent to the Ignore policy. This is a beta-level feature default
+                  enabled by the NodeInclusionPolicyInPodTopologySpread feature flag."
+                type: string
               topologyKey:
                 description: TopologyKey is the key of node labels. Nodes that have
                   a label with this key and identical values are considered to be
                   in the same topology. We consider each <key, value> as a "bucket",
-                  and try to put balanced number of pods into each bucket. It's a
-                  required field.
+                  and try to put balanced number of pods into each bucket. We define
+                  a domain as a particular instance of a topology. Also, we define
+                  an eligible domain as a domain whose nodes meet the requirements
+                  of nodeAffinityPolicy and nodeTaintsPolicy. e.g. If TopologyKey
+                  is "kubernetes.io/hostname", each Node is a domain of that topology.
+                  And, if TopologyKey is "topology.kubernetes.io/zone", each zone
+                  is a domain of that topology. It's a required field.
                 type: string
               whenUnsatisfiable:
                 description: 'WhenUnsatisfiable indicates how to deal with a pod if
@@ -10827,12 +11778,12 @@ var CRDsValidation map[string]string = map[string]string{
                       to the vmi via qemu. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                     properties:
                       claimName:
-                        description: 'ClaimName is the name of a PersistentVolumeClaim
+                        description: 'claimName is the name of a PersistentVolumeClaim
                           in the same namespace as the pod using this volume. More
                           info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                         type: string
                       readOnly:
-                        description: Will force the ReadOnly setting in VolumeMounts.
+                        description: readOnly Will force the ReadOnly setting in VolumeMounts.
                           Default false.
                         type: boolean
                     required:
@@ -10869,7 +11820,7 @@ var CRDsValidation map[string]string = map[string]string{
                   with a memory dump of the vmi
                 properties:
                   claimName:
-                    description: 'ClaimName is the name of a PersistentVolumeClaim
+                    description: 'claimName is the name of a PersistentVolumeClaim
                       in the same namespace as the pod using this volume. More info:
                       https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                     type: string
@@ -10878,7 +11829,7 @@ var CRDsValidation map[string]string = map[string]string{
                       hotplugged and hotunplugged.
                     type: boolean
                   readOnly:
-                    description: Will force the ReadOnly setting in VolumeMounts.
+                    description: readOnly Will force the ReadOnly setting in VolumeMounts.
                       Default false.
                     type: boolean
                 required:
@@ -10894,7 +11845,7 @@ var CRDsValidation map[string]string = map[string]string{
                   to the vmi via qemu. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                 properties:
                   claimName:
-                    description: 'ClaimName is the name of a PersistentVolumeClaim
+                    description: 'claimName is the name of a PersistentVolumeClaim
                       in the same namespace as the pod using this volume. More info:
                       https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                     type: string
@@ -10903,7 +11854,7 @@ var CRDsValidation map[string]string = map[string]string{
                       hotplugged and hotunplugged.
                     type: boolean
                   readOnly:
-                    description: Will force the ReadOnly setting in VolumeMounts.
+                    description: readOnly Will force the ReadOnly setting in VolumeMounts.
                       Default false.
                     type: boolean
                 required:
@@ -11008,6 +11959,27 @@ var CRDsValidation map[string]string = map[string]string{
             - type
             type: object
           type: array
+        currentCPUTopology:
+          description: CurrentCPUTopology specifies the current CPU topology used
+            by the VM workload. Current topology may differ from the desired topology
+            in the spec while CPU hotplug takes place.
+          properties:
+            cores:
+              description: Cores specifies the number of cores inside the vmi. Must
+                be a value greater or equal 1.
+              format: int32
+              type: integer
+            sockets:
+              description: Sockets specifies the number of sockets inside the vmi.
+                Must be a value greater or equal 1.
+              format: int32
+              type: integer
+            threads:
+              description: Threads specifies the number of threads inside the vmi.
+                Must be a value greater or equal 1.
+              format: int32
+              type: integer
+          type: object
         evacuationNodeName:
           description: EvacuationNodeName is used to track the eviction process of
             a VMI. It stores the name of the node that we want to evacuate. It is
@@ -11083,6 +12055,44 @@ var CRDsValidation map[string]string = map[string]string{
           description: LauncherContainerImageVersion indicates what container image
             is currently active for the vmi.
           type: string
+        machine:
+          description: Machine shows the final resulting qemu machine type. This can
+            be different than the machine type selected in the spec, due to qemus
+            machine type alias mechanism.
+          properties:
+            type:
+              description: QEMU machine type is the actual chipset of the VirtualMachineInstance.
+              type: string
+          type: object
+        memory:
+          description: Memory shows various informations about the VirtualMachine
+            memory.
+          properties:
+            guestAtBoot:
+              anyOf:
+              - type: integer
+              - type: string
+              description: GuestAtBoot specifies with how much memory the VirtualMachine
+                intiallly booted with.
+              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+              x-kubernetes-int-or-string: true
+            guestCurrent:
+              anyOf:
+              - type: integer
+              - type: string
+              description: GuestCurrent specifies how much memory is currently available
+                for the VirtualMachine.
+              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+              x-kubernetes-int-or-string: true
+            guestRequested:
+              anyOf:
+              - type: integer
+              - type: string
+              description: GuestRequested specifies how much memory was requested
+                (hotplug) for the VirtualMachine.
+              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+              x-kubernetes-int-or-string: true
+          type: object
         migrationMethod:
           description: 'Represents the method using which the vmi can be migrated:
             live migration or block migration'
@@ -11128,8 +12138,8 @@ var CRDsValidation map[string]string = map[string]string{
                   - type: integer
                   - type: string
                   description: BandwidthPerMigration limits the amount of network
-                    bandwith live migrations are allowed to use. The value is in quantity
-                    per second. Defaults to 0 (no limit)
+                    bandwidth live migrations are allowed to use. The value is in
+                    quantity per second. Defaults to 0 (no limit)
                   pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                   x-kubernetes-int-or-string: true
                 completionTimeoutPerGiB:
@@ -11144,6 +12154,15 @@ var CRDsValidation map[string]string = map[string]string{
                   description: When set to true, DisableTLS will disable the additional
                     layer of live migration encryption provided by KubeVirt. This
                     is usually a bad idea. Defaults to false
+                  type: boolean
+                matchSELinuxLevelOnMigration:
+                  description: By default, the SELinux level of target virt-launcher
+                    pods is forced to the level of the source virt-launcher. When
+                    set to true, MatchSELinuxLevelOnMigration lets the CRI auto-assign
+                    a random level to the target. That will ensure the target virt-launcher
+                    doesn't share categories with another pod on the node. However,
+                    migrations will fail when using RWX volumes that don't automatically
+                    deal with SELinux levels.
                   type: boolean
                 network:
                   description: Network is the name of the CNI network to use for live
@@ -11507,8 +12526,8 @@ var CRDsValidation map[string]string = map[string]string{
                   - type: integer
                   - type: string
                   description: BandwidthPerMigration limits the amount of network
-                    bandwith live migrations are allowed to use. The value is in quantity
-                    per second. Defaults to 0 (no limit)
+                    bandwidth live migrations are allowed to use. The value is in
+                    quantity per second. Defaults to 0 (no limit)
                   pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                   x-kubernetes-int-or-string: true
                 completionTimeoutPerGiB:
@@ -11523,6 +12542,15 @@ var CRDsValidation map[string]string = map[string]string{
                   description: When set to true, DisableTLS will disable the additional
                     layer of live migration encryption provided by KubeVirt. This
                     is usually a bad idea. Defaults to false
+                  type: boolean
+                matchSELinuxLevelOnMigration:
+                  description: By default, the SELinux level of target virt-launcher
+                    pods is forced to the level of the source virt-launcher. When
+                    set to true, MatchSELinuxLevelOnMigration lets the CRI auto-assign
+                    a random level to the target. That will ensure the target virt-launcher
+                    doesn't share categories with another pod on the node. However,
+                    migrations will fail when using RWX volumes that don't automatically
+                    deal with SELinux levels.
                   type: boolean
                 network:
                   description: Network is the name of the CNI network to use for live
@@ -11813,6 +12841,11 @@ var CRDsValidation map[string]string = map[string]string{
                   description: IsolateEmulatorThread requests one more dedicated pCPU
                     to be allocated for the VMI to place the emulator thread on it.
                   type: boolean
+                maxSockets:
+                  description: MaxSockets specifies the maximum amount of sockets
+                    that can be hotplugged
+                  format: int32
+                  type: integer
                 model:
                   description: Model specifies the CPU model inside the VMI. List
                     of available models https://github.com/libvirt/libvirt/tree/master/src/cpu_map.
@@ -11872,9 +12905,9 @@ var CRDsValidation map[string]string = map[string]string{
                     to true.
                   type: boolean
                 autoattachSerialConsole:
-                  description: Whether to attach the default serial console or not.
-                    Serial console access will not be available if set to false. Defaults
-                    to true.
+                  description: Whether to attach the default virtio-serial console
+                    or not. Serial console access will not be available if set to
+                    false. Defaults to true.
                   type: boolean
                 autoattachVSOCK:
                   description: Whether to attach the VSOCK CID to the VM or not. VSOCK
@@ -11970,6 +13003,10 @@ var CRDsValidation map[string]string = map[string]string{
                             description: ReadOnly. Defaults to false.
                             type: boolean
                         type: object
+                      errorPolicy:
+                        description: If specified, it can change the default error
+                          policy (stop) for the disk
+                        type: string
                       io:
                         description: 'IO specifies which QEMU disk IO mode should
                           be used. Supported values are: native, default, threads.'
@@ -12008,6 +13045,10 @@ var CRDsValidation map[string]string = map[string]string{
                     - name
                     type: object
                   type: array
+                downwardMetrics:
+                  description: DownwardMetrics creates a virtio serials for exposing
+                    the downward metrics to the vmi.
+                  type: object
                 filesystems:
                   description: Filesystems describes filesystem which is connected
                     to the vmi.
@@ -12117,6 +13158,18 @@ var CRDsValidation map[string]string = map[string]string{
                           in PCI addresses assigned to the device. This value is required
                           to be unique across all devices and be between 1 and (16*1024-1).
                         type: integer
+                      binding:
+                        description: 'Binding specifies the binding plugin that will
+                          be used to connect the interface to the guest. It provides
+                          an alternative to InterfaceBindingMethod. version: 1alphav1'
+                        properties:
+                          name:
+                            description: 'Name references to the binding name as denined
+                              in the kubevirt CR. version: 1alphav1'
+                            type: string
+                        required:
+                        - name
+                        type: object
                       bootOrder:
                         description: BootOrder is an integer value > 0, used to determine
                           ordering of boot devices. Lower values take precedence.
@@ -12231,6 +13284,11 @@ var CRDsValidation map[string]string = map[string]string{
                         description: InterfaceSRIOV connects to a given network by
                           passing-through an SR-IOV PCI device via vfio.
                         type: object
+                      state:
+                        description: State represents the requested operational state
+                          of the interface. The (only) value supported is 'absent',
+                          expressing a request to remove the interface.
+                        type: string
                       tag:
                         description: If specified, the virtual network interface address
                           and its tag will be provided to the guest via config drive
@@ -12239,6 +13297,12 @@ var CRDsValidation map[string]string = map[string]string{
                     - name
                     type: object
                   type: array
+                logSerialConsole:
+                  description: Whether to log the auto-attached default serial console
+                    or not. Serial console logs will be collect to a file and then
+                    streamed from a named 'guest-console-log'. Not relevant if autoattachSerialConsole
+                    is disabled. Defaults to cluster wide setting on VirtualMachineOptions.
+                  type: boolean
                 networkInterfaceMultiqueue:
                   description: If specified, virtual network interfaces configured
                     with a virtio bus will also enable the vhost multiqueue feature
@@ -12513,6 +13577,10 @@ var CRDsValidation map[string]string = map[string]string{
                     efi:
                       description: If set, EFI will be used instead of BIOS.
                       properties:
+                        persistent:
+                          description: If set to true, Persistent will persist the
+                            EFI NVRAM across reboots. Defaults to false
+                          type: boolean
                         secureBoot:
                           description: If set, SecureBoot will be enabled and the
                             OVMF roms will be swapped for SecureBoot-enabled ones.
@@ -12572,6 +13640,27 @@ var CRDsValidation map[string]string = map[string]string{
               properties:
                 sev:
                   description: AMD Secure Encrypted Virtualization (SEV).
+                  properties:
+                    attestation:
+                      description: If specified, run the attestation process for a
+                        vmi.
+                      type: object
+                    dhCert:
+                      description: Base64 encoded guest owner's Diffie-Hellman key.
+                      type: string
+                    policy:
+                      description: 'Guest policy flags as defined in AMD SEV API specification.
+                        Note: due to security reasons it is not allowed to enable
+                        guest debugging. Therefore NoDebug flag is not exposed to
+                        users and is always true.'
+                      properties:
+                        encryptedState:
+                          description: SEV-ES is required. Defaults to false.
+                          type: boolean
+                      type: object
+                    session:
+                      description: Base64 encoded session blob.
+                      type: string
                   type: object
               type: object
             machine:
@@ -12603,6 +13692,15 @@ var CRDsValidation map[string]string = map[string]string{
                         architecture valid values are 1Gi and 2Mi.
                       type: string
                   type: object
+                maxGuest:
+                  anyOf:
+                  - type: integer
+                  - type: string
+                  description: MaxGuest allows to specify the maximum amount of memory
+                    which is visible inside the Guest OS. The delta between MaxGuest
+                    and Guest is the amount of memory that can be hot(un)plugged.
+                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                  x-kubernetes-int-or-string: true
               type: object
             resources:
               description: Resources describes the Compute Resources required by this
@@ -12781,6 +13879,11 @@ var CRDsValidation map[string]string = map[string]string{
                                 description: ConfigDrivePropagation means that the
                                   ssh public keys are injected into the VM using metadata
                                   using the configDrive cloud-init provider
+                                type: object
+                              noCloud:
+                                description: NoCloudPropagation means that the ssh
+                                  public keys are injected into the VM using metadata
+                                  using the noCloud cloud-init provider
                                 type: object
                               qemuGuestAgent:
                                 description: QemuGuestAgentAccessCredentailPropagation
@@ -13151,9 +14254,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       field and the ones listed in the namespaces
                                       field. null selector and null or empty namespaces
                                       list means "this pod's namespace". An empty
-                                      selector ({}) matches all namespaces. This field
-                                      is beta-level and is only honored when PodAffinityNamespaceSelector
-                                      feature is enabled.
+                                      selector ({}) matches all namespaces.
                                     properties:
                                       matchExpressions:
                                         description: matchExpressions is a list of
@@ -13209,7 +14310,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       listed in this field and the ones selected by
                                       namespaceSelector. null or empty namespaces
                                       list and null namespaceSelector means "this
-                                      pod's namespace"
+                                      pod's namespace".
                                     items:
                                       type: string
                                     type: array
@@ -13310,9 +14411,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   and the ones listed in the namespaces field. null
                                   selector and null or empty namespaces list means
                                   "this pod's namespace". An empty selector ({}) matches
-                                  all namespaces. This field is beta-level and is
-                                  only honored when PodAffinityNamespaceSelector feature
-                                  is enabled.
+                                  all namespaces.
                                 properties:
                                   matchExpressions:
                                     description: matchExpressions is a list of label
@@ -13364,7 +14463,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   is applied to the union of the namespaces listed
                                   in this field and the ones selected by namespaceSelector.
                                   null or empty namespaces list and null namespaceSelector
-                                  means "this pod's namespace"
+                                  means "this pod's namespace".
                                 items:
                                   type: string
                                 type: array
@@ -13467,9 +14566,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       field and the ones listed in the namespaces
                                       field. null selector and null or empty namespaces
                                       list means "this pod's namespace". An empty
-                                      selector ({}) matches all namespaces. This field
-                                      is beta-level and is only honored when PodAffinityNamespaceSelector
-                                      feature is enabled.
+                                      selector ({}) matches all namespaces.
                                     properties:
                                       matchExpressions:
                                         description: matchExpressions is a list of
@@ -13525,7 +14622,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       listed in this field and the ones selected by
                                       namespaceSelector. null or empty namespaces
                                       list and null namespaceSelector means "this
-                                      pod's namespace"
+                                      pod's namespace".
                                     items:
                                       type: string
                                     type: array
@@ -13626,9 +14723,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   and the ones listed in the namespaces field. null
                                   selector and null or empty namespaces list means
                                   "this pod's namespace". An empty selector ({}) matches
-                                  all namespaces. This field is beta-level and is
-                                  only honored when PodAffinityNamespaceSelector feature
-                                  is enabled.
+                                  all namespaces.
                                 properties:
                                   matchExpressions:
                                     description: matchExpressions is a list of label
@@ -13680,7 +14775,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   is applied to the union of the namespaces listed
                                   in this field and the ones selected by namespaceSelector.
                                   null or empty namespaces list and null namespaceSelector
-                                  means "this pod's namespace"
+                                  means "this pod's namespace".
                                 items:
                                   type: string
                                 type: array
@@ -13699,6 +14794,11 @@ var CRDsValidation map[string]string = map[string]string{
                           type: array
                       type: object
                   type: object
+                architecture:
+                  description: Specifies the architecture of the vm guest you are
+                    attempting to run. Defaults to the compiled architecture of the
+                    KubeVirt components
+                  type: string
                 dnsConfig:
                   description: Specifies the DNS parameters of a pod. Parameters specified
                     here will be merged to the generated DNS configuration based on
@@ -13904,6 +15004,11 @@ var CRDsValidation map[string]string = map[string]string{
                             pCPU to be allocated for the VMI to place the emulator
                             thread on it.
                           type: boolean
+                        maxSockets:
+                          description: MaxSockets specifies the maximum amount of
+                            sockets that can be hotplugged
+                          format: int32
+                          type: integer
                         model:
                           description: Model specifies the CPU model inside the VMI.
                             List of available models https://github.com/libvirt/libvirt/tree/master/src/cpu_map.
@@ -13967,9 +15072,9 @@ var CRDsValidation map[string]string = map[string]string{
                             Defaults to true.
                           type: boolean
                         autoattachSerialConsole:
-                          description: Whether to attach the default serial console
-                            or not. Serial console access will not be available if
-                            set to false. Defaults to true.
+                          description: Whether to attach the default virtio-serial
+                            console or not. Serial console access will not be available
+                            if set to false. Defaults to true.
                           type: boolean
                         autoattachVSOCK:
                           description: Whether to attach the VSOCK CID to the VM or
@@ -14072,6 +15177,10 @@ var CRDsValidation map[string]string = map[string]string{
                                     description: ReadOnly. Defaults to false.
                                     type: boolean
                                 type: object
+                              errorPolicy:
+                                description: If specified, it can change the default
+                                  error policy (stop) for the disk
+                                type: string
                               io:
                                 description: 'IO specifies which QEMU disk IO mode
                                   should be used. Supported values are: native, default,
@@ -14113,6 +15222,10 @@ var CRDsValidation map[string]string = map[string]string{
                             - name
                             type: object
                           type: array
+                        downwardMetrics:
+                          description: DownwardMetrics creates a virtio serials for
+                            exposing the downward metrics to the vmi.
+                          type: object
                         filesystems:
                           description: Filesystems describes filesystem which is connected
                             to the vmi.
@@ -14226,6 +15339,19 @@ var CRDsValidation map[string]string = map[string]string{
                                   to the device. This value is required to be unique
                                   across all devices and be between 1 and (16*1024-1).
                                 type: integer
+                              binding:
+                                description: 'Binding specifies the binding plugin
+                                  that will be used to connect the interface to the
+                                  guest. It provides an alternative to InterfaceBindingMethod.
+                                  version: 1alphav1'
+                                properties:
+                                  name:
+                                    description: 'Name references to the binding name
+                                      as denined in the kubevirt CR. version: 1alphav1'
+                                    type: string
+                                required:
+                                - name
+                                type: object
                               bootOrder:
                                 description: BootOrder is an integer value > 0, used
                                   to determine ordering of boot devices. Lower values
@@ -14344,6 +15470,12 @@ var CRDsValidation map[string]string = map[string]string{
                                 description: InterfaceSRIOV connects to a given network
                                   by passing-through an SR-IOV PCI device via vfio.
                                 type: object
+                              state:
+                                description: State represents the requested operational
+                                  state of the interface. The (only) value supported
+                                  is 'absent', expressing a request to remove the
+                                  interface.
+                                type: string
                               tag:
                                 description: If specified, the virtual network interface
                                   address and its tag will be provided to the guest
@@ -14353,6 +15485,13 @@ var CRDsValidation map[string]string = map[string]string{
                             - name
                             type: object
                           type: array
+                        logSerialConsole:
+                          description: Whether to log the auto-attached default serial
+                            console or not. Serial console logs will be collect to
+                            a file and then streamed from a named 'guest-console-log'.
+                            Not relevant if autoattachSerialConsole is disabled. Defaults
+                            to cluster wide setting on VirtualMachineOptions.
+                          type: boolean
                         networkInterfaceMultiqueue:
                           description: If specified, virtual network interfaces configured
                             with a virtio bus will also enable the vhost multiqueue
@@ -14653,6 +15792,10 @@ var CRDsValidation map[string]string = map[string]string{
                             efi:
                               description: If set, EFI will be used instead of BIOS.
                               properties:
+                                persistent:
+                                  description: If set to true, Persistent will persist
+                                    the EFI NVRAM across reboots. Defaults to false
+                                  type: boolean
                                 secureBoot:
                                   description: If set, SecureBoot will be enabled
                                     and the OVMF roms will be swapped for SecureBoot-enabled
@@ -14717,6 +15860,29 @@ var CRDsValidation map[string]string = map[string]string{
                       properties:
                         sev:
                           description: AMD Secure Encrypted Virtualization (SEV).
+                          properties:
+                            attestation:
+                              description: If specified, run the attestation process
+                                for a vmi.
+                              type: object
+                            dhCert:
+                              description: Base64 encoded guest owner's Diffie-Hellman
+                                key.
+                              type: string
+                            policy:
+                              description: 'Guest policy flags as defined in AMD SEV
+                                API specification. Note: due to security reasons it
+                                is not allowed to enable guest debugging. Therefore
+                                NoDebug flag is not exposed to users and is always
+                                true.'
+                              properties:
+                                encryptedState:
+                                  description: SEV-ES is required. Defaults to false.
+                                  type: boolean
+                              type: object
+                            session:
+                              description: Base64 encoded session blob.
+                              type: string
                           type: object
                       type: object
                     machine:
@@ -14750,6 +15916,16 @@ var CRDsValidation map[string]string = map[string]string{
                                 x86_64 architecture valid values are 1Gi and 2Mi.
                               type: string
                           type: object
+                        maxGuest:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          description: MaxGuest allows to specify the maximum amount
+                            of memory which is visible inside the Guest OS. The delta
+                            between MaxGuest and Guest is the amount of memory that
+                            can be hot(un)plugged.
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
                       type: object
                     resources:
                       description: Resources describes the Compute Resources required
@@ -15217,29 +16393,97 @@ var CRDsValidation map[string]string = map[string]string{
                               only "value". The requirements are ANDed.
                             type: object
                         type: object
+                      matchLabelKeys:
+                        description: MatchLabelKeys is a set of pod label keys to
+                          select the pods over which spreading will be calculated.
+                          The keys are used to lookup values from the incoming pod
+                          labels, those key-value labels are ANDed with labelSelector
+                          to select the group of existing pods over which spreading
+                          will be calculated for the incoming pod. Keys that don't
+                          exist in the incoming pod labels will be ignored. A null
+                          or empty list means only match against labelSelector.
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: atomic
                       maxSkew:
                         description: 'MaxSkew describes the degree to which pods may
                           be unevenly distributed. When ''whenUnsatisfiable=DoNotSchedule'',
                           it is the maximum permitted difference between the number
                           of matching pods in the target topology and the global minimum.
-                          For example, in a 3-zone cluster, MaxSkew is set to 1, and
-                          pods with the same labelSelector spread as 1/1/0: | zone1
-                          | zone2 | zone3 | |   P   |   P   |       | - if MaxSkew
-                          is 1, incoming pod can only be scheduled to zone3 to become
-                          1/1/1; scheduling it onto zone1(zone2) would make the ActualSkew(2-0)
-                          on zone1(zone2) violate MaxSkew(1). - if MaxSkew is 2, incoming
-                          pod can be scheduled onto any zone. When ''whenUnsatisfiable=ScheduleAnyway'',
-                          it is used to give higher precedence to topologies that
-                          satisfy it. It''s a required field. Default value is 1 and
-                          0 is not allowed.'
+                          The global minimum is the minimum number of matching pods
+                          in an eligible domain or zero if the number of eligible
+                          domains is less than MinDomains. For example, in a 3-zone
+                          cluster, MaxSkew is set to 1, and pods with the same labelSelector
+                          spread as 2/2/1: In this case, the global minimum is 1.
+                          | zone1 | zone2 | zone3 | |  P P  |  P P  |   P   | - if
+                          MaxSkew is 1, incoming pod can only be scheduled to zone3
+                          to become 2/2/2; scheduling it onto zone1(zone2) would make
+                          the ActualSkew(3-1) on zone1(zone2) violate MaxSkew(1).
+                          - if MaxSkew is 2, incoming pod can be scheduled onto any
+                          zone. When ''whenUnsatisfiable=ScheduleAnyway'', it is used
+                          to give higher precedence to topologies that satisfy it.
+                          It''s a required field. Default value is 1 and 0 is not
+                          allowed.'
                         format: int32
                         type: integer
+                      minDomains:
+                        description: "MinDomains indicates a minimum number of eligible
+                          domains. When the number of eligible domains with matching
+                          topology keys is less than minDomains, Pod Topology Spread
+                          treats \"global minimum\" as 0, and then the calculation
+                          of Skew is performed. And when the number of eligible domains
+                          with matching topology keys equals or greater than minDomains,
+                          this value has no effect on scheduling. As a result, when
+                          the number of eligible domains is less than minDomains,
+                          scheduler won't schedule more than maxSkew Pods to those
+                          domains. If value is nil, the constraint behaves as if MinDomains
+                          is equal to 1. Valid values are integers greater than 0.
+                          When value is not nil, WhenUnsatisfiable must be DoNotSchedule.
+                          \n For example, in a 3-zone cluster, MaxSkew is set to 2,
+                          MinDomains is set to 5 and pods with the same labelSelector
+                          spread as 2/2/2: | zone1 | zone2 | zone3 | |  P P  |  P
+                          P  |  P P  | The number of domains is less than 5(MinDomains),
+                          so \"global minimum\" is treated as 0. In this situation,
+                          new pod with the same labelSelector cannot be scheduled,
+                          because computed skew will be 3(3 - 0) if new Pod is scheduled
+                          to any of the three zones, it will violate MaxSkew. \n This
+                          is a beta field and requires the MinDomainsInPodTopologySpread
+                          feature gate to be enabled (enabled by default)."
+                        format: int32
+                        type: integer
+                      nodeAffinityPolicy:
+                        description: "NodeAffinityPolicy indicates how we will treat
+                          Pod's nodeAffinity/nodeSelector when calculating pod topology
+                          spread skew. Options are: - Honor: only nodes matching nodeAffinity/nodeSelector
+                          are included in the calculations. - Ignore: nodeAffinity/nodeSelector
+                          are ignored. All nodes are included in the calculations.
+                          \n If this value is nil, the behavior is equivalent to the
+                          Honor policy. This is a beta-level feature default enabled
+                          by the NodeInclusionPolicyInPodTopologySpread feature flag."
+                        type: string
+                      nodeTaintsPolicy:
+                        description: "NodeTaintsPolicy indicates how we will treat
+                          node taints when calculating pod topology spread skew. Options
+                          are: - Honor: nodes without taints, along with tainted nodes
+                          for which the incoming pod has a toleration, are included.
+                          - Ignore: node taints are ignored. All nodes are included.
+                          \n If this value is nil, the behavior is equivalent to the
+                          Ignore policy. This is a beta-level feature default enabled
+                          by the NodeInclusionPolicyInPodTopologySpread feature flag."
+                        type: string
                       topologyKey:
                         description: TopologyKey is the key of node labels. Nodes
                           that have a label with this key and identical values are
                           considered to be in the same topology. We consider each
                           <key, value> as a "bucket", and try to put balanced number
-                          of pods into each bucket. It's a required field.
+                          of pods into each bucket. We define a domain as a particular
+                          instance of a topology. Also, we define an eligible domain
+                          as a domain whose nodes meet the requirements of nodeAffinityPolicy
+                          and nodeTaintsPolicy. e.g. If TopologyKey is "kubernetes.io/hostname",
+                          each Node is a domain of that topology. And, if TopologyKey
+                          is "topology.kubernetes.io/zone", each zone is a domain
+                          of that topology. It's a required field.
                         type: string
                       whenUnsatisfiable:
                         description: 'WhenUnsatisfiable indicates how to deal with
@@ -15534,13 +16778,13 @@ var CRDsValidation map[string]string = map[string]string{
                               Directly attached to the vmi via qemu. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                             properties:
                               claimName:
-                                description: 'ClaimName is the name of a PersistentVolumeClaim
+                                description: 'claimName is the name of a PersistentVolumeClaim
                                   in the same namespace as the pod using this volume.
                                   More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                                 type: string
                               readOnly:
-                                description: Will force the ReadOnly setting in VolumeMounts.
-                                  Default false.
+                                description: readOnly Will force the ReadOnly setting
+                                  in VolumeMounts. Default false.
                                 type: boolean
                             required:
                             - claimName
@@ -15578,7 +16822,7 @@ var CRDsValidation map[string]string = map[string]string{
                           is populated with a memory dump of the vmi
                         properties:
                           claimName:
-                            description: 'ClaimName is the name of a PersistentVolumeClaim
+                            description: 'claimName is the name of a PersistentVolumeClaim
                               in the same namespace as the pod using this volume.
                               More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                             type: string
@@ -15587,8 +16831,8 @@ var CRDsValidation map[string]string = map[string]string{
                               can be hotplugged and hotunplugged.
                             type: boolean
                           readOnly:
-                            description: Will force the ReadOnly setting in VolumeMounts.
-                              Default false.
+                            description: readOnly Will force the ReadOnly setting
+                              in VolumeMounts. Default false.
                             type: boolean
                         required:
                         - claimName
@@ -15603,7 +16847,7 @@ var CRDsValidation map[string]string = map[string]string{
                           Directly attached to the vmi via qemu. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                         properties:
                           claimName:
-                            description: 'ClaimName is the name of a PersistentVolumeClaim
+                            description: 'claimName is the name of a PersistentVolumeClaim
                               in the same namespace as the pod using this volume.
                               More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                             type: string
@@ -15612,8 +16856,8 @@ var CRDsValidation map[string]string = map[string]string{
                               can be hotplugged and hotunplugged.
                             type: boolean
                           readOnly:
-                            description: Will force the ReadOnly setting in VolumeMounts.
-                              Default false.
+                            description: readOnly Will force the ReadOnly setting
+                              in VolumeMounts. Default false.
                             type: boolean
                         required:
                         - claimName
@@ -15752,6 +16996,12 @@ var CRDsValidation map[string]string = map[string]string{
     spec:
       description: Required spec describing the instancetype
       properties:
+        annotations:
+          additionalProperties:
+            type: string
+          description: Optionally defines the required Annotations to be used by the
+            instance type and applied to the VirtualMachineInstance
+          type: object
         cpu:
           description: Required CPU related attributes of the instancetype.
           properties:
@@ -15763,7 +17013,7 @@ var CRDsValidation map[string]string = map[string]string{
             guest:
               description: "Required number of vCPUs to expose to the guest. \n The
                 resulting CPU topology being derived from the optional PreferredCPUTopology
-                attribute of CPUPreferences that itself defaults to PreferCores."
+                attribute of CPUPreferences that itself defaults to PreferSockets."
               format: int32
               type: integer
             isolateEmulatorThread:
@@ -15867,6 +17117,26 @@ var CRDsValidation map[string]string = map[string]string{
           properties:
             sev:
               description: AMD Secure Encrypted Virtualization (SEV).
+              properties:
+                attestation:
+                  description: If specified, run the attestation process for a vmi.
+                  type: object
+                dhCert:
+                  description: Base64 encoded guest owner's Diffie-Hellman key.
+                  type: string
+                policy:
+                  description: 'Guest policy flags as defined in AMD SEV API specification.
+                    Note: due to security reasons it is not allowed to enable guest
+                    debugging. Therefore NoDebug flag is not exposed to users and
+                    is always true.'
+                  properties:
+                    encryptedState:
+                      description: SEV-ES is required. Defaults to false.
+                      type: boolean
+                  type: object
+                session:
+                  description: Base64 encoded session blob.
+                  type: string
               type: object
           type: object
         memory:
@@ -15889,9 +17159,31 @@ var CRDsValidation map[string]string = map[string]string{
                     valid values are 1Gi and 2Mi.
                   type: string
               type: object
+            overcommitPercent:
+              description: OvercommitPercent is the percentage of the guest memory
+                which will be overcommitted. This means that the VMIs parent pod (virt-launcher)
+                will request less physical memory by a factor specified by the OvercommitPercent.
+                Overcommits can lead to memory exhaustion, which in turn can lead
+                to crashes. Use carefully. Defaults to 0
+              maximum: 100
+              minimum: 0
+              type: integer
           required:
           - guest
           type: object
+        nodeSelector:
+          additionalProperties:
+            type: string
+          description: "NodeSelector is a selector which must be true for the vmi
+            to fit on a node. Selector which must match a node's labels for the vmi
+            to be scheduled on that node. More info: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/
+            \n NodeSelector is the name of the custom node selector for the instancetype."
+          type: object
+        schedulerName:
+          description: "If specified, the VMI will be dispatched by specified scheduler.
+            If not specified, the VMI will be dispatched by default scheduler. \n
+            SchedulerName is the name of the custom K8s scheduler for the instancetype."
+          type: string
       required:
       - cpu
       - memory
@@ -16046,21 +17338,24 @@ var CRDsValidation map[string]string = map[string]string{
                             description: PVC is the PVC specification
                             properties:
                               accessModes:
-                                description: 'AccessModes contains the desired access
+                                description: 'accessModes contains the desired access
                                   modes the volume should have. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#access-modes-1'
                                 items:
                                   type: string
                                 type: array
                               dataSource:
-                                description: 'This field can be used to specify either:
-                                  * An existing VolumeSnapshot object (snapshot.storage.k8s.io/VolumeSnapshot)
+                                description: 'dataSource field can be used to specify
+                                  either: * An existing VolumeSnapshot object (snapshot.storage.k8s.io/VolumeSnapshot)
                                   * An existing PVC (PersistentVolumeClaim) If the
                                   provisioner or an external controller can support
                                   the specified data source, it will create a new
                                   volume based on the contents of the specified data
-                                  source. If the AnyVolumeDataSource feature gate
-                                  is enabled, this field will always have the same
-                                  contents as the DataSourceRef field.'
+                                  source. When the AnyVolumeDataSource feature gate
+                                  is enabled, dataSource contents will be copied to
+                                  dataSourceRef, and dataSourceRef contents will be
+                                  copied to dataSource when dataSourceRef.namespace
+                                  is not specified. If the namespace is specified,
+                                  then dataSourceRef will not be copied to dataSource.'
                                 properties:
                                   apiGroup:
                                     description: APIGroup is the group for the resource
@@ -16082,27 +17377,34 @@ var CRDsValidation map[string]string = map[string]string{
                                 - name
                                 type: object
                               dataSourceRef:
-                                description: 'Specifies the object from which to populate
-                                  the volume with data, if a non-empty volume is desired.
-                                  This may be any local object from a non-empty API
-                                  group (non core object) or a PersistentVolumeClaim
+                                description: 'dataSourceRef specifies the object from
+                                  which to populate the volume with data, if a non-empty
+                                  volume is desired. This may be any object from a
+                                  non-empty API group (non core object) or a PersistentVolumeClaim
                                   object. When this field is specified, volume binding
                                   will only succeed if the type of the specified object
                                   matches some installed volume populator or dynamic
                                   provisioner. This field will replace the functionality
-                                  of the DataSource field and as such if both fields
+                                  of the dataSource field and as such if both fields
                                   are non-empty, they must have the same value. For
-                                  backwards compatibility, both fields (DataSource
-                                  and DataSourceRef) will be set to the same value
-                                  automatically if one of them is empty and the other
-                                  is non-empty. There are two important differences
-                                  between DataSource and DataSourceRef: * While DataSource
-                                  only allows two specific types of objects, DataSourceRef   allows
+                                  backwards compatibility, when namespace isn''t specified
+                                  in dataSourceRef, both fields (dataSource and dataSourceRef)
+                                  will be set to the same value automatically if one
+                                  of them is empty and the other is non-empty. When
+                                  namespace is specified in dataSourceRef, dataSource
+                                  isn''t set to the same value and must be empty.
+                                  There are three important differences between dataSource
+                                  and dataSourceRef: * While dataSource only allows
+                                  two specific types of objects, dataSourceRef   allows
                                   any non-core object, as well as PersistentVolumeClaim
-                                  objects. * While DataSource ignores disallowed values
-                                  (dropping them), DataSourceRef   preserves all values,
+                                  objects. * While dataSource ignores disallowed values
+                                  (dropping them), dataSourceRef   preserves all values,
                                   and generates an error if a disallowed value is   specified.
-                                  (Alpha) Using this field requires the AnyVolumeDataSource
+                                  * While dataSource only allows local objects, dataSourceRef
+                                  allows objects   in any namespaces. (Beta) Using
+                                  this field requires the AnyVolumeDataSource feature
+                                  gate to be enabled. (Alpha) Using the namespace
+                                  field of dataSourceRef requires the CrossNamespaceVolumeDataSource
                                   feature gate to be enabled.'
                                 properties:
                                   apiGroup:
@@ -16120,18 +17422,53 @@ var CRDsValidation map[string]string = map[string]string{
                                     description: Name is the name of resource being
                                       referenced
                                     type: string
+                                  namespace:
+                                    description: Namespace is the namespace of resource
+                                      being referenced Note that when a namespace
+                                      is specified, a gateway.networking.k8s.io/ReferenceGrant
+                                      object is required in the referent namespace
+                                      to allow that namespace's owner to accept the
+                                      reference. See the ReferenceGrant documentation
+                                      for details. (Alpha) This field requires the
+                                      CrossNamespaceVolumeDataSource feature gate
+                                      to be enabled.
+                                    type: string
                                 required:
                                 - kind
                                 - name
                                 type: object
                               resources:
-                                description: 'Resources represents the minimum resources
+                                description: 'resources represents the minimum resources
                                   the volume should have. If RecoverVolumeExpansionFailure
                                   feature is enabled users are allowed to specify
                                   resource requirements that are lower than previous
                                   value but must still be higher than capacity recorded
                                   in the status field of the claim. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#resources'
                                 properties:
+                                  claims:
+                                    description: "Claims lists the names of resources,
+                                      defined in spec.resourceClaims, that are used
+                                      by this container. \n This is an alpha field
+                                      and requires enabling the DynamicResourceAllocation
+                                      feature gate. \n This field is immutable. It
+                                      can only be set for containers."
+                                    items:
+                                      description: ResourceClaim references one entry
+                                        in PodSpec.ResourceClaims.
+                                      properties:
+                                        name:
+                                          description: Name must match the name of
+                                            one entry in pod.spec.resourceClaims of
+                                            the Pod where this field is used. It makes
+                                            that resource available inside a container.
+                                          type: string
+                                      required:
+                                      - name
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-map-keys:
+                                    - name
+                                    x-kubernetes-list-type: map
                                   limits:
                                     additionalProperties:
                                       anyOf:
@@ -16158,8 +17495,8 @@ var CRDsValidation map[string]string = map[string]string{
                                     type: object
                                 type: object
                               selector:
-                                description: A label query over volumes to consider
-                                  for binding.
+                                description: selector is a label query over volumes
+                                  to consider for binding.
                                 properties:
                                   matchExpressions:
                                     description: matchExpressions is a list of label
@@ -16206,8 +17543,8 @@ var CRDsValidation map[string]string = map[string]string{
                                     type: object
                                 type: object
                               storageClassName:
-                                description: 'Name of the StorageClass required by
-                                  the claim. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#class-1'
+                                description: 'storageClassName is the name of the
+                                  StorageClass required by the claim. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#class-1'
                                 type: string
                               volumeMode:
                                 description: volumeMode defines what type of volume
@@ -16215,7 +17552,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   implied when not included in claim spec.
                                 type: string
                               volumeName:
-                                description: VolumeName is the binding reference to
+                                description: volumeName is the binding reference to
                                   the PersistentVolume backing this claim.
                                 type: string
                             type: object
@@ -16226,6 +17563,20 @@ var CRDsValidation map[string]string = map[string]string{
                               blank:
                                 description: DataVolumeBlankImage provides the parameters
                                   to create a new raw blank image for the PVC
+                                type: object
+                              gcs:
+                                description: DataVolumeSourceGCS provides the parameters
+                                  to create a Data Volume from an GCS source
+                                properties:
+                                  secretRef:
+                                    description: SecretRef provides the secret reference
+                                      needed to access the GCS source
+                                    type: string
+                                  url:
+                                    description: URL is the url of the GCS source
+                                    type: string
+                                required:
+                                - url
                                 type: object
                               http:
                                 description: DataVolumeSourceHTTP can be either an
@@ -16348,6 +17699,21 @@ var CRDsValidation map[string]string = map[string]string{
                                 required:
                                 - url
                                 type: object
+                              snapshot:
+                                description: DataVolumeSourceSnapshot provides the
+                                  parameters to create a Data Volume from an existing
+                                  VolumeSnapshot
+                                properties:
+                                  name:
+                                    description: The name of the source VolumeSnapshot
+                                    type: string
+                                  namespace:
+                                    description: The namespace of the source VolumeSnapshot
+                                    type: string
+                                required:
+                                - name
+                                - namespace
+                                type: object
                               upload:
                                 description: DataVolumeSourceUpload provides the parameters
                                   to create a Data Volume by uploading the source
@@ -16422,7 +17788,10 @@ var CRDsValidation map[string]string = map[string]string{
                                   feature gate must be enabled. If the provisioner
                                   or an external controller can support the specified
                                   data source, it will create a new volume based on
-                                  the contents of the specified data source.'
+                                  the contents of the specified data source. If the
+                                  AnyVolumeDataSource feature gate is enabled, this
+                                  field will always have the same contents as the
+                                  DataSourceRef field.'
                                 properties:
                                   apiGroup:
                                     description: APIGroup is the group for the resource
@@ -16443,10 +17812,88 @@ var CRDsValidation map[string]string = map[string]string{
                                 - kind
                                 - name
                                 type: object
+                              dataSourceRef:
+                                description: 'Specifies the object from which to populate
+                                  the volume with data, if a non-empty volume is desired.
+                                  This may be any local object from a non-empty API
+                                  group (non core object) or a PersistentVolumeClaim
+                                  object. When this field is specified, volume binding
+                                  will only succeed if the type of the specified object
+                                  matches some installed volume populator or dynamic
+                                  provisioner. This field will replace the functionality
+                                  of the DataSource field and as such if both fields
+                                  are non-empty, they must have the same value. For
+                                  backwards compatibility, both fields (DataSource
+                                  and DataSourceRef) will be set to the same value
+                                  automatically if one of them is empty and the other
+                                  is non-empty. There are two important differences
+                                  between DataSource and DataSourceRef: * While DataSource
+                                  only allows two specific types of objects, DataSourceRef
+                                  allows any non-core object, as well as PersistentVolumeClaim
+                                  objects. * While DataSource ignores disallowed values
+                                  (dropping them), DataSourceRef preserves all values,
+                                  and generates an error if a disallowed value is
+                                  specified. (Beta) Using this field requires the
+                                  AnyVolumeDataSource feature gate to be enabled.'
+                                properties:
+                                  apiGroup:
+                                    description: APIGroup is the group for the resource
+                                      being referenced. If APIGroup is not specified,
+                                      the specified Kind must be in the core API group.
+                                      For any other third-party types, APIGroup is
+                                      required.
+                                    type: string
+                                  kind:
+                                    description: Kind is the type of resource being
+                                      referenced
+                                    type: string
+                                  name:
+                                    description: Name is the name of resource being
+                                      referenced
+                                    type: string
+                                  namespace:
+                                    description: Namespace is the namespace of resource
+                                      being referenced Note that when a namespace
+                                      is specified, a gateway.networking.k8s.io/ReferenceGrant
+                                      object is required in the referent namespace
+                                      to allow that namespace's owner to accept the
+                                      reference. See the ReferenceGrant documentation
+                                      for details. (Alpha) This field requires the
+                                      CrossNamespaceVolumeDataSource feature gate
+                                      to be enabled.
+                                    type: string
+                                required:
+                                - kind
+                                - name
+                                type: object
                               resources:
                                 description: 'Resources represents the minimum resources
                                   the volume should have. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#resources'
                                 properties:
+                                  claims:
+                                    description: "Claims lists the names of resources,
+                                      defined in spec.resourceClaims, that are used
+                                      by this container. \n This is an alpha field
+                                      and requires enabling the DynamicResourceAllocation
+                                      feature gate. \n This field is immutable. It
+                                      can only be set for containers."
+                                    items:
+                                      description: ResourceClaim references one entry
+                                        in PodSpec.ResourceClaims.
+                                      properties:
+                                        name:
+                                          description: Name must match the name of
+                                            one entry in pod.spec.resourceClaims of
+                                            the Pod where this field is used. It makes
+                                            that resource available inside a container.
+                                          type: string
+                                      required:
+                                      - name
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-map-keys:
+                                    - name
+                                    x-kubernetes-list-type: map
                                   limits:
                                     additionalProperties:
                                       anyOf:
@@ -16554,6 +18001,13 @@ var CRDsValidation map[string]string = map[string]string{
                         used through known annotations on the underlying resource.
                         Once applied to the InstancetypeMatcher this field is removed.
                       type: string
+                    inferFromVolumeFailurePolicy:
+                      description: 'InferFromVolumeFailurePolicy controls what should
+                        happen on failure when inferring the instancetype. Allowed
+                        values are: "RejectInferFromVolumeFailure" and "IgnoreInferFromVolumeFailure".
+                        If not specified, "RejectInferFromVolumeFailure" is used by
+                        default.'
+                      type: string
                     kind:
                       description: 'Kind specifies which instancetype resource is
                         referenced. Allowed values are: "VirtualMachineInstancetype"
@@ -16571,6 +18025,40 @@ var CRDsValidation map[string]string = map[string]string{
                         instancetype is applied to the VirtualMachineInstance.
                       type: string
                   type: object
+                liveUpdateFeatures:
+                  description: LiveUpdateFeatures references a configuration of hotpluggable
+                    resources
+                  properties:
+                    affinity:
+                      description: Affinity allows live updating the virtual machines
+                        node affinity
+                      type: object
+                    cpu:
+                      description: LiveUpdateCPU holds hotplug configuration for the
+                        CPU resource. Empty struct indicates that default will be
+                        used for maxSockets. Default is specified on cluster level.
+                        Absence of the struct means opt-out from CPU hotplug functionality.
+                      properties:
+                        maxSockets:
+                          description: The maximum amount of sockets that can be hot-plugged
+                            to the Virtual Machine
+                          format: int32
+                          type: integer
+                      type: object
+                    memory:
+                      description: MemoryLiveUpdateConfiguration defines the live
+                        update memory features for the VirtualMachine
+                      properties:
+                        maxGuest:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          description: MaxGuest defines the maximum amount memory
+                            that can be allocated for the VM.
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                      type: object
+                  type: object
                 preference:
                   description: PreferenceMatcher references a set of preference that
                     is used to fill fields in Template
@@ -16580,6 +18068,13 @@ var CRDsValidation map[string]string = map[string]string{
                         should be used to infer or discover the preference to be used
                         through known annotations on the underlying resource. Once
                         applied to the PreferenceMatcher this field is removed.
+                      type: string
+                    inferFromVolumeFailurePolicy:
+                      description: 'InferFromVolumeFailurePolicy controls what should
+                        happen on failure when preference the instancetype. Allowed
+                        values are: "RejectInferFromVolumeFailure" and "IgnoreInferFromVolumeFailure".
+                        If not specified, "RejectInferFromVolumeFailure" is used by
+                        default.'
                       type: string
                     kind:
                       description: 'Kind specifies which preference resource is referenced.
@@ -16639,6 +18134,12 @@ var CRDsValidation map[string]string = map[string]string{
                                           that the ssh public keys are injected into
                                           the VM using metadata using the configDrive
                                           cloud-init provider
+                                        type: object
+                                      noCloud:
+                                        description: NoCloudPropagation means that
+                                          the ssh public keys are injected into the
+                                          VM using metadata using the noCloud cloud-init
+                                          provider
                                         type: object
                                       qemuGuestAgent:
                                         description: QemuGuestAgentAccessCredentailPropagation
@@ -17042,9 +18543,6 @@ var CRDsValidation map[string]string = map[string]string{
                                               field. null selector and null or empty
                                               namespaces list means "this pod's namespace".
                                               An empty selector ({}) matches all namespaces.
-                                              This field is beta-level and is only
-                                              honored when PodAffinityNamespaceSelector
-                                              feature is enabled.
                                             properties:
                                               matchExpressions:
                                                 description: matchExpressions is a
@@ -17107,7 +18605,7 @@ var CRDsValidation map[string]string = map[string]string{
                                               field and the ones selected by namespaceSelector.
                                               null or empty namespaces list and null
                                               namespaceSelector means "this pod's
-                                              namespace"
+                                              namespace".
                                             items:
                                               type: string
                                             type: array
@@ -17217,9 +18715,7 @@ var CRDsValidation map[string]string = map[string]string{
                                           in the namespaces field. null selector and
                                           null or empty namespaces list means "this
                                           pod's namespace". An empty selector ({})
-                                          matches all namespaces. This field is beta-level
-                                          and is only honored when PodAffinityNamespaceSelector
-                                          feature is enabled.
+                                          matches all namespaces.
                                         properties:
                                           matchExpressions:
                                             description: matchExpressions is a list
@@ -17276,7 +18772,7 @@ var CRDsValidation map[string]string = map[string]string{
                                           the namespaces listed in this field and
                                           the ones selected by namespaceSelector.
                                           null or empty namespaces list and null namespaceSelector
-                                          means "this pod's namespace"
+                                          means "this pod's namespace".
                                         items:
                                           type: string
                                         type: array
@@ -17390,9 +18886,6 @@ var CRDsValidation map[string]string = map[string]string{
                                               field. null selector and null or empty
                                               namespaces list means "this pod's namespace".
                                               An empty selector ({}) matches all namespaces.
-                                              This field is beta-level and is only
-                                              honored when PodAffinityNamespaceSelector
-                                              feature is enabled.
                                             properties:
                                               matchExpressions:
                                                 description: matchExpressions is a
@@ -17455,7 +18948,7 @@ var CRDsValidation map[string]string = map[string]string{
                                               field and the ones selected by namespaceSelector.
                                               null or empty namespaces list and null
                                               namespaceSelector means "this pod's
-                                              namespace"
+                                              namespace".
                                             items:
                                               type: string
                                             type: array
@@ -17566,9 +19059,7 @@ var CRDsValidation map[string]string = map[string]string{
                                           in the namespaces field. null selector and
                                           null or empty namespaces list means "this
                                           pod's namespace". An empty selector ({})
-                                          matches all namespaces. This field is beta-level
-                                          and is only honored when PodAffinityNamespaceSelector
-                                          feature is enabled.
+                                          matches all namespaces.
                                         properties:
                                           matchExpressions:
                                             description: matchExpressions is a list
@@ -17625,7 +19116,7 @@ var CRDsValidation map[string]string = map[string]string{
                                           the namespaces listed in this field and
                                           the ones selected by namespaceSelector.
                                           null or empty namespaces list and null namespaceSelector
-                                          means "this pod's namespace"
+                                          means "this pod's namespace".
                                         items:
                                           type: string
                                         type: array
@@ -17646,6 +19137,11 @@ var CRDsValidation map[string]string = map[string]string{
                                   type: array
                               type: object
                           type: object
+                        architecture:
+                          description: Specifies the architecture of the vm guest
+                            you are attempting to run. Defaults to the compiled architecture
+                            of the KubeVirt components
+                          type: string
                         dnsConfig:
                           description: Specifies the DNS parameters of a pod. Parameters
                             specified here will be merged to the generated DNS configuration
@@ -17864,6 +19360,11 @@ var CRDsValidation map[string]string = map[string]string{
                                     more dedicated pCPU to be allocated for the VMI
                                     to place the emulator thread on it.
                                   type: boolean
+                                maxSockets:
+                                  description: MaxSockets specifies the maximum amount
+                                    of sockets that can be hotplugged
+                                  format: int32
+                                  type: integer
                                 model:
                                   description: Model specifies the CPU model inside
                                     the VMI. List of available models https://github.com/libvirt/libvirt/tree/master/src/cpu_map.
@@ -17933,7 +19434,7 @@ var CRDsValidation map[string]string = map[string]string{
                                     Defaults to true.
                                   type: boolean
                                 autoattachSerialConsole:
-                                  description: Whether to attach the default serial
+                                  description: Whether to attach the default virtio-serial
                                     console or not. Serial console access will not
                                     be available if set to false. Defaults to true.
                                   type: boolean
@@ -18046,6 +19547,10 @@ var CRDsValidation map[string]string = map[string]string{
                                             description: ReadOnly. Defaults to false.
                                             type: boolean
                                         type: object
+                                      errorPolicy:
+                                        description: If specified, it can change the
+                                          default error policy (stop) for the disk
+                                        type: string
                                       io:
                                         description: 'IO specifies which QEMU disk
                                           IO mode should be used. Supported values
@@ -18090,6 +19595,10 @@ var CRDsValidation map[string]string = map[string]string{
                                     - name
                                     type: object
                                   type: array
+                                downwardMetrics:
+                                  description: DownwardMetrics creates a virtio serials
+                                    for exposing the downward metrics to the vmi.
+                                  type: object
                                 filesystems:
                                   description: Filesystems describes filesystem which
                                     is connected to the vmi.
@@ -18209,6 +19718,20 @@ var CRDsValidation map[string]string = map[string]string{
                                           value is required to be unique across all
                                           devices and be between 1 and (16*1024-1).
                                         type: integer
+                                      binding:
+                                        description: 'Binding specifies the binding
+                                          plugin that will be used to connect the
+                                          interface to the guest. It provides an alternative
+                                          to InterfaceBindingMethod. version: 1alphav1'
+                                        properties:
+                                          name:
+                                            description: 'Name references to the binding
+                                              name as denined in the kubevirt CR.
+                                              version: 1alphav1'
+                                            type: string
+                                        required:
+                                        - name
+                                        type: object
                                       bootOrder:
                                         description: BootOrder is an integer value
                                           > 0, used to determine ordering of boot
@@ -18339,6 +19862,12 @@ var CRDsValidation map[string]string = map[string]string{
                                           given network by passing-through an SR-IOV
                                           PCI device via vfio.
                                         type: object
+                                      state:
+                                        description: State represents the requested
+                                          operational state of the interface. The
+                                          (only) value supported is 'absent', expressing
+                                          a request to remove the interface.
+                                        type: string
                                       tag:
                                         description: If specified, the virtual network
                                           interface address and its tag will be provided
@@ -18348,6 +19877,14 @@ var CRDsValidation map[string]string = map[string]string{
                                     - name
                                     type: object
                                   type: array
+                                logSerialConsole:
+                                  description: Whether to log the auto-attached default
+                                    serial console or not. Serial console logs will
+                                    be collect to a file and then streamed from a
+                                    named 'guest-console-log'. Not relevant if autoattachSerialConsole
+                                    is disabled. Defaults to cluster wide setting
+                                    on VirtualMachineOptions.
+                                  type: boolean
                                 networkInterfaceMultiqueue:
                                   description: If specified, virtual network interfaces
                                     configured with a virtio bus will also enable
@@ -18663,6 +20200,11 @@ var CRDsValidation map[string]string = map[string]string{
                                       description: If set, EFI will be used instead
                                         of BIOS.
                                       properties:
+                                        persistent:
+                                          description: If set to true, Persistent
+                                            will persist the EFI NVRAM across reboots.
+                                            Defaults to false
+                                          type: boolean
                                         secureBoot:
                                           description: If set, SecureBoot will be
                                             enabled and the OVMF roms will be swapped
@@ -18730,6 +20272,30 @@ var CRDsValidation map[string]string = map[string]string{
                                 sev:
                                   description: AMD Secure Encrypted Virtualization
                                     (SEV).
+                                  properties:
+                                    attestation:
+                                      description: If specified, run the attestation
+                                        process for a vmi.
+                                      type: object
+                                    dhCert:
+                                      description: Base64 encoded guest owner's Diffie-Hellman
+                                        key.
+                                      type: string
+                                    policy:
+                                      description: 'Guest policy flags as defined
+                                        in AMD SEV API specification. Note: due to
+                                        security reasons it is not allowed to enable
+                                        guest debugging. Therefore NoDebug flag is
+                                        not exposed to users and is always true.'
+                                      properties:
+                                        encryptedState:
+                                          description: SEV-ES is required. Defaults
+                                            to false.
+                                          type: boolean
+                                      type: object
+                                    session:
+                                      description: Base64 encoded session blob.
+                                      type: string
                                   type: object
                               type: object
                             machine:
@@ -18766,6 +20332,16 @@ var CRDsValidation map[string]string = map[string]string{
                                         are 1Gi and 2Mi.
                                       type: string
                                   type: object
+                                maxGuest:
+                                  anyOf:
+                                  - type: integer
+                                  - type: string
+                                  description: MaxGuest allows to specify the maximum
+                                    amount of memory which is visible inside the Guest
+                                    OS. The delta between MaxGuest and Guest is the
+                                    amount of memory that can be hot(un)plugged.
+                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                  x-kubernetes-int-or-string: true
                               type: object
                             resources:
                               description: Resources describes the Compute Resources
@@ -19256,17 +20832,35 @@ var CRDsValidation map[string]string = map[string]string{
                                       The requirements are ANDed.
                                     type: object
                                 type: object
+                              matchLabelKeys:
+                                description: MatchLabelKeys is a set of pod label
+                                  keys to select the pods over which spreading will
+                                  be calculated. The keys are used to lookup values
+                                  from the incoming pod labels, those key-value labels
+                                  are ANDed with labelSelector to select the group
+                                  of existing pods over which spreading will be calculated
+                                  for the incoming pod. Keys that don't exist in the
+                                  incoming pod labels will be ignored. A null or empty
+                                  list means only match against labelSelector.
+                                items:
+                                  type: string
+                                type: array
+                                x-kubernetes-list-type: atomic
                               maxSkew:
                                 description: 'MaxSkew describes the degree to which
                                   pods may be unevenly distributed. When ''whenUnsatisfiable=DoNotSchedule'',
                                   it is the maximum permitted difference between the
                                   number of matching pods in the target topology and
-                                  the global minimum. For example, in a 3-zone cluster,
-                                  MaxSkew is set to 1, and pods with the same labelSelector
-                                  spread as 1/1/0: | zone1 | zone2 | zone3 | |   P   |   P   |       |
+                                  the global minimum. The global minimum is the minimum
+                                  number of matching pods in an eligible domain or
+                                  zero if the number of eligible domains is less than
+                                  MinDomains. For example, in a 3-zone cluster, MaxSkew
+                                  is set to 1, and pods with the same labelSelector
+                                  spread as 2/2/1: In this case, the global minimum
+                                  is 1. | zone1 | zone2 | zone3 | |  P P  |  P P  |   P   |
                                   - if MaxSkew is 1, incoming pod can only be scheduled
-                                  to zone3 to become 1/1/1; scheduling it onto zone1(zone2)
-                                  would make the ActualSkew(2-0) on zone1(zone2) violate
+                                  to zone3 to become 2/2/2; scheduling it onto zone1(zone2)
+                                  would make the ActualSkew(3-1) on zone1(zone2) violate
                                   MaxSkew(1). - if MaxSkew is 2, incoming pod can
                                   be scheduled onto any zone. When ''whenUnsatisfiable=ScheduleAnyway'',
                                   it is used to give higher precedence to topologies
@@ -19274,13 +20868,73 @@ var CRDsValidation map[string]string = map[string]string{
                                   value is 1 and 0 is not allowed.'
                                 format: int32
                                 type: integer
+                              minDomains:
+                                description: "MinDomains indicates a minimum number
+                                  of eligible domains. When the number of eligible
+                                  domains with matching topology keys is less than
+                                  minDomains, Pod Topology Spread treats \"global
+                                  minimum\" as 0, and then the calculation of Skew
+                                  is performed. And when the number of eligible domains
+                                  with matching topology keys equals or greater than
+                                  minDomains, this value has no effect on scheduling.
+                                  As a result, when the number of eligible domains
+                                  is less than minDomains, scheduler won't schedule
+                                  more than maxSkew Pods to those domains. If value
+                                  is nil, the constraint behaves as if MinDomains
+                                  is equal to 1. Valid values are integers greater
+                                  than 0. When value is not nil, WhenUnsatisfiable
+                                  must be DoNotSchedule. \n For example, in a 3-zone
+                                  cluster, MaxSkew is set to 2, MinDomains is set
+                                  to 5 and pods with the same labelSelector spread
+                                  as 2/2/2: | zone1 | zone2 | zone3 | |  P P  |  P
+                                  P  |  P P  | The number of domains is less than
+                                  5(MinDomains), so \"global minimum\" is treated
+                                  as 0. In this situation, new pod with the same labelSelector
+                                  cannot be scheduled, because computed skew will
+                                  be 3(3 - 0) if new Pod is scheduled to any of the
+                                  three zones, it will violate MaxSkew. \n This is
+                                  a beta field and requires the MinDomainsInPodTopologySpread
+                                  feature gate to be enabled (enabled by default)."
+                                format: int32
+                                type: integer
+                              nodeAffinityPolicy:
+                                description: "NodeAffinityPolicy indicates how we
+                                  will treat Pod's nodeAffinity/nodeSelector when
+                                  calculating pod topology spread skew. Options are:
+                                  - Honor: only nodes matching nodeAffinity/nodeSelector
+                                  are included in the calculations. - Ignore: nodeAffinity/nodeSelector
+                                  are ignored. All nodes are included in the calculations.
+                                  \n If this value is nil, the behavior is equivalent
+                                  to the Honor policy. This is a beta-level feature
+                                  default enabled by the NodeInclusionPolicyInPodTopologySpread
+                                  feature flag."
+                                type: string
+                              nodeTaintsPolicy:
+                                description: "NodeTaintsPolicy indicates how we will
+                                  treat node taints when calculating pod topology
+                                  spread skew. Options are: - Honor: nodes without
+                                  taints, along with tainted nodes for which the incoming
+                                  pod has a toleration, are included. - Ignore: node
+                                  taints are ignored. All nodes are included. \n If
+                                  this value is nil, the behavior is equivalent to
+                                  the Ignore policy. This is a beta-level feature
+                                  default enabled by the NodeInclusionPolicyInPodTopologySpread
+                                  feature flag."
+                                type: string
                               topologyKey:
                                 description: TopologyKey is the key of node labels.
                                   Nodes that have a label with this key and identical
                                   values are considered to be in the same topology.
                                   We consider each <key, value> as a "bucket", and
                                   try to put balanced number of pods into each bucket.
-                                  It's a required field.
+                                  We define a domain as a particular instance of a
+                                  topology. Also, we define an eligible domain as
+                                  a domain whose nodes meet the requirements of nodeAffinityPolicy
+                                  and nodeTaintsPolicy. e.g. If TopologyKey is "kubernetes.io/hostname",
+                                  each Node is a domain of that topology. And, if
+                                  TopologyKey is "topology.kubernetes.io/zone", each
+                                  zone is a domain of that topology. It's a required
+                                  field.
                                 type: string
                               whenUnsatisfiable:
                                 description: 'WhenUnsatisfiable indicates how to deal
@@ -19600,13 +21254,13 @@ var CRDsValidation map[string]string = map[string]string{
                                       the vmi via qemu. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                                     properties:
                                       claimName:
-                                        description: 'ClaimName is the name of a PersistentVolumeClaim
+                                        description: 'claimName is the name of a PersistentVolumeClaim
                                           in the same namespace as the pod using this
                                           volume. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                                         type: string
                                       readOnly:
-                                        description: Will force the ReadOnly setting
-                                          in VolumeMounts. Default false.
+                                        description: readOnly Will force the ReadOnly
+                                          setting in VolumeMounts. Default false.
                                         type: boolean
                                     required:
                                     - claimName
@@ -19645,7 +21299,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   and is populated with a memory dump of the vmi
                                 properties:
                                   claimName:
-                                    description: 'ClaimName is the name of a PersistentVolumeClaim
+                                    description: 'claimName is the name of a PersistentVolumeClaim
                                       in the same namespace as the pod using this
                                       volume. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                                     type: string
@@ -19654,8 +21308,8 @@ var CRDsValidation map[string]string = map[string]string{
                                       volume can be hotplugged and hotunplugged.
                                     type: boolean
                                   readOnly:
-                                    description: Will force the ReadOnly setting in
-                                      VolumeMounts. Default false.
+                                    description: readOnly Will force the ReadOnly
+                                      setting in VolumeMounts. Default false.
                                     type: boolean
                                 required:
                                 - claimName
@@ -19671,7 +21325,7 @@ var CRDsValidation map[string]string = map[string]string{
                                   More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                                 properties:
                                   claimName:
-                                    description: 'ClaimName is the name of a PersistentVolumeClaim
+                                    description: 'claimName is the name of a PersistentVolumeClaim
                                       in the same namespace as the pod using this
                                       volume. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                                     type: string
@@ -19680,8 +21334,8 @@ var CRDsValidation map[string]string = map[string]string{
                                       volume can be hotplugged and hotunplugged.
                                     type: boolean
                                   readOnly:
-                                    description: Will force the ReadOnly setting in
-                                      VolumeMounts. Default false.
+                                    description: readOnly Will force the ReadOnly
+                                      setting in VolumeMounts. Default false.
                                     type: boolean
                                 required:
                                 - claimName
@@ -19822,6 +21476,12 @@ var CRDsValidation map[string]string = map[string]string{
     spec:
       description: Required spec describing the preferences
       properties:
+        annotations:
+          additionalProperties:
+            type: string
+          description: Optionally defines preferred Annotations to be applied to the
+            VirtualMachineInstance
+          type: object
         clock:
           description: Clock optionally defines preferences associated with the Clock
             attribute of a VirtualMachineInstance DomainSpec
@@ -19918,6 +21578,31 @@ var CRDsValidation map[string]string = map[string]string{
           description: CPU optionally defines preferences associated with the CPU
             attribute of a VirtualMachineInstance DomainSpec
           properties:
+            preferredCPUFeatures:
+              description: PreferredCPUFeatures optionally defines a slice of preferred
+                CPU features.
+              items:
+                description: CPUFeature allows specifying a CPU feature.
+                properties:
+                  name:
+                    description: Name of the CPU feature
+                    type: string
+                  policy:
+                    description: 'Policy is the CPU feature attribute which can have
+                      the following attributes: force    - The virtual CPU will claim
+                      the feature is supported regardless of it being supported by
+                      host CPU. require  - Guest creation will fail unless the feature
+                      is supported by the host CPU or the hypervisor is able to emulate
+                      it. optional - The feature will be supported by virtual CPU
+                      if and only if it is supported by host CPU. disable  - The feature
+                      will not be supported by virtual CPU. forbid   - Guest creation
+                      will fail if the feature is supported by host CPU. Defaults
+                      to require'
+                    type: string
+                required:
+                - name
+                type: object
+              type: array
             preferredCPUTopology:
               description: PreferredCPUTopology optionally defines the preferred guest
                 visible CPU topology, defaults to PreferSockets.
@@ -20008,6 +21693,10 @@ var CRDsValidation map[string]string = map[string]string{
               description: PreferredInputType optionally defines the preferred type
                 for Input devices.
               type: string
+            preferredInterfaceMasquerade:
+              description: PreferredInterfaceMasquerade optionally defines the preferred
+                masquerade configuration to use with each network interface.
+              type: object
             preferredInterfaceModel:
               description: PreferredInterfaceModel optionally defines the preferred
                 model to be used by Interface devices.
@@ -20288,6 +21977,47 @@ var CRDsValidation map[string]string = map[string]string{
               description: PreferredMachineType optionally defines the preferred machine
                 type to use.
               type: string
+          type: object
+        preferSpreadSocketToCoreRatio:
+          description: PreferSpreadSocketToCoreRatio defines the ratio to spread vCPUs
+            between cores and sockets, it defaults to 2.
+          format: int32
+          type: integer
+        preferredSubdomain:
+          description: Subdomain of the VirtualMachineInstance
+          type: string
+        preferredTerminationGracePeriodSeconds:
+          description: Grace period observed after signalling a VirtualMachineInstance
+            to stop after which the VirtualMachineInstance is force terminated.
+          format: int64
+          type: integer
+        requirements:
+          description: Requirements defines the minium amount of instance type defined
+            resources required by a set of preferences
+          properties:
+            cpu:
+              description: Required CPU related attributes of the instancetype.
+              properties:
+                guest:
+                  description: Minimal number of vCPUs required by the preference.
+                  format: int32
+                  type: integer
+              required:
+              - guest
+              type: object
+            memory:
+              description: Required Memory related attributes of the instancetype.
+              properties:
+                guest:
+                  anyOf:
+                  - type: integer
+                  - type: string
+                  description: Minimal amount of memory required by the preference.
+                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                  x-kubernetes-int-or-string: true
+              required:
+              - guest
+              type: object
           type: object
         volumes:
           description: Volumes optionally defines preferences associated with the
@@ -20650,23 +22380,26 @@ var CRDsValidation map[string]string = map[string]string{
                                 description: PVC is the PVC specification
                                 properties:
                                   accessModes:
-                                    description: 'AccessModes contains the desired
+                                    description: 'accessModes contains the desired
                                       access modes the volume should have. More info:
                                       https://kubernetes.io/docs/concepts/storage/persistent-volumes#access-modes-1'
                                     items:
                                       type: string
                                     type: array
                                   dataSource:
-                                    description: 'This field can be used to specify
-                                      either: * An existing VolumeSnapshot object
-                                      (snapshot.storage.k8s.io/VolumeSnapshot) * An
-                                      existing PVC (PersistentVolumeClaim) If the
-                                      provisioner or an external controller can support
-                                      the specified data source, it will create a
-                                      new volume based on the contents of the specified
-                                      data source. If the AnyVolumeDataSource feature
-                                      gate is enabled, this field will always have
-                                      the same contents as the DataSourceRef field.'
+                                    description: 'dataSource field can be used to
+                                      specify either: * An existing VolumeSnapshot
+                                      object (snapshot.storage.k8s.io/VolumeSnapshot)
+                                      * An existing PVC (PersistentVolumeClaim) If
+                                      the provisioner or an external controller can
+                                      support the specified data source, it will create
+                                      a new volume based on the contents of the specified
+                                      data source. When the AnyVolumeDataSource feature
+                                      gate is enabled, dataSource contents will be
+                                      copied to dataSourceRef, and dataSourceRef contents
+                                      will be copied to dataSource when dataSourceRef.namespace
+                                      is not specified. If the namespace is specified,
+                                      then dataSourceRef will not be copied to dataSource.'
                                     properties:
                                       apiGroup:
                                         description: APIGroup is the group for the
@@ -20688,31 +22421,38 @@ var CRDsValidation map[string]string = map[string]string{
                                     - name
                                     type: object
                                   dataSourceRef:
-                                    description: 'Specifies the object from which
-                                      to populate the volume with data, if a non-empty
-                                      volume is desired. This may be any local object
-                                      from a non-empty API group (non core object)
-                                      or a PersistentVolumeClaim object. When this
-                                      field is specified, volume binding will only
-                                      succeed if the type of the specified object
+                                    description: 'dataSourceRef specifies the object
+                                      from which to populate the volume with data,
+                                      if a non-empty volume is desired. This may be
+                                      any object from a non-empty API group (non core
+                                      object) or a PersistentVolumeClaim object. When
+                                      this field is specified, volume binding will
+                                      only succeed if the type of the specified object
                                       matches some installed volume populator or dynamic
                                       provisioner. This field will replace the functionality
-                                      of the DataSource field and as such if both
+                                      of the dataSource field and as such if both
                                       fields are non-empty, they must have the same
-                                      value. For backwards compatibility, both fields
-                                      (DataSource and DataSourceRef) will be set to
+                                      value. For backwards compatibility, when namespace
+                                      isn''t specified in dataSourceRef, both fields
+                                      (dataSource and dataSourceRef) will be set to
                                       the same value automatically if one of them
-                                      is empty and the other is non-empty. There are
-                                      two important differences between DataSource
-                                      and DataSourceRef: * While DataSource only allows
-                                      two specific types of objects, DataSourceRef   allows
+                                      is empty and the other is non-empty. When namespace
+                                      is specified in dataSourceRef, dataSource isn''t
+                                      set to the same value and must be empty. There
+                                      are three important differences between dataSource
+                                      and dataSourceRef: * While dataSource only allows
+                                      two specific types of objects, dataSourceRef   allows
                                       any non-core object, as well as PersistentVolumeClaim
-                                      objects. * While DataSource ignores disallowed
-                                      values (dropping them), DataSourceRef   preserves
+                                      objects. * While dataSource ignores disallowed
+                                      values (dropping them), dataSourceRef   preserves
                                       all values, and generates an error if a disallowed
-                                      value is   specified. (Alpha) Using this field
-                                      requires the AnyVolumeDataSource feature gate
-                                      to be enabled.'
+                                      value is   specified. * While dataSource only
+                                      allows local objects, dataSourceRef allows objects   in
+                                      any namespaces. (Beta) Using this field requires
+                                      the AnyVolumeDataSource feature gate to be enabled.
+                                      (Alpha) Using the namespace field of dataSourceRef
+                                      requires the CrossNamespaceVolumeDataSource
+                                      feature gate to be enabled.'
                                     properties:
                                       apiGroup:
                                         description: APIGroup is the group for the
@@ -20729,12 +22469,23 @@ var CRDsValidation map[string]string = map[string]string{
                                         description: Name is the name of resource
                                           being referenced
                                         type: string
+                                      namespace:
+                                        description: Namespace is the namespace of
+                                          resource being referenced Note that when
+                                          a namespace is specified, a gateway.networking.k8s.io/ReferenceGrant
+                                          object is required in the referent namespace
+                                          to allow that namespace's owner to accept
+                                          the reference. See the ReferenceGrant documentation
+                                          for details. (Alpha) This field requires
+                                          the CrossNamespaceVolumeDataSource feature
+                                          gate to be enabled.
+                                        type: string
                                     required:
                                     - kind
                                     - name
                                     type: object
                                   resources:
-                                    description: 'Resources represents the minimum
+                                    description: 'resources represents the minimum
                                       resources the volume should have. If RecoverVolumeExpansionFailure
                                       feature is enabled users are allowed to specify
                                       resource requirements that are lower than previous
@@ -20742,6 +22493,31 @@ var CRDsValidation map[string]string = map[string]string{
                                       recorded in the status field of the claim. More
                                       info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#resources'
                                     properties:
+                                      claims:
+                                        description: "Claims lists the names of resources,
+                                          defined in spec.resourceClaims, that are
+                                          used by this container. \n This is an alpha
+                                          field and requires enabling the DynamicResourceAllocation
+                                          feature gate. \n This field is immutable.
+                                          It can only be set for containers."
+                                        items:
+                                          description: ResourceClaim references one
+                                            entry in PodSpec.ResourceClaims.
+                                          properties:
+                                            name:
+                                              description: Name must match the name
+                                                of one entry in pod.spec.resourceClaims
+                                                of the Pod where this field is used.
+                                                It makes that resource available inside
+                                                a container.
+                                              type: string
+                                          required:
+                                          - name
+                                          type: object
+                                        type: array
+                                        x-kubernetes-list-map-keys:
+                                        - name
+                                        x-kubernetes-list-type: map
                                       limits:
                                         additionalProperties:
                                           anyOf:
@@ -20769,8 +22545,8 @@ var CRDsValidation map[string]string = map[string]string{
                                         type: object
                                     type: object
                                   selector:
-                                    description: A label query over volumes to consider
-                                      for binding.
+                                    description: selector is a label query over volumes
+                                      to consider for binding.
                                     properties:
                                       matchExpressions:
                                         description: matchExpressions is a list of
@@ -20820,8 +22596,9 @@ var CRDsValidation map[string]string = map[string]string{
                                         type: object
                                     type: object
                                   storageClassName:
-                                    description: 'Name of the StorageClass required
-                                      by the claim. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#class-1'
+                                    description: 'storageClassName is the name of
+                                      the StorageClass required by the claim. More
+                                      info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#class-1'
                                     type: string
                                   volumeMode:
                                     description: volumeMode defines what type of volume
@@ -20829,7 +22606,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       is implied when not included in claim spec.
                                     type: string
                                   volumeName:
-                                    description: VolumeName is the binding reference
+                                    description: volumeName is the binding reference
                                       to the PersistentVolume backing this claim.
                                     type: string
                                 type: object
@@ -20841,6 +22618,21 @@ var CRDsValidation map[string]string = map[string]string{
                                     description: DataVolumeBlankImage provides the
                                       parameters to create a new raw blank image for
                                       the PVC
+                                    type: object
+                                  gcs:
+                                    description: DataVolumeSourceGCS provides the
+                                      parameters to create a Data Volume from an GCS
+                                      source
+                                    properties:
+                                      secretRef:
+                                        description: SecretRef provides the secret
+                                          reference needed to access the GCS source
+                                        type: string
+                                      url:
+                                        description: URL is the url of the GCS source
+                                        type: string
+                                    required:
+                                    - url
                                     type: object
                                   http:
                                     description: DataVolumeSourceHTTP can be either
@@ -20968,6 +22760,21 @@ var CRDsValidation map[string]string = map[string]string{
                                     required:
                                     - url
                                     type: object
+                                  snapshot:
+                                    description: DataVolumeSourceSnapshot provides
+                                      the parameters to create a Data Volume from
+                                      an existing VolumeSnapshot
+                                    properties:
+                                      name:
+                                        description: The name of the source VolumeSnapshot
+                                        type: string
+                                      namespace:
+                                        description: The namespace of the source VolumeSnapshot
+                                        type: string
+                                    required:
+                                    - name
+                                    - namespace
+                                    type: object
                                   upload:
                                     description: DataVolumeSourceUpload provides the
                                       parameters to create a Data Volume by uploading
@@ -21048,7 +22855,10 @@ var CRDsValidation map[string]string = map[string]string{
                                       feature gate must be enabled. If the provisioner
                                       or an external controller can support the specified
                                       data source, it will create a new volume based
-                                      on the contents of the specified data source.'
+                                      on the contents of the specified data source.
+                                      If the AnyVolumeDataSource feature gate is enabled,
+                                      this field will always have the same contents
+                                      as the DataSourceRef field.'
                                     properties:
                                       apiGroup:
                                         description: APIGroup is the group for the
@@ -21069,11 +22879,93 @@ var CRDsValidation map[string]string = map[string]string{
                                     - kind
                                     - name
                                     type: object
+                                  dataSourceRef:
+                                    description: 'Specifies the object from which
+                                      to populate the volume with data, if a non-empty
+                                      volume is desired. This may be any local object
+                                      from a non-empty API group (non core object)
+                                      or a PersistentVolumeClaim object. When this
+                                      field is specified, volume binding will only
+                                      succeed if the type of the specified object
+                                      matches some installed volume populator or dynamic
+                                      provisioner. This field will replace the functionality
+                                      of the DataSource field and as such if both
+                                      fields are non-empty, they must have the same
+                                      value. For backwards compatibility, both fields
+                                      (DataSource and DataSourceRef) will be set to
+                                      the same value automatically if one of them
+                                      is empty and the other is non-empty. There are
+                                      two important differences between DataSource
+                                      and DataSourceRef: * While DataSource only allows
+                                      two specific types of objects, DataSourceRef
+                                      allows any non-core object, as well as PersistentVolumeClaim
+                                      objects. * While DataSource ignores disallowed
+                                      values (dropping them), DataSourceRef preserves
+                                      all values, and generates an error if a disallowed
+                                      value is specified. (Beta) Using this field
+                                      requires the AnyVolumeDataSource feature gate
+                                      to be enabled.'
+                                    properties:
+                                      apiGroup:
+                                        description: APIGroup is the group for the
+                                          resource being referenced. If APIGroup is
+                                          not specified, the specified Kind must be
+                                          in the core API group. For any other third-party
+                                          types, APIGroup is required.
+                                        type: string
+                                      kind:
+                                        description: Kind is the type of resource
+                                          being referenced
+                                        type: string
+                                      name:
+                                        description: Name is the name of resource
+                                          being referenced
+                                        type: string
+                                      namespace:
+                                        description: Namespace is the namespace of
+                                          resource being referenced Note that when
+                                          a namespace is specified, a gateway.networking.k8s.io/ReferenceGrant
+                                          object is required in the referent namespace
+                                          to allow that namespace's owner to accept
+                                          the reference. See the ReferenceGrant documentation
+                                          for details. (Alpha) This field requires
+                                          the CrossNamespaceVolumeDataSource feature
+                                          gate to be enabled.
+                                        type: string
+                                    required:
+                                    - kind
+                                    - name
+                                    type: object
                                   resources:
                                     description: 'Resources represents the minimum
                                       resources the volume should have. More info:
                                       https://kubernetes.io/docs/concepts/storage/persistent-volumes#resources'
                                     properties:
+                                      claims:
+                                        description: "Claims lists the names of resources,
+                                          defined in spec.resourceClaims, that are
+                                          used by this container. \n This is an alpha
+                                          field and requires enabling the DynamicResourceAllocation
+                                          feature gate. \n This field is immutable.
+                                          It can only be set for containers."
+                                        items:
+                                          description: ResourceClaim references one
+                                            entry in PodSpec.ResourceClaims.
+                                          properties:
+                                            name:
+                                              description: Name must match the name
+                                                of one entry in pod.spec.resourceClaims
+                                                of the Pod where this field is used.
+                                                It makes that resource available inside
+                                                a container.
+                                              type: string
+                                          required:
+                                          - name
+                                          type: object
+                                        type: array
+                                        x-kubernetes-list-map-keys:
+                                        - name
+                                        x-kubernetes-list-type: map
                                       limits:
                                         additionalProperties:
                                           anyOf:
@@ -21186,6 +23078,13 @@ var CRDsValidation map[string]string = map[string]string{
                             resource. Once applied to the InstancetypeMatcher this
                             field is removed.
                           type: string
+                        inferFromVolumeFailurePolicy:
+                          description: 'InferFromVolumeFailurePolicy controls what
+                            should happen on failure when inferring the instancetype.
+                            Allowed values are: "RejectInferFromVolumeFailure" and
+                            "IgnoreInferFromVolumeFailure". If not specified, "RejectInferFromVolumeFailure"
+                            is used by default.'
+                          type: string
                         kind:
                           description: 'Kind specifies which instancetype resource
                             is referenced. Allowed values are: "VirtualMachineInstancetype"
@@ -21204,6 +23103,41 @@ var CRDsValidation map[string]string = map[string]string{
                             is applied to the VirtualMachineInstance.
                           type: string
                       type: object
+                    liveUpdateFeatures:
+                      description: LiveUpdateFeatures references a configuration of
+                        hotpluggable resources
+                      properties:
+                        affinity:
+                          description: Affinity allows live updating the virtual machines
+                            node affinity
+                          type: object
+                        cpu:
+                          description: LiveUpdateCPU holds hotplug configuration for
+                            the CPU resource. Empty struct indicates that default
+                            will be used for maxSockets. Default is specified on cluster
+                            level. Absence of the struct means opt-out from CPU hotplug
+                            functionality.
+                          properties:
+                            maxSockets:
+                              description: The maximum amount of sockets that can
+                                be hot-plugged to the Virtual Machine
+                              format: int32
+                              type: integer
+                          type: object
+                        memory:
+                          description: MemoryLiveUpdateConfiguration defines the live
+                            update memory features for the VirtualMachine
+                          properties:
+                            maxGuest:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              description: MaxGuest defines the maximum amount memory
+                                that can be allocated for the VM.
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                          type: object
+                      type: object
                     preference:
                       description: PreferenceMatcher references a set of preference
                         that is used to fill fields in Template
@@ -21214,6 +23148,13 @@ var CRDsValidation map[string]string = map[string]string{
                             to be used through known annotations on the underlying
                             resource. Once applied to the PreferenceMatcher this field
                             is removed.
+                          type: string
+                        inferFromVolumeFailurePolicy:
+                          description: 'InferFromVolumeFailurePolicy controls what
+                            should happen on failure when preference the instancetype.
+                            Allowed values are: "RejectInferFromVolumeFailure" and
+                            "IgnoreInferFromVolumeFailure". If not specified, "RejectInferFromVolumeFailure"
+                            is used by default.'
                           type: string
                         kind:
                           description: 'Kind specifies which preference resource is
@@ -21275,6 +23216,12 @@ var CRDsValidation map[string]string = map[string]string{
                                               that the ssh public keys are injected
                                               into the VM using metadata using the
                                               configDrive cloud-init provider
+                                            type: object
+                                          noCloud:
+                                            description: NoCloudPropagation means
+                                              that the ssh public keys are injected
+                                              into the VM using metadata using the
+                                              noCloud cloud-init provider
                                             type: object
                                           qemuGuestAgent:
                                             description: QemuGuestAgentAccessCredentailPropagation
@@ -21698,9 +23645,7 @@ var CRDsValidation map[string]string = map[string]string{
                                                   and null or empty namespaces list
                                                   means "this pod's namespace". An
                                                   empty selector ({}) matches all
-                                                  namespaces. This field is beta-level
-                                                  and is only honored when PodAffinityNamespaceSelector
-                                                  feature is enabled.
+                                                  namespaces.
                                                 properties:
                                                   matchExpressions:
                                                     description: matchExpressions
@@ -21768,7 +23713,7 @@ var CRDsValidation map[string]string = map[string]string{
                                                   selected by namespaceSelector. null
                                                   or empty namespaces list and null
                                                   namespaceSelector means "this pod's
-                                                  namespace"
+                                                  namespace".
                                                 items:
                                                   type: string
                                                 type: array
@@ -21887,9 +23832,6 @@ var CRDsValidation map[string]string = map[string]string{
                                               field. null selector and null or empty
                                               namespaces list means "this pod's namespace".
                                               An empty selector ({}) matches all namespaces.
-                                              This field is beta-level and is only
-                                              honored when PodAffinityNamespaceSelector
-                                              feature is enabled.
                                             properties:
                                               matchExpressions:
                                                 description: matchExpressions is a
@@ -21952,7 +23894,7 @@ var CRDsValidation map[string]string = map[string]string{
                                               field and the ones selected by namespaceSelector.
                                               null or empty namespaces list and null
                                               namespaceSelector means "this pod's
-                                              namespace"
+                                              namespace".
                                             items:
                                               type: string
                                             type: array
@@ -22074,9 +24016,7 @@ var CRDsValidation map[string]string = map[string]string{
                                                   and null or empty namespaces list
                                                   means "this pod's namespace". An
                                                   empty selector ({}) matches all
-                                                  namespaces. This field is beta-level
-                                                  and is only honored when PodAffinityNamespaceSelector
-                                                  feature is enabled.
+                                                  namespaces.
                                                 properties:
                                                   matchExpressions:
                                                     description: matchExpressions
@@ -22144,7 +24084,7 @@ var CRDsValidation map[string]string = map[string]string{
                                                   selected by namespaceSelector. null
                                                   or empty namespaces list and null
                                                   namespaceSelector means "this pod's
-                                                  namespace"
+                                                  namespace".
                                                 items:
                                                   type: string
                                                 type: array
@@ -22263,9 +24203,6 @@ var CRDsValidation map[string]string = map[string]string{
                                               field. null selector and null or empty
                                               namespaces list means "this pod's namespace".
                                               An empty selector ({}) matches all namespaces.
-                                              This field is beta-level and is only
-                                              honored when PodAffinityNamespaceSelector
-                                              feature is enabled.
                                             properties:
                                               matchExpressions:
                                                 description: matchExpressions is a
@@ -22328,7 +24265,7 @@ var CRDsValidation map[string]string = map[string]string{
                                               field and the ones selected by namespaceSelector.
                                               null or empty namespaces list and null
                                               namespaceSelector means "this pod's
-                                              namespace"
+                                              namespace".
                                             items:
                                               type: string
                                             type: array
@@ -22349,6 +24286,11 @@ var CRDsValidation map[string]string = map[string]string{
                                       type: array
                                   type: object
                               type: object
+                            architecture:
+                              description: Specifies the architecture of the vm guest
+                                you are attempting to run. Defaults to the compiled
+                                architecture of the KubeVirt components
+                              type: string
                             dnsConfig:
                               description: Specifies the DNS parameters of a pod.
                                 Parameters specified here will be merged to the generated
@@ -22573,6 +24515,11 @@ var CRDsValidation map[string]string = map[string]string{
                                         one more dedicated pCPU to be allocated for
                                         the VMI to place the emulator thread on it.
                                       type: boolean
+                                    maxSockets:
+                                      description: MaxSockets specifies the maximum
+                                        amount of sockets that can be hotplugged
+                                      format: int32
+                                      type: integer
                                     model:
                                       description: Model specifies the CPU model inside
                                         the VMI. List of available models https://github.com/libvirt/libvirt/tree/master/src/cpu_map.
@@ -22642,7 +24589,7 @@ var CRDsValidation map[string]string = map[string]string{
                                         interface. Defaults to true.
                                       type: boolean
                                     autoattachSerialConsole:
-                                      description: Whether to attach the default serial
+                                      description: Whether to attach the default virtio-serial
                                         console or not. Serial console access will
                                         not be available if set to false. Defaults
                                         to true.
@@ -22760,6 +24707,11 @@ var CRDsValidation map[string]string = map[string]string{
                                                   false.
                                                 type: boolean
                                             type: object
+                                          errorPolicy:
+                                            description: If specified, it can change
+                                              the default error policy (stop) for
+                                              the disk
+                                            type: string
                                           io:
                                             description: 'IO specifies which QEMU
                                               disk IO mode should be used. Supported
@@ -22807,6 +24759,11 @@ var CRDsValidation map[string]string = map[string]string{
                                         - name
                                         type: object
                                       type: array
+                                    downwardMetrics:
+                                      description: DownwardMetrics creates a virtio
+                                        serials for exposing the downward metrics
+                                        to the vmi.
+                                      type: object
                                     filesystems:
                                       description: Filesystems describes filesystem
                                         which is connected to the vmi.
@@ -22931,6 +24888,21 @@ var CRDsValidation map[string]string = map[string]string{
                                               be unique across all devices and be
                                               between 1 and (16*1024-1).
                                             type: integer
+                                          binding:
+                                            description: 'Binding specifies the binding
+                                              plugin that will be used to connect
+                                              the interface to the guest. It provides
+                                              an alternative to InterfaceBindingMethod.
+                                              version: 1alphav1'
+                                            properties:
+                                              name:
+                                                description: 'Name references to the
+                                                  binding name as denined in the kubevirt
+                                                  CR. version: 1alphav1'
+                                                type: string
+                                            required:
+                                            - name
+                                            type: object
                                           bootOrder:
                                             description: BootOrder is an integer value
                                               > 0, used to determine ordering of boot
@@ -23066,6 +25038,12 @@ var CRDsValidation map[string]string = map[string]string{
                                               a given network by passing-through an
                                               SR-IOV PCI device via vfio.
                                             type: object
+                                          state:
+                                            description: State represents the requested
+                                              operational state of the interface.
+                                              The (only) value supported is 'absent',
+                                              expressing a request to remove the interface.
+                                            type: string
                                           tag:
                                             description: If specified, the virtual
                                               network interface address and its tag
@@ -23076,6 +25054,14 @@ var CRDsValidation map[string]string = map[string]string{
                                         - name
                                         type: object
                                       type: array
+                                    logSerialConsole:
+                                      description: Whether to log the auto-attached
+                                        default serial console or not. Serial console
+                                        logs will be collect to a file and then streamed
+                                        from a named 'guest-console-log'. Not relevant
+                                        if autoattachSerialConsole is disabled. Defaults
+                                        to cluster wide setting on VirtualMachineOptions.
+                                      type: boolean
                                     networkInterfaceMultiqueue:
                                       description: If specified, virtual network interfaces
                                         configured with a virtio bus will also enable
@@ -23400,6 +25386,11 @@ var CRDsValidation map[string]string = map[string]string{
                                           description: If set, EFI will be used instead
                                             of BIOS.
                                           properties:
+                                            persistent:
+                                              description: If set to true, Persistent
+                                                will persist the EFI NVRAM across
+                                                reboots. Defaults to false
+                                              type: boolean
                                             secureBoot:
                                               description: If set, SecureBoot will
                                                 be enabled and the OVMF roms will
@@ -23469,6 +25460,31 @@ var CRDsValidation map[string]string = map[string]string{
                                     sev:
                                       description: AMD Secure Encrypted Virtualization
                                         (SEV).
+                                      properties:
+                                        attestation:
+                                          description: If specified, run the attestation
+                                            process for a vmi.
+                                          type: object
+                                        dhCert:
+                                          description: Base64 encoded guest owner's
+                                            Diffie-Hellman key.
+                                          type: string
+                                        policy:
+                                          description: 'Guest policy flags as defined
+                                            in AMD SEV API specification. Note: due
+                                            to security reasons it is not allowed
+                                            to enable guest debugging. Therefore NoDebug
+                                            flag is not exposed to users and is always
+                                            true.'
+                                          properties:
+                                            encryptedState:
+                                              description: SEV-ES is required. Defaults
+                                                to false.
+                                              type: boolean
+                                          type: object
+                                        session:
+                                          description: Base64 encoded session blob.
+                                          type: string
                                       type: object
                                   type: object
                                 machine:
@@ -23506,6 +25522,17 @@ var CRDsValidation map[string]string = map[string]string{
                                             are 1Gi and 2Mi.
                                           type: string
                                       type: object
+                                    maxGuest:
+                                      anyOf:
+                                      - type: integer
+                                      - type: string
+                                      description: MaxGuest allows to specify the
+                                        maximum amount of memory which is visible
+                                        inside the Guest OS. The delta between MaxGuest
+                                        and Guest is the amount of memory that can
+                                        be hot(un)plugged.
+                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                      x-kubernetes-int-or-string: true
                                   type: object
                                 resources:
                                   description: Resources describes the Compute Resources
@@ -24011,34 +26038,117 @@ var CRDsValidation map[string]string = map[string]string{
                                           "value". The requirements are ANDed.
                                         type: object
                                     type: object
+                                  matchLabelKeys:
+                                    description: MatchLabelKeys is a set of pod label
+                                      keys to select the pods over which spreading
+                                      will be calculated. The keys are used to lookup
+                                      values from the incoming pod labels, those key-value
+                                      labels are ANDed with labelSelector to select
+                                      the group of existing pods over which spreading
+                                      will be calculated for the incoming pod. Keys
+                                      that don't exist in the incoming pod labels
+                                      will be ignored. A null or empty list means
+                                      only match against labelSelector.
+                                    items:
+                                      type: string
+                                    type: array
+                                    x-kubernetes-list-type: atomic
                                   maxSkew:
                                     description: 'MaxSkew describes the degree to
                                       which pods may be unevenly distributed. When
                                       ''whenUnsatisfiable=DoNotSchedule'', it is the
                                       maximum permitted difference between the number
                                       of matching pods in the target topology and
-                                      the global minimum. For example, in a 3-zone
+                                      the global minimum. The global minimum is the
+                                      minimum number of matching pods in an eligible
+                                      domain or zero if the number of eligible domains
+                                      is less than MinDomains. For example, in a 3-zone
                                       cluster, MaxSkew is set to 1, and pods with
-                                      the same labelSelector spread as 1/1/0: | zone1
-                                      | zone2 | zone3 | |   P   |   P   |       |
-                                      - if MaxSkew is 1, incoming pod can only be
-                                      scheduled to zone3 to become 1/1/1; scheduling
-                                      it onto zone1(zone2) would make the ActualSkew(2-0)
-                                      on zone1(zone2) violate MaxSkew(1). - if MaxSkew
-                                      is 2, incoming pod can be scheduled onto any
-                                      zone. When ''whenUnsatisfiable=ScheduleAnyway'',
+                                      the same labelSelector spread as 2/2/1: In this
+                                      case, the global minimum is 1. | zone1 | zone2
+                                      | zone3 | |  P P  |  P P  |   P   | - if MaxSkew
+                                      is 1, incoming pod can only be scheduled to
+                                      zone3 to become 2/2/2; scheduling it onto zone1(zone2)
+                                      would make the ActualSkew(3-1) on zone1(zone2)
+                                      violate MaxSkew(1). - if MaxSkew is 2, incoming
+                                      pod can be scheduled onto any zone. When ''whenUnsatisfiable=ScheduleAnyway'',
                                       it is used to give higher precedence to topologies
                                       that satisfy it. It''s a required field. Default
                                       value is 1 and 0 is not allowed.'
                                     format: int32
                                     type: integer
+                                  minDomains:
+                                    description: "MinDomains indicates a minimum number
+                                      of eligible domains. When the number of eligible
+                                      domains with matching topology keys is less
+                                      than minDomains, Pod Topology Spread treats
+                                      \"global minimum\" as 0, and then the calculation
+                                      of Skew is performed. And when the number of
+                                      eligible domains with matching topology keys
+                                      equals or greater than minDomains, this value
+                                      has no effect on scheduling. As a result, when
+                                      the number of eligible domains is less than
+                                      minDomains, scheduler won't schedule more than
+                                      maxSkew Pods to those domains. If value is nil,
+                                      the constraint behaves as if MinDomains is equal
+                                      to 1. Valid values are integers greater than
+                                      0. When value is not nil, WhenUnsatisfiable
+                                      must be DoNotSchedule. \n For example, in a
+                                      3-zone cluster, MaxSkew is set to 2, MinDomains
+                                      is set to 5 and pods with the same labelSelector
+                                      spread as 2/2/2: | zone1 | zone2 | zone3 | |
+                                      \ P P  |  P P  |  P P  | The number of domains
+                                      is less than 5(MinDomains), so \"global minimum\"
+                                      is treated as 0. In this situation, new pod
+                                      with the same labelSelector cannot be scheduled,
+                                      because computed skew will be 3(3 - 0) if new
+                                      Pod is scheduled to any of the three zones,
+                                      it will violate MaxSkew. \n This is a beta field
+                                      and requires the MinDomainsInPodTopologySpread
+                                      feature gate to be enabled (enabled by default)."
+                                    format: int32
+                                    type: integer
+                                  nodeAffinityPolicy:
+                                    description: "NodeAffinityPolicy indicates how
+                                      we will treat Pod's nodeAffinity/nodeSelector
+                                      when calculating pod topology spread skew. Options
+                                      are: - Honor: only nodes matching nodeAffinity/nodeSelector
+                                      are included in the calculations. - Ignore:
+                                      nodeAffinity/nodeSelector are ignored. All nodes
+                                      are included in the calculations. \n If this
+                                      value is nil, the behavior is equivalent to
+                                      the Honor policy. This is a beta-level feature
+                                      default enabled by the NodeInclusionPolicyInPodTopologySpread
+                                      feature flag."
+                                    type: string
+                                  nodeTaintsPolicy:
+                                    description: "NodeTaintsPolicy indicates how we
+                                      will treat node taints when calculating pod
+                                      topology spread skew. Options are: - Honor:
+                                      nodes without taints, along with tainted nodes
+                                      for which the incoming pod has a toleration,
+                                      are included. - Ignore: node taints are ignored.
+                                      All nodes are included. \n If this value is
+                                      nil, the behavior is equivalent to the Ignore
+                                      policy. This is a beta-level feature default
+                                      enabled by the NodeInclusionPolicyInPodTopologySpread
+                                      feature flag."
+                                    type: string
                                   topologyKey:
                                     description: TopologyKey is the key of node labels.
                                       Nodes that have a label with this key and identical
                                       values are considered to be in the same topology.
                                       We consider each <key, value> as a "bucket",
                                       and try to put balanced number of pods into
-                                      each bucket. It's a required field.
+                                      each bucket. We define a domain as a particular
+                                      instance of a topology. Also, we define an eligible
+                                      domain as a domain whose nodes meet the requirements
+                                      of nodeAffinityPolicy and nodeTaintsPolicy.
+                                      e.g. If TopologyKey is "kubernetes.io/hostname",
+                                      each Node is a domain of that topology. And,
+                                      if TopologyKey is "topology.kubernetes.io/zone",
+                                      each zone is a domain of that topology. It's
+                                      a required field.
                                     type: string
                                   whenUnsatisfiable:
                                     description: 'WhenUnsatisfiable indicates how
@@ -24372,14 +26482,14 @@ var CRDsValidation map[string]string = map[string]string{
                                           to the vmi via qemu. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                                         properties:
                                           claimName:
-                                            description: 'ClaimName is the name of
+                                            description: 'claimName is the name of
                                               a PersistentVolumeClaim in the same
                                               namespace as the pod using this volume.
                                               More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                                             type: string
                                           readOnly:
-                                            description: Will force the ReadOnly setting
-                                              in VolumeMounts. Default false.
+                                            description: readOnly Will force the ReadOnly
+                                              setting in VolumeMounts. Default false.
                                             type: boolean
                                         required:
                                         - claimName
@@ -24419,7 +26529,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       of the vmi
                                     properties:
                                       claimName:
-                                        description: 'ClaimName is the name of a PersistentVolumeClaim
+                                        description: 'claimName is the name of a PersistentVolumeClaim
                                           in the same namespace as the pod using this
                                           volume. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                                         type: string
@@ -24428,8 +26538,8 @@ var CRDsValidation map[string]string = map[string]string{
                                           the volume can be hotplugged and hotunplugged.
                                         type: boolean
                                       readOnly:
-                                        description: Will force the ReadOnly setting
-                                          in VolumeMounts. Default false.
+                                        description: readOnly Will force the ReadOnly
+                                          setting in VolumeMounts. Default false.
                                         type: boolean
                                     required:
                                     - claimName
@@ -24445,7 +26555,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       the vmi via qemu. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                                     properties:
                                       claimName:
-                                        description: 'ClaimName is the name of a PersistentVolumeClaim
+                                        description: 'claimName is the name of a PersistentVolumeClaim
                                           in the same namespace as the pod using this
                                           volume. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                                         type: string
@@ -24454,8 +26564,8 @@ var CRDsValidation map[string]string = map[string]string{
                                           the volume can be hotplugged and hotunplugged.
                                         type: boolean
                                       readOnly:
-                                        description: Will force the ReadOnly setting
-                                          in VolumeMounts. Default false.
+                                        description: readOnly Will force the ReadOnly
+                                          setting in VolumeMounts. Default false.
                                         type: boolean
                                     required:
                                     - claimName
@@ -24579,35 +26689,6 @@ var CRDsValidation map[string]string = map[string]string{
                         ObservedGeneration in Status.
                       format: int64
                       type: integer
-                    interfaceRequests:
-                      description: InterfaceRequests indicates a list of interfaces
-                        added to the VMI template and hot-plugged on an active running
-                        VMI.
-                      items:
-                        properties:
-                          addInterfaceOptions:
-                            description: AddInterfaceOptions when set indicates a
-                              network interface should be added. The details within
-                              this field specify how to add the interface
-                            properties:
-                              name:
-                                description: Name indicates the logical name of the
-                                  interface.
-                                type: string
-                              networkAttachmentDefinitionName:
-                                description: 'NetworkAttachmentDefinitionName references
-                                  a NetworkAttachmentDefinition CRD object. Format:
-                                  <networkAttachmentDefinitionName>, <namespace>/<networkAttachmentDefinitionName>.
-                                  If namespace is not specified, VMI namespace is
-                                  assumed.'
-                                type: string
-                            required:
-                            - name
-                            - networkAttachmentDefinitionName
-                            type: object
-                        type: object
-                      type: array
-                      x-kubernetes-list-type: atomic
                     memoryDumpRequest:
                       description: MemoryDumpRequest tracks memory dump request phase
                         and info of getting a memory dump to the given pvc
@@ -24808,6 +26889,10 @@ var CRDsValidation map[string]string = map[string]string{
                                         description: ReadOnly. Defaults to false.
                                         type: boolean
                                     type: object
+                                  errorPolicy:
+                                    description: If specified, it can change the default
+                                      error policy (stop) for the disk
+                                    type: string
                                   io:
                                     description: 'IO specifies which QEMU disk IO
                                       mode should be used. Supported values are: native,
@@ -24894,7 +26979,7 @@ var CRDsValidation map[string]string = map[string]string{
                                       the vmi via qemu. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                                     properties:
                                       claimName:
-                                        description: 'ClaimName is the name of a PersistentVolumeClaim
+                                        description: 'claimName is the name of a PersistentVolumeClaim
                                           in the same namespace as the pod using this
                                           volume. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                                         type: string
@@ -24903,8 +26988,8 @@ var CRDsValidation map[string]string = map[string]string{
                                           the volume can be hotplugged and hotunplugged.
                                         type: boolean
                                       readOnly:
-                                        description: Will force the ReadOnly setting
-                                          in VolumeMounts. Default false.
+                                        description: readOnly Will force the ReadOnly
+                                          setting in VolumeMounts. Default false.
                                         type: boolean
                                     required:
                                     - claimName
@@ -24980,20 +27065,23 @@ var CRDsValidation map[string]string = map[string]string{
                       requested by a pod author. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims'
                     properties:
                       accessModes:
-                        description: 'AccessModes contains the desired access modes
+                        description: 'accessModes contains the desired access modes
                           the volume should have. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#access-modes-1'
                         items:
                           type: string
                         type: array
                       dataSource:
-                        description: 'This field can be used to specify either: *
-                          An existing VolumeSnapshot object (snapshot.storage.k8s.io/VolumeSnapshot)
+                        description: 'dataSource field can be used to specify either:
+                          * An existing VolumeSnapshot object (snapshot.storage.k8s.io/VolumeSnapshot)
                           * An existing PVC (PersistentVolumeClaim) If the provisioner
                           or an external controller can support the specified data
                           source, it will create a new volume based on the contents
-                          of the specified data source. If the AnyVolumeDataSource
-                          feature gate is enabled, this field will always have the
-                          same contents as the DataSourceRef field.'
+                          of the specified data source. When the AnyVolumeDataSource
+                          feature gate is enabled, dataSource contents will be copied
+                          to dataSourceRef, and dataSourceRef contents will be copied
+                          to dataSource when dataSourceRef.namespace is not specified.
+                          If the namespace is specified, then dataSourceRef will not
+                          be copied to dataSource.'
                         properties:
                           apiGroup:
                             description: APIGroup is the group for the resource being
@@ -25012,26 +27100,32 @@ var CRDsValidation map[string]string = map[string]string{
                         - name
                         type: object
                       dataSourceRef:
-                        description: 'Specifies the object from which to populate
-                          the volume with data, if a non-empty volume is desired.
-                          This may be any local object from a non-empty API group
-                          (non core object) or a PersistentVolumeClaim object. When
-                          this field is specified, volume binding will only succeed
+                        description: 'dataSourceRef specifies the object from which
+                          to populate the volume with data, if a non-empty volume
+                          is desired. This may be any object from a non-empty API
+                          group (non core object) or a PersistentVolumeClaim object.
+                          When this field is specified, volume binding will only succeed
                           if the type of the specified object matches some installed
                           volume populator or dynamic provisioner. This field will
-                          replace the functionality of the DataSource field and as
+                          replace the functionality of the dataSource field and as
                           such if both fields are non-empty, they must have the same
-                          value. For backwards compatibility, both fields (DataSource
-                          and DataSourceRef) will be set to the same value automatically
-                          if one of them is empty and the other is non-empty. There
-                          are two important differences between DataSource and DataSourceRef:
-                          * While DataSource only allows two specific types of objects,
-                          DataSourceRef   allows any non-core object, as well as PersistentVolumeClaim
-                          objects. * While DataSource ignores disallowed values (dropping
-                          them), DataSourceRef   preserves all values, and generates
-                          an error if a disallowed value is   specified. (Alpha) Using
-                          this field requires the AnyVolumeDataSource feature gate
-                          to be enabled.'
+                          value. For backwards compatibility, when namespace isn''t
+                          specified in dataSourceRef, both fields (dataSource and
+                          dataSourceRef) will be set to the same value automatically
+                          if one of them is empty and the other is non-empty. When
+                          namespace is specified in dataSourceRef, dataSource isn''t
+                          set to the same value and must be empty. There are three
+                          important differences between dataSource and dataSourceRef:
+                          * While dataSource only allows two specific types of objects,
+                          dataSourceRef   allows any non-core object, as well as PersistentVolumeClaim
+                          objects. * While dataSource ignores disallowed values (dropping
+                          them), dataSourceRef   preserves all values, and generates
+                          an error if a disallowed value is   specified. * While dataSource
+                          only allows local objects, dataSourceRef allows objects   in
+                          any namespaces. (Beta) Using this field requires the AnyVolumeDataSource
+                          feature gate to be enabled. (Alpha) Using the namespace
+                          field of dataSourceRef requires the CrossNamespaceVolumeDataSource
+                          feature gate to be enabled.'
                         properties:
                           apiGroup:
                             description: APIGroup is the group for the resource being
@@ -25045,18 +27139,50 @@ var CRDsValidation map[string]string = map[string]string{
                           name:
                             description: Name is the name of resource being referenced
                             type: string
+                          namespace:
+                            description: Namespace is the namespace of resource being
+                              referenced Note that when a namespace is specified,
+                              a gateway.networking.k8s.io/ReferenceGrant object is
+                              required in the referent namespace to allow that namespace's
+                              owner to accept the reference. See the ReferenceGrant
+                              documentation for details. (Alpha) This field requires
+                              the CrossNamespaceVolumeDataSource feature gate to be
+                              enabled.
+                            type: string
                         required:
                         - kind
                         - name
                         type: object
                       resources:
-                        description: 'Resources represents the minimum resources the
+                        description: 'resources represents the minimum resources the
                           volume should have. If RecoverVolumeExpansionFailure feature
                           is enabled users are allowed to specify resource requirements
                           that are lower than previous value but must still be higher
                           than capacity recorded in the status field of the claim.
                           More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#resources'
                         properties:
+                          claims:
+                            description: "Claims lists the names of resources, defined
+                              in spec.resourceClaims, that are used by this container.
+                              \n This is an alpha field and requires enabling the
+                              DynamicResourceAllocation feature gate. \n This field
+                              is immutable. It can only be set for containers."
+                            items:
+                              description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                              properties:
+                                name:
+                                  description: Name must match the name of one entry
+                                    in pod.spec.resourceClaims of the Pod where this
+                                    field is used. It makes that resource available
+                                    inside a container.
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
                           limits:
                             additionalProperties:
                               anyOf:
@@ -25082,7 +27208,8 @@ var CRDsValidation map[string]string = map[string]string{
                             type: object
                         type: object
                       selector:
-                        description: A label query over volumes to consider for binding.
+                        description: selector is a label query over volumes to consider
+                          for binding.
                         properties:
                           matchExpressions:
                             description: matchExpressions is a list of label selector
@@ -25127,8 +27254,8 @@ var CRDsValidation map[string]string = map[string]string{
                             type: object
                         type: object
                       storageClassName:
-                        description: 'Name of the StorageClass required by the claim.
-                          More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#class-1'
+                        description: 'storageClassName is the name of the StorageClass
+                          required by the claim. More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#class-1'
                         type: string
                       volumeMode:
                         description: volumeMode defines what type of volume is required
@@ -25136,7 +27263,7 @@ var CRDsValidation map[string]string = map[string]string{
                           in claim spec.
                         type: string
                       volumeName:
-                        description: VolumeName is the binding reference to the PersistentVolume
+                        description: volumeName is the binding reference to the PersistentVolume
                           backing this claim.
                         type: string
                     type: object

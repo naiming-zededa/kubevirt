@@ -62,31 +62,22 @@ var _ = Describe("Node-labeller ", func() {
 		mockQueue.Wait()
 	}
 
-	expectPatch := func(expect bool, expectedPatches ...string) {
-		kubeClient.Fake.PrependReactor("patch", "nodes", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
-			patch, ok := action.(testing.PatchAction)
-			Expect(ok).To(BeTrue())
-			for _, expectedPatch := range expectedPatches {
-				if expect {
-					Expect(string(patch.GetPatch())).To(ContainSubstring(expectedPatch))
-				} else {
-					Expect(string(patch.GetPatch())).ToNot(ContainSubstring(expectedPatch))
-				}
-			}
-			return true, nil, nil
-		})
-	}
+	initNodeLabeller := func(kubevirt *kubevirtv1.KubeVirt, nodeLabels, nodeAnnotations map[string]string) {
+		var err error
+		config, _, _ = testutils.NewFakeClusterConfigUsingKV(kubevirt)
+		recorder = record.NewFakeRecorder(100)
+		recorder.IncludeObject = true
 
-	expectNodePatch := func(expectedPatches ...string) {
-		expectPatch(true, expectedPatches...)
-	}
+		nlController, err = newNodeLabeller(config, virtClient, "testNode", k8sv1.NamespaceDefault, "testdata", recorder)
+		Expect(err).ToNot(HaveOccurred())
 
-	doNotExpectNodePatch := func(expectedPatches ...string) {
-		expectPatch(false, expectedPatches...)
+		mockQueue = testutils.NewMockWorkQueue(nlController.queue)
+
+		nlController.queue = mockQueue
+		addNode(newNode("testNode", nodeLabels, nodeAnnotations))
 	}
 
 	BeforeEach(func() {
-		var err error
 		stop = make(chan struct{})
 		ctrl = gomock.NewController(GinkgoT())
 
@@ -112,21 +103,11 @@ var _ = Describe("Node-labeller ", func() {
 			},
 		}
 
-		config, _, _ = testutils.NewFakeClusterConfigUsingKV(kv)
-		recorder = record.NewFakeRecorder(100)
-		recorder.IncludeObject = true
-
-		nlController, err = newNodeLabeller(config, virtClient, "testNode", k8sv1.NamespaceDefault, "testdata", recorder)
-		Expect(err).ToNot(HaveOccurred())
-
-		mockQueue = testutils.NewMockWorkQueue(nlController.queue)
-
-		nlController.queue = mockQueue
-		addNode(newNode("testNode"))
+		initNodeLabeller(kv, make(map[string]string), make(map[string]string))
 	})
 
 	It("should run node-labelling", func() {
-		expectNodePatch()
+		testutils.ExpectNodePatch(kubeClient)
 		res := nlController.execute()
 		Expect(res).To(BeTrue(), "labeller should end with true result")
 		Consistently(func() int {
@@ -144,24 +125,30 @@ var _ = Describe("Node-labeller ", func() {
 	})
 
 	It("should add host cpu model label", func() {
-		expectNodePatch(kubevirtv1.HostModelCPULabel)
+		testutils.ExpectNodePatch(kubeClient, kubevirtv1.HostModelCPULabel)
 		res := nlController.execute()
 		Expect(res).To(BeTrue())
 	})
 	It("should add host cpu required features", func() {
-		expectNodePatch(kubevirtv1.HostModelRequiredFeaturesLabel)
+		testutils.ExpectNodePatch(kubeClient, kubevirtv1.HostModelRequiredFeaturesLabel)
 		res := nlController.execute()
 		Expect(res).To(BeTrue())
 	})
 
 	It("should add SEV label", func() {
-		expectNodePatch(kubevirtv1.SEVLabel)
+		testutils.ExpectNodePatch(kubeClient, kubevirtv1.SEVLabel)
+		res := nlController.execute()
+		Expect(res).To(BeTrue())
+	})
+
+	It("should add SEVES label", func() {
+		testutils.ExpectNodePatch(kubeClient, kubevirtv1.SEVESLabel)
 		res := nlController.execute()
 		Expect(res).To(BeTrue())
 	})
 
 	It("should add usable cpu model labels for the host cpu model", func() {
-		expectNodePatch(
+		testutils.ExpectNodePatch(kubeClient,
 			kubevirtv1.HostModelCPULabel+"Skylake-Client-IBRS",
 			kubevirtv1.CPUModelLabel+"Skylake-Client-IBRS",
 			kubevirtv1.SupportedHostModelMigrationCPU+"Skylake-Client-IBRS",
@@ -171,7 +158,7 @@ var _ = Describe("Node-labeller ", func() {
 	})
 
 	It("should add usable cpu model labels if all required features are supported", func() {
-		expectNodePatch(
+		testutils.ExpectNodePatch(kubeClient,
 			kubevirtv1.CPUModelLabel+"Penryn",
 			kubevirtv1.SupportedHostModelMigrationCPU+"Penryn",
 		)
@@ -180,7 +167,7 @@ var _ = Describe("Node-labeller ", func() {
 	})
 
 	It("should not add usable cpu model labels if some features are not suported (svm)", func() {
-		doNotExpectNodePatch(
+		testutils.DoNotExpectNodePatch(kubeClient,
 			kubevirtv1.CPUModelLabel+"Opteron_G2",
 			kubevirtv1.SupportedHostModelMigrationCPU+"Opteron_G2",
 		)
@@ -193,11 +180,11 @@ var _ = Describe("Node-labeller ", func() {
 	})
 })
 
-func newNode(name string) *v1.Node {
+func newNode(name string, labels, annotations map[string]string) *v1.Node {
 	return &v1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Annotations: make(map[string]string),
-			Labels:      make(map[string]string),
+			Annotations: annotations,
+			Labels:      labels,
 			Name:        name,
 		},
 		Spec: v1.NodeSpec{},

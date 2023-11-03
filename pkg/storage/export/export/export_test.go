@@ -57,7 +57,7 @@ import (
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
 	apiinstancetype "kubevirt.io/api/instancetype"
-	instancetypev1alpha2 "kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 
 	"kubevirt.io/kubevirt/pkg/certificates/bootstrap"
 	"kubevirt.io/kubevirt/pkg/certificates/triple"
@@ -116,6 +116,8 @@ var _ = Describe("Export controller", func() {
 		preferenceInformer          cache.SharedIndexInformer
 		clusterPreferenceInformer   cache.SharedIndexInformer
 		controllerRevisionInformer  cache.SharedIndexInformer
+		rqInformer                  cache.SharedIndexInformer
+		nsInformer                  cache.SharedIndexInformer
 		k8sClient                   *k8sfake.Clientset
 		virtClient                  *kubecli.MockKubevirtClient
 		vmExportClient              *kubevirtfake.Clientset
@@ -148,6 +150,8 @@ var _ = Describe("Export controller", func() {
 		go preferenceInformer.Run(stop)
 		go clusterPreferenceInformer.Run(stop)
 		go controllerRevisionInformer.Run(stop)
+		go rqInformer.Run(stop)
+		go nsInformer.Run(stop)
 		Expect(cache.WaitForCacheSync(
 			stop,
 			vmExportInformer.HasSynced,
@@ -168,6 +172,8 @@ var _ = Describe("Export controller", func() {
 			preferenceInformer.HasSynced,
 			clusterPreferenceInformer.HasSynced,
 			controllerRevisionInformer.HasSynced,
+			rqInformer.HasSynced,
+			nsInformer.HasSynced,
 		)).To(BeTrue())
 	}
 
@@ -198,11 +204,13 @@ var _ = Describe("Export controller", func() {
 		secretInformer, _ = testutils.NewFakeInformerFor(&k8sv1.Secret{})
 		kvInformer, _ = testutils.NewFakeInformerFor(&virtv1.KubeVirt{})
 		crdInformer, _ = testutils.NewFakeInformerFor(&extv1.CustomResourceDefinition{})
-		instancetypeInformer, _ = testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineInstancetype{})
-		clusterInstancetypeInformer, _ = testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineClusterInstancetype{})
-		preferenceInformer, _ = testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachinePreference{})
-		clusterPreferenceInformer, _ = testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineClusterPreference{})
+		instancetypeInformer, _ = testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineInstancetype{})
+		clusterInstancetypeInformer, _ = testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineClusterInstancetype{})
+		preferenceInformer, _ = testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachinePreference{})
+		clusterPreferenceInformer, _ = testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineClusterPreference{})
 		controllerRevisionInformer, _ = testutils.NewFakeInformerFor(&appsv1.ControllerRevision{})
+		rqInformer, _ = testutils.NewFakeInformerFor(&k8sv1.ResourceQuota{})
+		nsInformer, _ = testutils.NewFakeInformerFor(&k8sv1.Namespace{})
 		fakeVolumeSnapshotProvider = &MockVolumeSnapshotProvider{
 			volumeSnapshots: []*vsv1.VolumeSnapshot{},
 		}
@@ -226,7 +234,7 @@ var _ = Describe("Export controller", func() {
 			ServiceInformer:             serviceInformer,
 			DataVolumeInformer:          dvInformer,
 			KubevirtNamespace:           "kubevirt",
-			TemplateService:             services.NewTemplateService("a", 240, "b", "c", "d", "e", "f", "g", pvcInformer.GetStore(), virtClient, config, qemuGid, "h"),
+			TemplateService:             services.NewTemplateService("a", 240, "b", "c", "d", "e", "f", "g", pvcInformer.GetStore(), virtClient, config, qemuGid, "h", rqInformer.GetStore(), nsInformer.GetStore()),
 			caCertManager:               bootstrap.NewFileCertificateManager(certFilePath, keyFilePath),
 			RouteCache:                  routeCache,
 			IngressCache:                ingressCache,
@@ -905,6 +913,14 @@ var _ = Describe("Export controller", func() {
 		}))
 		Expect(pod.Annotations[annCertParams]).To(Equal("{\"Duration\":7200000000000,\"RenewBefore\":3600000000000}"))
 		Expect(pod.Spec.Containers[0].Env).To(ContainElements(expectedPodEnvVars))
+		Expect(pod.Spec.Containers[0].Resources.Requests.Cpu()).ToNot(BeNil())
+		Expect(pod.Spec.Containers[0].Resources.Requests.Cpu().MilliValue()).To(Equal(int64(100)))
+		Expect(pod.Spec.Containers[0].Resources.Requests.Memory()).ToNot(BeNil())
+		Expect(pod.Spec.Containers[0].Resources.Requests.Memory().Value()).To(Equal(int64(209715200)))
+		Expect(pod.Spec.Containers[0].Resources.Limits.Cpu()).ToNot(BeNil())
+		Expect(pod.Spec.Containers[0].Resources.Limits.Cpu().MilliValue()).To(Equal(int64(1000)))
+		Expect(pod.Spec.Containers[0].Resources.Limits.Memory()).ToNot(BeNil())
+		Expect(pod.Spec.Containers[0].Resources.Limits.Memory().Value()).To(Equal(int64(1073741824)))
 	},
 		Entry("PVC", createPVCVMExport, 3),
 		Entry("VM", populateVmExportVM, 4),
@@ -1209,17 +1225,17 @@ var _ = Describe("Export controller", func() {
 	}
 	It("Should properly expand instance types of VMs", func() {
 		vm := createVM()
-		testInstanceType := &instancetypev1alpha2.VirtualMachineInstancetype{
+		testInstanceType := &instancetypev1beta1.VirtualMachineInstancetype{
 			TypeMeta: metav1.TypeMeta{
 				Kind:       apiinstancetype.SingularResourceName,
-				APIVersion: instancetypev1alpha2.SchemeGroupVersion.String(),
+				APIVersion: instancetypev1beta1.SchemeGroupVersion.String(),
 			},
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-instance-type",
 				Namespace: vm.Namespace,
 			},
-			Spec: instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-				CPU: instancetypev1alpha2.CPUInstancetype{
+			Spec: instancetypev1beta1.VirtualMachineInstancetypeSpec{
+				CPU: instancetypev1beta1.CPUInstancetype{
 					Guest: uint32(2),
 				},
 			},
@@ -1239,17 +1255,17 @@ var _ = Describe("Export controller", func() {
 				Cores: uint32(1),
 			},
 		}
-		testInstanceType := &instancetypev1alpha2.VirtualMachineInstancetype{
+		testInstanceType := &instancetypev1beta1.VirtualMachineInstancetype{
 			TypeMeta: metav1.TypeMeta{
 				Kind:       apiinstancetype.SingularResourceName,
-				APIVersion: instancetypev1alpha2.SchemeGroupVersion.String(),
+				APIVersion: instancetypev1beta1.SchemeGroupVersion.String(),
 			},
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-instance-type",
 				Namespace: vm.Namespace,
 			},
-			Spec: instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-				CPU: instancetypev1alpha2.CPUInstancetype{
+			Spec: instancetypev1beta1.VirtualMachineInstancetypeSpec{
+				CPU: instancetypev1beta1.CPUInstancetype{
 					Guest: uint32(2),
 				},
 			},
@@ -1310,12 +1326,16 @@ var _ = Describe("Export controller", func() {
 
 	It("Should generate DataVolumes from VM", func() {
 		pvc := createPVC("pvc", string(cdiv1.DataVolumeKubeVirt))
+		pvc.Spec.DataSource = &k8sv1.TypedLocalObjectReference{}
+		pvc.Spec.DataSourceRef = &k8sv1.TypedObjectReference{}
 		pvcInformer.GetStore().Add(pvc)
 		vm := createVMWithDVTemplateAndPVC()
 		dvs := controller.generateDataVolumesFromVm(vm)
 		Expect(dvs).To(HaveLen(1))
 		Expect(dvs[0]).ToNot(BeNil())
 		Expect(dvs[0].Name).To((Equal("pvc")))
+		Expect(dvs[0].Spec.PVC.DataSource).To(BeNil())
+		Expect(dvs[0].Spec.PVC.DataSourceRef).To(BeNil())
 	})
 })
 

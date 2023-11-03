@@ -47,7 +47,7 @@ import (
 	"k8s.io/utils/pointer"
 
 	v1 "kubevirt.io/api/core/v1"
-	instancetypev1alpha2 "kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 	"kubevirt.io/client-go/kubecli"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
@@ -130,8 +130,13 @@ var _ = Describe("[rfe_id:1177][crit:medium][vendor:cnv-qe@redhat.com][level:com
 		BeforeEach(func() {
 			kv := util.GetCurrentKv(virtClient)
 			kubevirtConfiguration := kv.Spec.Configuration
+			kubevirtConfiguration.MachineType = ""
+			kubevirtConfiguration.ArchitectureConfiguration = &v1.ArchConfiguration{Amd64: &v1.ArchSpecificConfiguration{}, Arm64: &v1.ArchSpecificConfiguration{}, Ppc64le: &v1.ArchSpecificConfiguration{}}
 
-			kubevirtConfiguration.MachineType = testingMachineType
+			kubevirtConfiguration.ArchitectureConfiguration.Amd64.MachineType = testingMachineType
+			kubevirtConfiguration.ArchitectureConfiguration.Arm64.MachineType = testingMachineType
+			kubevirtConfiguration.ArchitectureConfiguration.Ppc64le.MachineType = testingMachineType
+
 			tests.UpdateKubeVirtConfigValueAndWait(kubevirtConfiguration)
 		})
 
@@ -1234,7 +1239,7 @@ var _ = Describe("[rfe_id:1177][crit:medium][vendor:cnv-qe@redhat.com][level:com
 				DescribeTable("with a failing VMI and the kubevirt.io/keep-launcher-alive-after-failure annotation", func(keepLauncher string) {
 					// The estimated execution time of one test is 400 seconds.
 					By("Creating a Kernel Boot VMI with a mismatched disk")
-					vmi := utils.GetVMIKernelBoot()
+					vmi := utils.GetVMIKernelBootWithRandName()
 					vmi.Spec.Domain.Firmware.KernelBoot.Container.Image = cd.ContainerDiskFor(cd.ContainerDiskCirros)
 
 					By("Creating a VM with RunStrategyManual")
@@ -1278,7 +1283,10 @@ var _ = Describe("[rfe_id:1177][crit:medium][vendor:cnv-qe@redhat.com][level:com
 							return false
 						}, 10*time.Second, 1*time.Second).Should(BeTrue())
 					} else {
-						Eventually(Expect(launcherPod.Status.Phase).To(Equal(k8sv1.PodFailed)), 160*time.Second, 1*time.Second).Should(BeTrue())
+						Eventually(launcherPod.Status.Phase).
+							Within(160 * time.Second).
+							WithPolling(time.Second).
+							Should(Equal(k8sv1.PodFailed))
 					}
 				},
 					Entry("[test_id:7164]VMI launcher pod should fail", "false"),
@@ -1304,7 +1312,7 @@ var _ = Describe("[rfe_id:1177][crit:medium][vendor:cnv-qe@redhat.com][level:com
 				})
 
 				It("should fail with non existing vm", func() {
-					expandCommand := clientcmd.NewRepeatableVirtctlCommand(virtctl.COMMAND_EXPAND, "--vm", "non-existing-vm")
+					expandCommand := clientcmd.NewRepeatableVirtctlCommand(virtctl.COMMAND_EXPAND, "--namespace", "default", "--vm", "non-existing-vm")
 					Expect(expandCommand()).To(MatchError("error expanding VirtualMachine - non-existing-vm in namespace - default: virtualmachine.kubevirt.io \"non-existing-vm\" not found"))
 				})
 
@@ -1365,7 +1373,7 @@ status:
 
 				It("should fail expanding invalid vm defined in file", func() {
 					Expect(os.WriteFile(file.Name(), []byte(invalidVmSpec), 0777)).To(Succeed())
-					expandCommand := clientcmd.NewRepeatableVirtctlCommand(virtctl.COMMAND_EXPAND, "--file", file.Name())
+					expandCommand := clientcmd.NewRepeatableVirtctlCommand(virtctl.COMMAND_EXPAND, "--namespace", "default", "--file", file.Name())
 					Expect(expandCommand()).To(MatchError("error expanding VirtualMachine - testvm in namespace - default: Object is not a valid VirtualMachine"))
 				})
 
@@ -1486,6 +1494,49 @@ status:
 			By("Verifying pod gets deleted")
 			expectedPodName := getExpectedPodName(vm)
 			waitForResourceDeletion(k8sClient, "pods", expectedPodName)
+		})
+
+		Context("Deleting a running VM with high TerminationGracePeriod via command line", func() {
+			DescribeTable("should force delete the VM", func(deleteFlags []string) {
+				By("getting a VM with a high TerminationGracePeriod")
+				vmi := libvmi.New(
+					libvmi.WithResourceMemory("128Mi"),
+					libvmi.WithTerminationGracePeriod(1600),
+				)
+				vm := tests.NewRandomVirtualMachine(vmi, true)
+				vm.Namespace = testsuite.GetTestNamespace(vm)
+
+				vmJson, err := tests.GenerateVMJson(vm, workDir)
+				Expect(err).ToNot(HaveOccurred(), "Cannot generate VMs manifest")
+
+				By("Creating VM using k8s client binary")
+				_, _, err = clientcmd.RunCommand(k8sClient, "create", "-f", vmJson)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("Waiting for VMI to start")
+				Eventually(ThisVMIWith(vm.Namespace, vm.Name), 240*time.Second, 1*time.Second).Should(BeRunning())
+
+				By("Checking that VM is running")
+				stdout, _, err := clientcmd.RunCommand(k8sClient, "describe", "vmis", vm.GetName())
+				Expect(err).ToNot(HaveOccurred())
+
+				Expect(vmRunningRe.FindString(stdout)).ToNot(Equal(""), "VMI is not Running")
+
+				By("Sending a force delete VM request using k8s client binary")
+				deleteCmd := append([]string{"delete", "vm", vm.GetName()}, deleteFlags...)
+				_, _, err = clientcmd.RunCommand(k8sClient, deleteCmd...)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("Verifying the VM gets deleted")
+				waitForResourceDeletion(k8sClient, "vms", vm.GetName())
+
+				By("Verifying pod gets deleted")
+				expectedPodName := getExpectedPodName(vm)
+				waitForResourceDeletion(k8sClient, "pods", expectedPodName)
+			},
+				Entry("when --force and --grace-period=0 are provided", []string{"--force", "--grace-period=0"}),
+				Entry("when --now is provided", []string{"--now"}),
+			)
 		})
 
 		Context("should not change anything if dry-run option is passed", func() {
@@ -1794,7 +1845,7 @@ status:
 				g.Expect(err).ToNot(HaveOccurred())
 				g.Expect(controller.HasFinalizer(vm, v1.VirtualMachineControllerFinalizer)).To(BeTrue())
 				g.Expect(controller.HasFinalizer(vm, customFinalizer)).To(BeTrue())
-			}, 2*time.Minute, 1*time.Second)
+			}, 2*time.Minute, 1*time.Second).Should(Succeed())
 
 			err = virtClient.VirtualMachine(testsuite.GetTestNamespace(vm)).Delete(context.Background(), vm.Name, &metav1.DeleteOptions{})
 			Expect(err).ToNot(HaveOccurred())
@@ -1804,20 +1855,20 @@ status:
 				g.Expect(err).ToNot(HaveOccurred())
 				g.Expect(controller.HasFinalizer(vm, v1.VirtualMachineControllerFinalizer)).To(BeFalse())
 				g.Expect(controller.HasFinalizer(vm, customFinalizer)).To(BeTrue())
-			}, 2*time.Minute, 1*time.Second)
+			}, 2*time.Minute, 1*time.Second).Should(Succeed())
 		})
 
 		It("should be removed when the vm has child resources, such as instance type ControllerRevisions, that have been deleted before the vm - issue #9438", func() {
 			By("creating a VirtualMachineClusterInstancetype")
-			instancetype := &instancetypev1alpha2.VirtualMachineClusterInstancetype{
+			instancetype := &instancetypev1beta1.VirtualMachineClusterInstancetype{
 				ObjectMeta: metav1.ObjectMeta{
 					GenerateName: "instancetype-",
 				},
-				Spec: instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-					CPU: instancetypev1alpha2.CPUInstancetype{
+				Spec: instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					CPU: instancetypev1beta1.CPUInstancetype{
 						Guest: uint32(1),
 					},
-					Memory: instancetypev1alpha2.MemoryInstancetype{
+					Memory: instancetypev1beta1.MemoryInstancetype{
 						Guest: resource.MustParse("64Mi"),
 					},
 				},
@@ -1844,7 +1895,7 @@ status:
 				g.Expect(controller.HasFinalizer(vm, v1.VirtualMachineControllerFinalizer)).To(BeTrue())
 				g.Expect(controller.HasFinalizer(vm, customFinalizer)).To(BeTrue())
 				g.Expect(vm.Spec.Instancetype.RevisionName).ToNot(BeEmpty())
-			}, 2*time.Minute, 1*time.Second)
+			}, 2*time.Minute, 1*time.Second).Should(Succeed())
 
 			vm, err = virtClient.VirtualMachine(vm.Namespace).Get(context.Background(), vm.Name, &k8smetav1.GetOptions{})
 			Expect(err).ToNot(HaveOccurred())
@@ -1867,7 +1918,7 @@ status:
 				g.Expect(err).ToNot(HaveOccurred())
 				g.Expect(controller.HasFinalizer(vm, v1.VirtualMachineControllerFinalizer)).To(BeFalse())
 				g.Expect(controller.HasFinalizer(vm, customFinalizer)).To(BeTrue())
-			}, 2*time.Minute, 1*time.Second)
+			}, 2*time.Minute, 1*time.Second).Should(Succeed())
 		})
 	})
 })

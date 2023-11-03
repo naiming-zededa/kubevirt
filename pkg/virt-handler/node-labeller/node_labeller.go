@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -57,12 +58,13 @@ var nodeLabellerLabels = []string{
 	kubevirtv1.HypervLabel,
 	kubevirtv1.RealtimeLabel,
 	kubevirtv1.SEVLabel,
+	kubevirtv1.SEVESLabel,
 	kubevirtv1.HostModelCPULabel,
 	kubevirtv1.HostModelRequiredFeaturesLabel,
 	kubevirtv1.NodeHostModelIsObsoleteLabel,
 }
 
-// NodeLabeller struct holds informations needed to run node-labeller
+// NodeLabeller struct holds information needed to run node-labeller
 type NodeLabeller struct {
 	recorder                record.EventRecorder
 	clientset               kubecli.KubevirtClient
@@ -157,10 +159,14 @@ func (n *NodeLabeller) loadAll() error {
 		return err
 	}
 
-	err = n.loadHostSupportedFeatures()
-	if err != nil {
-		n.logger.Errorf("node-labeller could not load supported features: " + err.Error())
-		return err
+	// host supported features is only available on AMD64 nodes.
+	// This is because hypervisor-cpu-baseline virsh command doesnt work for ARM64 architecture.
+	if virtconfig.IsAMD64(runtime.GOARCH) {
+		err = n.loadHostSupportedFeatures()
+		if err != nil {
+			n.logger.Errorf("node-labeller could not load supported features: " + err.Error())
+			return err
+		}
 	}
 
 	err = n.loadDomCapabilities()
@@ -193,23 +199,21 @@ func (n *NodeLabeller) run() error {
 
 	node := originalNode.DeepCopy()
 
-	if skipNode(node) {
-		return nil
+	if !skipNodeLabelling(node) {
+		//prepare new labels
+		newLabels := n.prepareLabels(node, cpuModels, cpuFeatures, hostCPUModel, obsoleteCPUsx86)
+		//remove old labeller labels
+		n.removeLabellerLabels(node)
+		//add new labels
+		n.addLabellerLabels(node, newLabels)
 	}
-
-	//prepare new labels
-	newLabels := n.prepareLabels(node, cpuModels, cpuFeatures, hostCPUModel, obsoleteCPUsx86)
-	//remove old labeller labels
-	n.removeLabellerLabels(node)
-	//add new labels
-	n.addLabellerLabels(node, newLabels)
 
 	err = n.patchNode(originalNode, node)
 
 	return err
 }
 
-func skipNode(node *v1.Node) bool {
+func skipNodeLabelling(node *v1.Node) bool {
 	_, exists := node.Annotations[kubevirtv1.LabellerSkipNodeAnnotation]
 	return exists
 }
@@ -292,7 +296,7 @@ func (n *NodeLabeller) prepareLabels(node *v1.Node, cpuModels []string, cpuFeatu
 		n.logger.Reason(err).Error("failed to get tsc cpu frequency, will continue without the tsc frequency label")
 	}
 
-	for feature, _ := range hostCpuModel.requiredFeatures {
+	for feature := range hostCpuModel.requiredFeatures {
 		newLabels[kubevirtv1.HostModelRequiredFeaturesLabel+feature] = "true"
 	}
 	if _, obsolete := obsoleteCPUsx86[hostCpuModel.Name]; obsolete {
@@ -318,11 +322,14 @@ func (n *NodeLabeller) prepareLabels(node *v1.Node, cpuModels []string, cpuFeatu
 		newLabels[kubevirtv1.SEVLabel] = ""
 	}
 
+	if n.SEV.SupportedES == "yes" {
+		newLabels[kubevirtv1.SEVESLabel] = ""
+	}
+
 	return newLabels
 }
 
-// addNodeLabels adds labels and special annotation to node.
-// annotations are needed because we need to know which labels were set by kubevirt.
+// addNodeLabels adds labels to node.
 func (n *NodeLabeller) addLabellerLabels(node *v1.Node, labels map[string]string) {
 	for key, value := range labels {
 		node.Labels[key] = value
@@ -404,7 +411,7 @@ func (n *NodeLabeller) shouldAddCPUModelLabel(
 		return false
 	}
 	missingFeatures := make([]string, 0)
-	for f, _ := range requiredFeatures {
+	for f := range requiredFeatures {
 		if _, isFeatureSupported := featureLabels[kubevirtv1.CPUFeatureLabel+f]; !isFeatureSupported {
 			missingFeatures = append(missingFeatures, f)
 		}

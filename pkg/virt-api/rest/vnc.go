@@ -10,7 +10,7 @@ import (
 
 	"kubevirt.io/kubevirt/pkg/virt-api/definitions"
 
-	restful "github.com/emicklei/go-restful"
+	restful "github.com/emicklei/go-restful/v3"
 	"k8s.io/apimachinery/pkg/api/errors"
 
 	v1 "kubevirt.io/api/core/v1"
@@ -159,6 +159,9 @@ func validateVMIForVNC(vmi *v1.VirtualMachineInstance) *errors.StatusError {
 		err := fmt.Errorf("No graphics devices are present.")
 		log.Log.Object(vmi).Reason(err).Error("Can't establish VNC connection.")
 		return errors.NewBadRequest(err.Error())
+	}
+	if !vmi.IsRunning() {
+		return errors.NewBadRequest(vmiNotRunning)
 	}
 	return nil
 }

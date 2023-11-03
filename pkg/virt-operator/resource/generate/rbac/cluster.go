@@ -41,6 +41,11 @@ const (
 	VMInstancesGuestOSInfo = "virtualmachineinstances/guestosinfo"
 	VMInstancesFileSysList = "virtualmachineinstances/filesystemlist"
 	VMInstancesUserList    = "virtualmachineinstances/userlist"
+
+	VMInstancesSEVFetchCertChain         = "virtualmachineinstances/sev/fetchcertchain"
+	VMInstancesSEVQueryLaunchMeasurement = "virtualmachineinstances/sev/querylaunchmeasurement"
+	VMInstancesSEVSetupSession           = "virtualmachineinstances/sev/setupsession"
+	VMInstancesSEVInjectLaunchSecret     = "virtualmachineinstances/sev/injectlaunchsecret"
 )
 
 func GetAllCluster() []runtime.Object {
@@ -50,6 +55,7 @@ func GetAllCluster() []runtime.Object {
 		newAdminClusterRole(),
 		newEditClusterRole(),
 		newViewClusterRole(),
+		newInstancetypeViewClusterRole(),
 	}
 }
 
@@ -147,6 +153,8 @@ func newAdminClusterRole() *rbacv1.ClusterRole {
 					VMInstancesGuestOSInfo,
 					VMInstancesFileSysList,
 					VMInstancesUserList,
+					VMInstancesSEVFetchCertChain,
+					VMInstancesSEVQueryLaunchMeasurement,
 				},
 				Verbs: []string{
 					"get",
@@ -164,7 +172,8 @@ func newAdminClusterRole() *rbacv1.ClusterRole {
 					"virtualmachineinstances/freeze",
 					"virtualmachineinstances/unfreeze",
 					"virtualmachineinstances/softreboot",
-					"virtualmachineinstances/addinterface",
+					VMInstancesSEVSetupSession,
+					VMInstancesSEVInjectLaunchSecret,
 				},
 				Verbs: []string{
 					"update",
@@ -194,7 +203,6 @@ func newAdminClusterRole() *rbacv1.ClusterRole {
 					"virtualmachines/removevolume",
 					"virtualmachines/migrate",
 					"virtualmachines/memorydump",
-					"virtualmachines/addinterface",
 				},
 				Verbs: []string{
 					"update",
@@ -327,6 +335,8 @@ func newEditClusterRole() *rbacv1.ClusterRole {
 					VMInstancesGuestOSInfo,
 					VMInstancesFileSysList,
 					VMInstancesUserList,
+					VMInstancesSEVFetchCertChain,
+					VMInstancesSEVQueryLaunchMeasurement,
 				},
 				Verbs: []string{
 					"get",
@@ -344,7 +354,8 @@ func newEditClusterRole() *rbacv1.ClusterRole {
 					"virtualmachineinstances/freeze",
 					"virtualmachineinstances/unfreeze",
 					"virtualmachineinstances/softreboot",
-					"virtualmachineinstances/addinterface",
+					VMInstancesSEVSetupSession,
+					VMInstancesSEVInjectLaunchSecret,
 				},
 				Verbs: []string{
 					"update",
@@ -374,7 +385,6 @@ func newEditClusterRole() *rbacv1.ClusterRole {
 					"virtualmachines/removevolume",
 					"virtualmachines/migrate",
 					"virtualmachines/memorydump",
-					"virtualmachines/addinterface",
 				},
 				Verbs: []string{
 					"update",
@@ -515,6 +525,8 @@ func newViewClusterRole() *rbacv1.ClusterRole {
 					VMInstancesGuestOSInfo,
 					VMInstancesFileSysList,
 					VMInstancesUserList,
+					VMInstancesSEVFetchCertChain,
+					VMInstancesSEVQueryLaunchMeasurement,
 				},
 				Verbs: []string{
 					"get",
@@ -612,6 +624,31 @@ func newViewClusterRole() *rbacv1.ClusterRole {
 				},
 				Resources: []string{
 					migrations.ResourceMigrationPolicies,
+				},
+				Verbs: []string{
+					"get", "list", "watch",
+				},
+			},
+		},
+	}
+}
+func newInstancetypeViewClusterRole() *rbacv1.ClusterRole {
+	return &rbacv1.ClusterRole{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: VersionNamev1,
+			Kind:       "ClusterRole",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "instancetype.kubevirt.io:view",
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{
+					GroupNameInstancetype,
+				},
+				Resources: []string{
+					instancetype.ClusterPluralResourceName,
+					instancetype.ClusterPluralPreferenceResourceName,
 				},
 				Verbs: []string{
 					"get", "list", "watch",

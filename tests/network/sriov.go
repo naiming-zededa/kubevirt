@@ -28,6 +28,8 @@ import (
 	"strings"
 	"time"
 
+	"kubevirt.io/kubevirt/tests/libmigration"
+
 	"kubevirt.io/kubevirt/tests/framework/kubevirt"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -356,8 +358,8 @@ var _ = Describe("[Serial]SRIOV", Serial, decorators.SRIOV, func() {
 			It("should be successful with a running VMI on the target", func() {
 				By("starting the migration")
 				migration := tests.NewRandomMigration(vmi.Name, vmi.Namespace)
-				migration = tests.RunMigrationAndExpectCompletion(virtClient, migration, tests.MigrationWaitTime)
-				tests.ConfirmVMIPostMigration(virtClient, vmi, migration)
+				migration = libmigration.RunMigrationAndExpectToCompleteWithDefaultTimeout(virtClient, migration)
+				libmigration.ConfirmVMIPostMigration(virtClient, vmi, migration)
 
 				// It may take some time for the VMI interface status to be updated with the information reported by
 				// the guest-agent.
@@ -712,7 +714,7 @@ func waitVMI(vmi *v1.VirtualMachineInstance) (*v1.VirtualMachineInstance, error)
 	// Kubevirt re-enqueue the request once it happens, so its safe to ignore this warning.
 	// see https://github.com/kubevirt/kubevirt/issues/5027
 	warningsIgnoreList := []string{"unknown error encountered sending command SyncVMI: rpc error: code = DeadlineExceeded desc = context deadline exceeded"}
-	libwait.WaitUntilVMIReadyIgnoreSelectedWarnings(vmi, console.LoginToFedora, warningsIgnoreList)
+	libwait.WaitUntilVMIReady(vmi, console.LoginToFedora, libwait.WithWarningsIgnoreList(warningsIgnoreList))
 
 	virtClient := kubevirt.Client()
 

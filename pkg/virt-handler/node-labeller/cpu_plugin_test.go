@@ -45,39 +45,39 @@ const (
 	x86PenrynXml = "x86_Penryn.xml"
 )
 
-var nlController *NodeLabeller
-
-var _ = BeforeSuite(func() {
-	ctrl := gomock.NewController(GinkgoT())
-	virtClient := kubecli.NewMockKubevirtClient(ctrl)
-
-	kv := &kubevirtv1.KubeVirt{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "kubevirt",
-			Namespace: "kubevirt",
-		},
-		Spec: kubevirtv1.KubeVirtSpec{
-			Configuration: kubevirtv1.KubeVirtConfiguration{
-				ObsoleteCPUModels: util.DefaultObsoleteCPUModels,
-				MinCPUModel:       util.DefaultMinCPUModel,
-			},
-		},
-	}
-
-	clusterConfig, _, _ := testutils.NewFakeClusterConfigUsingKV(kv)
-
-	nlController = &NodeLabeller{
-		namespace:               k8sv1.NamespaceDefault,
-		clientset:               virtClient,
-		clusterConfig:           clusterConfig,
-		logger:                  log.DefaultLogger(),
-		volumePath:              "testdata",
-		domCapabilitiesFileName: "virsh_domcapabilities.xml",
-		hostCPUModel:            hostCPUModel{requiredFeatures: make(map[string]bool, 0)},
-	}
-})
-
 var _ = Describe("Node-labeller config", func() {
+	var nlController *NodeLabeller
+
+	BeforeEach(func() {
+		ctrl := gomock.NewController(GinkgoT())
+		virtClient := kubecli.NewMockKubevirtClient(ctrl)
+
+		kv := &kubevirtv1.KubeVirt{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "kubevirt",
+				Namespace: "kubevirt",
+			},
+			Spec: kubevirtv1.KubeVirtSpec{
+				Configuration: kubevirtv1.KubeVirtConfiguration{
+					ObsoleteCPUModels: util.DefaultObsoleteCPUModels,
+					MinCPUModel:       util.DefaultMinCPUModel,
+				},
+			},
+		}
+
+		clusterConfig, _, _ := testutils.NewFakeClusterConfigUsingKV(kv)
+
+		nlController = &NodeLabeller{
+			namespace:               k8sv1.NamespaceDefault,
+			clientset:               virtClient,
+			clusterConfig:           clusterConfig,
+			logger:                  log.DefaultLogger(),
+			volumePath:              "testdata",
+			domCapabilitiesFileName: "virsh_domcapabilities.xml",
+			hostCPUModel:            hostCPUModel{requiredFeatures: make(map[string]bool, 0)},
+		}
+	})
+
 	It("should return correct cpu file path", func() {
 		p := getPathCPUFeatures(nlController.volumePath, x86PenrynXml)
 		correctPath := path.Join(nlController.volumePath, "cpu_map", x86PenrynXml)
@@ -130,6 +130,8 @@ var _ = Describe("Node-labeller config", func() {
 		err = nlController.loadCPUInfo()
 		Expect(err).ToNot(HaveOccurred())
 
+		Expect(nlController.loadHostSupportedFeatures()).To(Succeed())
+
 		cpuModels := nlController.getSupportedCpuModels(nlController.clusterConfig.GetObsoleteCPUModels())
 		cpuFeatures := nlController.getSupportedCpuFeatures()
 
@@ -142,7 +144,11 @@ var _ = Describe("Node-labeller config", func() {
 		var hostCpuModel hostCPUModel
 
 		BeforeEach(func() {
-			err := nlController.loadHostSupportedFeatures()
+			nlController.domCapabilitiesFileName = "virsh_domcapabilities.xml"
+			err := nlController.loadDomCapabilities()
+			Expect(err).ToNot(HaveOccurred())
+
+			err = nlController.loadHostSupportedFeatures()
 			Expect(err).ToNot(HaveOccurred())
 
 			hostCpuModel = nlController.GetHostCpuModel()
@@ -165,25 +171,44 @@ var _ = Describe("Node-labeller config", func() {
 	})
 
 	Context("return correct SEV capabilities", func() {
-		It("when SEV is supported", func() {
-			nlController.domCapabilitiesFileName = "domcapabilities_sev.xml"
-			err := nlController.loadDomCapabilities()
-			Expect(err).ToNot(HaveOccurred())
+		DescribeTable("for SEV and SEV-ES",
+			func(isSupported bool, withES bool) {
+				if isSupported && withES {
+					nlController.domCapabilitiesFileName = "domcapabilities_sev.xml"
+				} else if isSupported {
+					nlController.domCapabilitiesFileName = "domcapabilities_noseves.xml"
+				} else {
+					nlController.domCapabilitiesFileName = "domcapabilities_nosev.xml"
+				}
+				err := nlController.loadDomCapabilities()
+				Expect(err).ToNot(HaveOccurred())
 
-			Expect(nlController.SEV.Supported).To(Equal("yes"))
-			Expect(nlController.SEV.Cbitpos).To(Equal("47"))
-			Expect(nlController.SEV.ReducedPhysBits).To(Equal("1"))
-		})
+				if isSupported {
+					Expect(nlController.SEV.Supported).To(Equal("yes"))
+					Expect(nlController.SEV.CBitPos).To(Equal(uint(47)))
+					Expect(nlController.SEV.ReducedPhysBits).To(Equal(uint(1)))
+					Expect(nlController.SEV.MaxGuests).To(Equal(uint(15)))
 
-		It("when SEV is not supported", func() {
-			nlController.domCapabilitiesFileName = "domcapabilities_nosev.xml"
-			err := nlController.loadDomCapabilities()
-			Expect(err).ToNot(HaveOccurred())
-
-			Expect(nlController.SEV.Supported).To(Equal("no"))
-			Expect(nlController.SEV.Cbitpos).To(BeEmpty())
-			Expect(nlController.SEV.ReducedPhysBits).To(BeEmpty())
-		})
+					if withES {
+						Expect(nlController.SEV.SupportedES).To(Equal("yes"))
+						Expect(nlController.SEV.MaxESGuests).To(Equal(uint(15)))
+					} else {
+						Expect(nlController.SEV.SupportedES).To(Equal("no"))
+						Expect(nlController.SEV.MaxESGuests).To(BeZero())
+					}
+				} else {
+					Expect(nlController.SEV.Supported).To(Equal("no"))
+					Expect(nlController.SEV.CBitPos).To(BeZero())
+					Expect(nlController.SEV.ReducedPhysBits).To(BeZero())
+					Expect(nlController.SEV.MaxGuests).To(BeZero())
+					Expect(nlController.SEV.SupportedES).To(Equal("no"))
+					Expect(nlController.SEV.MaxESGuests).To(BeZero())
+				}
+			},
+			Entry("when only SEV is supported", true, false),
+			Entry("when both SEV and SEV-ES are supported", true, true),
+			Entry("when neither SEV nor SEV-ES are supported", false, false),
+		)
 	})
 
 	It("Make sure proper labels are removed on removeLabellerLabels()", func() {

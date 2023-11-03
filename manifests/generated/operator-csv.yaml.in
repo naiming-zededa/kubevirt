@@ -122,8 +122,8 @@ spec:
 
     # Start using KubeVirt
 
-      * Try our quickstart at [kubevirt.io](http://kubevirt.io/get_kubevirt/).
-      * See our user documentation at [kubevirt.io/docs](http://kubevirt.io/user-guide).
+      * Try our quickstart at [kubevirt.io](https://kubevirt.io/get_kubevirt/).
+      * See our user documentation at [kubevirt.io/docs](https://kubevirt.io/user-guide).
 
     # Start developing KubeVirt
 
@@ -331,22 +331,6 @@ spec:
           - watch
           - patch
         - apiGroups:
-          - flavor.kubevirt.io
-          resources:
-          - virtualmachineflavors
-          - virtualmachineclusterflavors
-          - virtualmachinepreferences
-          - virtualmachineclusterpreferences
-          verbs:
-          - get
-          - delete
-          - create
-          - update
-          - patch
-          - list
-          - watch
-          - deletecollection
-        - apiGroups:
           - ""
           resources:
           - pods
@@ -441,6 +425,14 @@ spec:
           resources:
           - datasources
           - datavolumes
+          verbs:
+          - get
+          - list
+          - watch
+        - apiGroups:
+          - ""
+          resources:
+          - namespaces
           verbs:
           - get
           - list
@@ -627,7 +619,8 @@ spec:
           - virtualmachineinstances/freeze
           - virtualmachineinstances/unfreeze
           - virtualmachineinstances/softreboot
-          - virtualmachineinstances/addinterface
+          - virtualmachineinstances/sev/setupsession
+          - virtualmachineinstances/sev/injectlaunchsecret
           verbs:
           - update
         - apiGroups:
@@ -642,8 +635,6 @@ spec:
           - network-attachment-definitions
           verbs:
           - get
-          - list
-          - watch
         - apiGroups:
           - apiextensions.k8s.io
           resources:
@@ -724,6 +715,13 @@ spec:
           verbs:
           - get
         - apiGroups:
+          - ""
+          resources:
+          - resourcequotas
+          verbs:
+          - list
+          - watch
+        - apiGroups:
           - route.openshift.io
           resources:
           - routes
@@ -747,6 +745,18 @@ spec:
           - list
           - get
           - watch
+        - apiGroups:
+          - coordination.k8s.io
+          resources:
+          - leases
+          verbs:
+          - get
+          - list
+          - watch
+          - delete
+          - update
+          - create
+          - patch
         - apiGroups:
           - kubevirt.io
           resources:
@@ -854,6 +864,8 @@ spec:
           - virtualmachineinstances/guestosinfo
           - virtualmachineinstances/filesystemlist
           - virtualmachineinstances/userlist
+          - virtualmachineinstances/sev/fetchcertchain
+          - virtualmachineinstances/sev/querylaunchmeasurement
           verbs:
           - get
         - apiGroups:
@@ -866,7 +878,8 @@ spec:
           - virtualmachineinstances/freeze
           - virtualmachineinstances/unfreeze
           - virtualmachineinstances/softreboot
-          - virtualmachineinstances/addinterface
+          - virtualmachineinstances/sev/setupsession
+          - virtualmachineinstances/sev/injectlaunchsecret
           verbs:
           - update
         - apiGroups:
@@ -886,7 +899,6 @@ spec:
           - virtualmachines/removevolume
           - virtualmachines/migrate
           - virtualmachines/memorydump
-          - virtualmachines/addinterface
           verbs:
           - update
         - apiGroups:
@@ -1000,6 +1012,8 @@ spec:
           - virtualmachineinstances/guestosinfo
           - virtualmachineinstances/filesystemlist
           - virtualmachineinstances/userlist
+          - virtualmachineinstances/sev/fetchcertchain
+          - virtualmachineinstances/sev/querylaunchmeasurement
           verbs:
           - get
         - apiGroups:
@@ -1012,7 +1026,8 @@ spec:
           - virtualmachineinstances/freeze
           - virtualmachineinstances/unfreeze
           - virtualmachineinstances/softreboot
-          - virtualmachineinstances/addinterface
+          - virtualmachineinstances/sev/setupsession
+          - virtualmachineinstances/sev/injectlaunchsecret
           verbs:
           - update
         - apiGroups:
@@ -1032,7 +1047,6 @@ spec:
           - virtualmachines/removevolume
           - virtualmachines/migrate
           - virtualmachines/memorydump
-          - virtualmachines/addinterface
           verbs:
           - update
         - apiGroups:
@@ -1144,6 +1158,8 @@ spec:
           - virtualmachineinstances/guestosinfo
           - virtualmachineinstances/filesystemlist
           - virtualmachineinstances/userlist
+          - virtualmachineinstances/sev/fetchcertchain
+          - virtualmachineinstances/sev/querylaunchmeasurement
           verbs:
           - get
         - apiGroups:
@@ -1213,6 +1229,15 @@ spec:
           - migrations.kubevirt.io
           resources:
           - migrationpolicies
+          verbs:
+          - get
+          - list
+          - watch
+        - apiGroups:
+          - instancetype.kubevirt.io
+          resources:
+          - virtualmachineclusterinstancetypes
+          - virtualmachineclusterpreferences
           verbs:
           - get
           - list
@@ -1394,6 +1419,18 @@ spec:
           - routes/custom-host
           verbs:
           - create
+        - apiGroups:
+          - coordination.k8s.io
+          resources:
+          - leases
+          verbs:
+          - get
+          - list
+          - watch
+          - delete
+          - update
+          - create
+          - patch
         serviceAccountName: kubevirt-operator
     strategy: deployment
   installModes:

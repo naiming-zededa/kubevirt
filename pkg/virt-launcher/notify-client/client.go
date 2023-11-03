@@ -1,6 +1,7 @@
 package eventsclient
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -8,7 +9,6 @@ import (
 
 	"kubevirt.io/kubevirt/pkg/virt-launcher/metadata"
 
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"k8s.io/apimachinery/pkg/runtime"
 	"libvirt.org/go/libvirt"
@@ -92,7 +92,8 @@ func init() {
 }
 
 func negotiateVersion(infoClient info.NotifyInfoClient) (uint32, error) {
-	ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	info, err := infoClient.Info(ctx, &info.NotifyInfoRequest{})
 	if err != nil {
 		return 0, fmt.Errorf("could not check cmd server version: %v", err)
@@ -440,22 +441,26 @@ func (n *Notifier) StartDomainNotifier(
 				n.SendDomainEvent(newWatchEventError(fmt.Errorf("Libvirt reconnect, domain %s", domainName)))
 
 			case <-metadataCache.Listen():
-				domainCache = util.NewDomainFromName(
-					util.DomainFromNamespaceName(domainCache.ObjectMeta.Namespace, domainCache.ObjectMeta.Name),
-					vmi.UID,
-				)
-				eventCallback(
-					domainConn,
-					domainCache,
-					libvirtEvent{},
-					n,
-					deleteNotificationSent,
-					interfaceStatuses,
-					guestOsInfo,
-					vmi,
-					fsFreezeStatus,
-					metadataCache,
-				)
+				// Metadata cache updates should be processed only *after* at least one
+				// libvirt event arrived (which creates the first domainCache).
+				if domainCache != nil {
+					domainCache = util.NewDomainFromName(
+						util.DomainFromNamespaceName(domainCache.ObjectMeta.Namespace, domainCache.ObjectMeta.Name),
+						vmi.UID,
+					)
+					eventCallback(
+						domainConn,
+						domainCache,
+						libvirtEvent{},
+						n,
+						deleteNotificationSent,
+						interfaceStatuses,
+						guestOsInfo,
+						vmi,
+						fsFreezeStatus,
+						metadataCache,
+					)
+				}
 			}
 		}
 	}()
@@ -501,6 +506,20 @@ func (n *Notifier) StartDomainNotifier(
 		}
 	}
 
+	domainEventMemoryDeviceSizeChange := func(c *libvirt.Connect, d *libvirt.Domain, event *libvirt.DomainEventMemoryDeviceSizeChange) {
+		log.Log.Infof("Domain Memory Device size-change event received")
+		name, err := d.GetName()
+		if err != nil {
+			log.Log.Reason(err).Info(cantDetermineLibvirtDomainName)
+		}
+
+		select {
+		case eventChan <- libvirtEvent{Domain: name}:
+		default:
+			log.Log.Infof(libvirtEventChannelFull)
+		}
+	}
+
 	err := domainConn.DomainEventLifecycleRegister(domainEventLifecycleCallback)
 	if err != nil {
 		log.Log.Reason(err).Errorf("failed to register event callback with libvirt")
@@ -515,6 +534,11 @@ func (n *Notifier) StartDomainNotifier(
 	err = domainConn.DomainEventDeviceRemovedRegister(domainEventDeviceRemovedCallback)
 	if err != nil {
 		log.Log.Reason(err).Errorf("failed to register device removed event callback with libvirt")
+		return err
+	}
+	err = domainConn.DomainEventMemoryDeviceSizeChangeRegister(domainEventMemoryDeviceSizeChange)
+	if err != nil {
+		log.Log.Reason(err).Errorf("failed to register memory device size change event callback with libvirt")
 		return err
 	}
 

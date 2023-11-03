@@ -66,7 +66,7 @@ var _ = Describe("[sig-compute]MultiQueue", decorators.SigCompute, func() {
 		})
 
 		DescribeTable("should be able to successfully boot fedora to the login prompt with multi-queue without being blocked by selinux", func(interfaceModel string, expectedQueueCount int32) {
-			vmi := tests.NewRandomFedoraVMIWithGuestAgent()
+			vmi := tests.NewRandomFedoraVMI()
 			Expect(numCpus).To(BeNumerically("<=", availableCPUs),
 				fmt.Sprintf("Testing environment only has nodes with %d CPUs available, but required are %d CPUs", availableCPUs, numCpus),
 			)
@@ -79,7 +79,7 @@ var _ = Describe("[sig-compute]MultiQueue", decorators.SigCompute, func() {
 			By("Creating and starting the VMI")
 			vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vmi)
 			Expect(err).ToNot(HaveOccurred())
-			vmi = libwait.WaitForSuccessfulVMIStartWithTimeout(vmi, 360)
+			vmi = libwait.WaitForSuccessfulVMIStart(vmi)
 
 			By("Checking if we can login")
 			Expect(console.LoginToFedora(vmi)).To(Succeed())
@@ -143,7 +143,7 @@ var _ = Describe("[sig-compute]MultiQueue", decorators.SigCompute, func() {
 			By("Creating and starting the VMI")
 			vmi, err := virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vmi)
 			Expect(err).ToNot(HaveOccurred())
-			libwait.WaitForSuccessfulVMIStartWithTimeout(vmi, 360)
+			libwait.WaitForSuccessfulVMIStart(vmi)
 
 			By("Fetching Domain XML from running pod")
 			domain, err := tests.GetRunningVirtualMachineInstanceDomainXML(virtClient, vmi)

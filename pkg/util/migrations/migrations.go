@@ -23,8 +23,8 @@ func ListUnfinishedMigrations(informer cache.SharedIndexInformer) []*v1.VirtualM
 	return migrations
 }
 
-func FilterRunningMigrations(migrations []v1.VirtualMachineInstanceMigration) []v1.VirtualMachineInstanceMigration {
-	runningMigrations := []v1.VirtualMachineInstanceMigration{}
+func FilterRunningMigrations(migrations []*v1.VirtualMachineInstanceMigration) []*v1.VirtualMachineInstanceMigration {
+	runningMigrations := []*v1.VirtualMachineInstanceMigration{}
 	for _, migration := range migrations {
 		if migration.IsRunning() {
 			runningMigrations = append(runningMigrations, migration)
@@ -72,5 +72,14 @@ func VMIEvictionStrategy(clusterConfig *virtconfig.ClusterConfig, vmi *v1.Virtua
 
 func VMIMigratableOnEviction(clusterConfig *virtconfig.ClusterConfig, vmi *v1.VirtualMachineInstance) bool {
 	strategy := VMIEvictionStrategy(clusterConfig, vmi)
-	return strategy != nil && *strategy == v1.EvictionStrategyLiveMigrate
+	if strategy == nil {
+		return false
+	}
+	switch *strategy {
+	case v1.EvictionStrategyLiveMigrate:
+		return true
+	case v1.EvictionStrategyLiveMigrateIfPossible:
+		return vmi.IsMigratable()
+	}
+	return false
 }

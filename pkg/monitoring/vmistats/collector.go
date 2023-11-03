@@ -28,7 +28,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	k6tv1 "kubevirt.io/api/core/v1"
-	instancetypev1alpha2 "kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 
 	"kubevirt.io/client-go/log"
 
@@ -164,7 +164,7 @@ func (co *VMICollector) setInstancetypeFromAnnotations(vmc *vmiCountMetric, anno
 			return
 		}
 
-		vendorName := obj.(*instancetypev1alpha2.VirtualMachineInstancetype).Labels[instancetypeVendorLabel]
+		vendorName := obj.(*instancetypev1beta1.VirtualMachineInstancetype).Labels[instancetypeVendorLabel]
 		if _, isWhitelisted := whitelistedInstanceTypeVendors[vendorName]; isWhitelisted {
 			vmc.InstanceType = instancetypeName
 		}
@@ -178,7 +178,7 @@ func (co *VMICollector) setInstancetypeFromAnnotations(vmc *vmiCountMetric, anno
 			return
 		}
 
-		vendorName := obj.(*instancetypev1alpha2.VirtualMachineClusterInstancetype).Labels[instancetypeVendorLabel]
+		vendorName := obj.(*instancetypev1beta1.VirtualMachineClusterInstancetype).Labels[instancetypeVendorLabel]
 		if _, isWhitelisted := whitelistedInstanceTypeVendors[vendorName]; isWhitelisted {
 			vmc.InstanceType = instancetypeName
 		}
@@ -194,7 +194,7 @@ func (co *VMICollector) setPreferenceFromAnnotations(vmc *vmiCountMetric, annota
 			return
 		}
 
-		vendorName := obj.(*instancetypev1alpha2.VirtualMachinePreference).Labels[instancetypeVendorLabel]
+		vendorName := obj.(*instancetypev1beta1.VirtualMachinePreference).Labels[instancetypeVendorLabel]
 		if _, isWhitelisted := whitelistedInstanceTypeVendors[vendorName]; isWhitelisted {
 			vmc.Preference = instancetypeName
 		}
@@ -208,7 +208,7 @@ func (co *VMICollector) setPreferenceFromAnnotations(vmc *vmiCountMetric, annota
 			return
 		}
 
-		vendorName := obj.(*instancetypev1alpha2.VirtualMachineClusterPreference).Labels[instancetypeVendorLabel]
+		vendorName := obj.(*instancetypev1beta1.VirtualMachineClusterPreference).Labels[instancetypeVendorLabel]
 		if _, isWhitelisted := whitelistedInstanceTypeVendors[vendorName]; isWhitelisted {
 			vmc.Preference = instancetypeName
 		}
@@ -250,7 +250,7 @@ func (co *VMICollector) updateVMIsPhase(vmis []*k6tv1.VirtualMachineInstance, ch
 		mv, err := prometheus.NewConstMetric(
 			vmiCountDesc, prometheus.GaugeValue,
 			float64(count),
-			vmc.NodeName, vmc.Phase, vmc.OS, vmc.Workload, vmc.Flavor, vmc.InstanceType,
+			vmc.NodeName, vmc.Phase, vmc.OS, vmc.Workload, vmc.Flavor, vmc.InstanceType, vmc.Preference,
 		)
 		if err != nil {
 			log.Log.Reason(err).Errorf("Failed to create metric for VMIs phase")

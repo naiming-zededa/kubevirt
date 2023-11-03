@@ -22,6 +22,7 @@ import (
 
 	"k8s.io/client-go/testing"
 
+	instancetypeapi "kubevirt.io/api/instancetype"
 	fakecdiclient "kubevirt.io/client-go/generated/containerized-data-importer/clientset/versioned/fake"
 	"kubevirt.io/client-go/kubecli"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
@@ -40,13 +41,19 @@ const (
 	podPhaseAnnotation              = "cdi.kubevirt.io/storage.pod.phase"
 	podReadyAnnotation              = "cdi.kubevirt.io/storage.pod.ready"
 	deleteAfterCompletionAnnotation = "cdi.kubevirt.io/storage.deleteAfterCompletion"
+	UsePopulatorAnnotation          = "cdi.kubevirt.io/storage.usePopulator"
+	PVCPrimeNameAnnotation          = "cdi.kubevirt.io/storage.populator.pvcPrime"
 )
 
 const (
-	targetNamespace = "default"
-	targetName      = "test-volume"
-	pvcSize         = "500Mi"
-	configName      = "config"
+	targetNamespace         = "default"
+	targetName              = "test-volume"
+	pvcSize                 = "500Mi"
+	configName              = "config"
+	defaultInstancetypeName = "instancetype"
+	defaultInstancetypeKind = "VirtualMachineInstancetype"
+	defaultPreferenceName   = "preference"
+	defaultPreferenceKind   = "VirtualMachinePreference"
 )
 
 var _ = Describe("ImageUpload", func() {
@@ -164,7 +171,7 @@ var _ = Describe("ImageUpload", func() {
 		return spec
 	}
 
-	dvSpecWithWaitForFirstConsumer := func() *cdiv1.DataVolume {
+	dvSpecWithPhase := func(phase cdiv1.DataVolumePhase) *cdiv1.DataVolume {
 		dv := &cdiv1.DataVolume{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      targetName,
@@ -174,11 +181,11 @@ var _ = Describe("ImageUpload", func() {
 				APIVersion: cdiv1.SchemeGroupVersion.String(),
 				Kind:       "DataVolume",
 			},
-			Status: cdiv1.DataVolumeStatus{Phase: cdiv1.WaitForFirstConsumer},
 			Spec: cdiv1.DataVolumeSpec{
 				Source: &cdiv1.DataVolumeSource{Upload: &cdiv1.DataVolumeSourceUpload{}},
 				PVC:    &v1.PersistentVolumeClaimSpec{},
 			},
+			Status: cdiv1.DataVolumeStatus{Phase: phase},
 		}
 		return dv
 	}
@@ -379,6 +386,26 @@ var _ = Describe("ImageUpload", func() {
 		validateDataVolumeArgs(dv, v1.PersistentVolumeFilesystem)
 	}
 
+	validateDefaultInstancetypeLabels := func(labels map[string]string) {
+		Expect(labels).ToNot(BeNil())
+		Expect(labels).To(HaveKeyWithValue(instancetypeapi.DefaultInstancetypeLabel, defaultInstancetypeName))
+		Expect(labels).To(HaveKeyWithValue(instancetypeapi.DefaultInstancetypeKindLabel, defaultInstancetypeKind))
+		Expect(labels).To(HaveKeyWithValue(instancetypeapi.DefaultPreferenceLabel, defaultPreferenceName))
+		Expect(labels).To(HaveKeyWithValue(instancetypeapi.DefaultPreferenceKindLabel, defaultPreferenceKind))
+	}
+
+	validatePVCDefaultInstancetypeLabels := func() {
+		pvc, err := kubeClient.CoreV1().PersistentVolumeClaims(targetNamespace).Get(context.Background(), targetName, metav1.GetOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		validateDefaultInstancetypeLabels(pvc.ObjectMeta.Labels)
+	}
+
+	validateDataVolumeDefaultInstancetypeLabels := func() {
+		dv, err := cdiClient.CdiV1beta1().DataVolumes(targetNamespace).Get(context.Background(), targetName, metav1.GetOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		validateDefaultInstancetypeLabels(dv.ObjectMeta.Labels)
+	}
+
 	expectedStorageClassMatchesActual := func(storageClass string) {
 		pvc, err := kubeClient.CoreV1().PersistentVolumeClaims(targetNamespace).Get(context.Background(), targetName, metav1.GetOptions{})
 		Expect(err).ToNot(HaveOccurred())
@@ -546,7 +573,7 @@ var _ = Describe("ImageUpload", func() {
 			validateDataVolume()
 		})
 
-		It("Create a VolumeMode=Block PVC", func() {
+		DescribeTable("Create a VolumeMode=Block PVC", func(flag string) {
 			testInit(http.StatusOK)
 			cmd := clientcmd.NewRepeatableVirtctlCommand(commandName, "dv", targetName, "--size", pvcSize,
 				"--insecure", "--image-path", imagePath, "--block-volume")
@@ -554,6 +581,19 @@ var _ = Describe("ImageUpload", func() {
 			Expect(dvCreateCalled.IsTrue()).To(BeTrue())
 			validateBlockPVC()
 			validateBlockDataVolume()
+		},
+			Entry("using deprecated flag", "--block-volume"),
+			Entry("using VolumeMode flag", "-volume-mode=block"),
+		)
+
+		It("Create a VolumeMode=Filesystem PVC using volume-mode flag", func() {
+			testInit(http.StatusOK)
+			cmd := clientcmd.NewRepeatableVirtctlCommand(commandName, "dv", targetName, "--size", pvcSize,
+				"--insecure", "--image-path", imagePath, "--volume-mode", "filesystem")
+			Expect(cmd()).To(Succeed())
+			Expect(dvCreateCalled.IsTrue()).To(BeTrue())
+			validatePVC()
+			validateDataVolume()
 		})
 
 		It("Create a non-default storage class PVC", func() {
@@ -621,6 +661,45 @@ var _ = Describe("ImageUpload", func() {
 			Expect(dvCreateCalled.IsTrue()).To(BeFalse())
 		})
 
+		It("Should set default instance type and preference labels on DataVolume", func() {
+			testInit(http.StatusOK)
+			cmd := clientcmd.NewRepeatableVirtctlCommand(
+				commandName, "dv", targetName,
+				"--size", pvcSize,
+				"--uploadproxy-url", server.URL,
+				"--insecure",
+				"--image-path", imagePath,
+				"--default-instancetype", defaultInstancetypeName,
+				"--default-instancetype-kind", defaultInstancetypeKind,
+				"--default-preference", defaultPreferenceName,
+				"--default-preference-kind", defaultPreferenceKind,
+			)
+			Expect(cmd()).To(Succeed())
+			Expect(dvCreateCalled.IsTrue()).To(BeTrue())
+			validatePVC()
+			validateDataVolume()
+			validateDataVolumeDefaultInstancetypeLabels()
+		})
+
+		It("Should set default instance type and preference labels on PVC", func() {
+			testInit(http.StatusOK)
+			cmd := clientcmd.NewRepeatableVirtctlCommand(
+				commandName, "pvc", targetName,
+				"--size", pvcSize,
+				"--uploadproxy-url", server.URL,
+				"--insecure",
+				"--image-path", imagePath,
+				"--default-instancetype", defaultInstancetypeName,
+				"--default-instancetype-kind", defaultInstancetypeKind,
+				"--default-preference", defaultPreferenceName,
+				"--default-preference-kind", defaultPreferenceKind,
+			)
+			Expect(cmd()).To(Succeed())
+			Expect(pvcCreateCalled.IsTrue()).To(BeTrue())
+			validatePVC()
+			validatePVCDefaultInstancetypeLabels()
+		})
+
 		AfterEach(func() {
 			testDone()
 		})
@@ -654,19 +733,85 @@ var _ = Describe("ImageUpload", func() {
 			Expect(err.Error()).Should(ContainSubstring("doesn't have archive contentType annotation"))
 		})
 
-		It("DV in phase WaitForFirstConsumer", func() {
+		It("DV is using populators and target PVC is bound", func() {
+			dv := dvSpecWithPhase(cdiv1.UploadReady)
+			dv.Annotations = map[string]string{UsePopulatorAnnotation: "true"}
+			pvc := pvcSpecWithUploadAnnotation()
+			pvc.Status.Phase = v1.ClaimBound
+			testInitAsyncWithCdiObjects(
+				http.StatusOK,
+				true,
+				[]runtime.Object{pvc},
+				[]runtime.Object{dv},
+			)
+			cmd := clientcmd.NewRepeatableVirtctlCommand(commandName, "dv", targetName, "--size", pvcSize,
+				"--uploadproxy-url", server.URL, "--insecure", "--archive-path", archiveFilePath)
+			err := cmd()
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).Should(ContainSubstring("already successfully populated"))
+		})
+
+		It("DV is using populators but PVC has no PVC Prime annotation", func() {
+			dv := dvSpecWithPhase(cdiv1.UploadReady)
+			dv.Annotations = map[string]string{UsePopulatorAnnotation: "true"}
 			testInitAsyncWithCdiObjects(
 				http.StatusOK,
 				true,
 				[]runtime.Object{pvcSpecWithUploadAnnotation()},
-				[]runtime.Object{dvSpecWithWaitForFirstConsumer()},
+				[]runtime.Object{dv},
 			)
 			cmd := clientcmd.NewRepeatableVirtctlCommand(commandName, "dv", targetName, "--size", pvcSize,
-				"--uploadproxy-url", server.URL, "--insecure", "--image-path", imagePath)
+				"--uploadproxy-url", server.URL, "--insecure", "--archive-path", archiveFilePath)
 			err := cmd()
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).Should(ContainSubstring("cannot upload to DataVolume in WaitForFirstConsumer state"))
+			Expect(err.Error()).Should(ContainSubstring("Unable to get PVC Prime name from PVC"))
 		})
+
+		It("DV is using populators but PVC Prime doesn't exist", func() {
+			dv := dvSpecWithPhase(cdiv1.UploadReady)
+			dv.Annotations = map[string]string{UsePopulatorAnnotation: "true"}
+			pvc := pvcSpecWithUploadAnnotation()
+			pvc.Annotations = map[string]string{PVCPrimeNameAnnotation: "pvc-prime-name"}
+			testInitAsyncWithCdiObjects(
+				http.StatusOK,
+				true,
+				[]runtime.Object{pvc},
+				[]runtime.Object{dv},
+			)
+			cmd := clientcmd.NewRepeatableVirtctlCommand(commandName, "dv", targetName, "--size", pvcSize,
+				"--uploadproxy-url", server.URL, "--insecure", "--archive-path", archiveFilePath)
+			err := cmd()
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).Should(ContainSubstring("Unable to get PVC Prime"))
+		})
+
+		DescribeTable("when DV in phase", func(phase cdiv1.DataVolumePhase, forcebind bool) {
+			testInitAsyncWithCdiObjects(
+				http.StatusOK,
+				true,
+				[]runtime.Object{pvcSpecWithUploadAnnotation()},
+				[]runtime.Object{dvSpecWithPhase(phase)},
+			)
+			if forcebind {
+				cmd := clientcmd.NewRepeatableVirtctlCommand(commandName, "dv", targetName, "--size", pvcSize,
+					"--uploadproxy-url", server.URL, "--insecure", "--image-path", imagePath, "--force-bind")
+				go addDvPhase()
+				Expect(cmd()).To(Succeed())
+				Expect(pvcCreateCalled.IsTrue()).To(BeFalse())
+				Expect(dvCreateCalled.IsTrue()).To(BeFalse())
+			} else {
+				cmd := clientcmd.NewRepeatableVirtctlCommand(commandName, "dv", targetName, "--size", pvcSize,
+					"--uploadproxy-url", server.URL, "--insecure", "--image-path", imagePath)
+				err := cmd()
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).Should(ContainSubstring(fmt.Sprintf("cannot upload to DataVolume in %s phase", phase)))
+			}
+		},
+			Entry("WaitForFirstConsumer should fail without force-bind flag", cdiv1.WaitForFirstConsumer, false),
+			Entry("WaitForFirstConsumer should succeed with force-bind flag", cdiv1.WaitForFirstConsumer, true),
+			Entry("PendingPopulation should fail without force-bind flag", cdiv1.PendingPopulation, false),
+			Entry("PendingPopulation should succeed with force-bind flag", cdiv1.WaitForFirstConsumer, true),
+		)
 
 		It("uploadProxyURL not configured", func() {
 			testInit(http.StatusOK)
@@ -723,12 +868,24 @@ var _ = Describe("ImageUpload", func() {
 				[]string{"dv", targetName, "--size", pvcSize, "--uploadproxy-url", "https://doesnotexist", "--insecure", "--image-path", "/dev/null", "--archive-path", "/dev/null.tar"}),
 			Entry("Archive path and block volume true provided", "In archive upload the volume mode should always be filesystem",
 				[]string{"dv", targetName, "--size", pvcSize, "--uploadproxy-url", "https://doesnotexist", "--insecure", "--archive-path", "/dev/null.tar", "--block-volume"}),
+			Entry("BlockVolume true provided with different volume-mode", "incompatible --volume-mode 'filesystem' and --block-volume",
+				[]string{"dv", targetName, "--size", pvcSize, "--uploadproxy-url", "https://doesnotexist", "--insecure", "--archive-path", "/dev/null.tar", "--block-volume", "--volume-mode", "filesystem"}),
+			Entry("Invalid volume-mode specified", "Invalid volume mode 'foo'. Valid values are 'block' and 'filesystem'.",
+				[]string{"dv", targetName, "--size", pvcSize, "--uploadproxy-url", "https://doesnotexist", "--insecure", "--archive-path", "/dev/null.tar", "--volume-mode", "foo"}),
 			Entry("PVC name and args", "cannot use --pvc-name and args",
 				[]string{"foo", "--pvc-name", targetName, "--size", pvcSize, "--uploadproxy-url", "https://doesnotexist", "--insecure", "--image-path", "/dev/null"}),
 			Entry("Unexpected resource type", "invalid resource type foo",
 				[]string{"foo", targetName, "--size", pvcSize, "--uploadproxy-url", "https://doesnotexist", "--insecure", "--image-path", "/dev/null"}),
 			Entry("Size twice", "--pvc-size and --size can not be specified at the same time",
 				[]string{"dv", targetName, "--size", "500G", "--pvc-size", "50G", "--uploadproxy-url", "https://doesnotexist", "--insecure", "--image-path", "/dev/null"}),
+			Entry("--default-instancetype-kind without --default-instancetype", "--default-instancetype must be provided with --default-instancetype-kind",
+				[]string{"pvc", targetName, "--size", pvcSize, "--uploadproxy-url", "https://doesnotexist", "--insecure", "--image-path", "/dev/null", "--default-instancetype-kind", "foo"}),
+			Entry("--default-preference-kind without --default-preference", "--default-preference must be provided with --default-preference-kind",
+				[]string{"pvc", targetName, "--size", pvcSize, "--uploadproxy-url", "https://doesnotexist", "--insecure", "--image-path", "/dev/null", "--default-preference-kind", "foo"}),
+			Entry("--default-instancetype with --no-create", "--default-instancetype and --default-preference cannot be used with --no-create",
+				[]string{"pvc", targetName, "--size", pvcSize, "--uploadproxy-url", "https://doesnotexist", "--insecure", "--image-path", "/dev/null", "--default-instancetype", "foo", "--no-create"}),
+			Entry("--default-preference with --no-create", "--default-instancetype and --default-preference cannot be used with --no-create",
+				[]string{"pvc", targetName, "--size", pvcSize, "--uploadproxy-url", "https://doesnotexist", "--insecure", "--image-path", "/dev/null", "--default-preference", "foo", "--no-create"}),
 		)
 
 		AfterEach(func() {

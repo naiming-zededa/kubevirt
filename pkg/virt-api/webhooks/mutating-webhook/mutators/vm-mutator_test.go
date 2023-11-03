@@ -23,23 +23,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	rt "runtime"
 
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	admissionv1 "k8s.io/api/admission/v1"
 	k8sv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	k8smetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8sfield "k8s.io/apimachinery/pkg/util/validation/field"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
 
-	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
-
 	v1 "kubevirt.io/api/core/v1"
 	apiinstancetype "kubevirt.io/api/instancetype"
-	instancetypev1alpha2 "kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 	"kubevirt.io/client-go/kubecli"
 	"kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
@@ -47,7 +47,7 @@ import (
 
 	cdifake "kubevirt.io/client-go/generated/containerized-data-importer/clientset/versioned/fake"
 	fakeclientset "kubevirt.io/client-go/generated/kubevirt/clientset/versioned/fake"
-	instancetypeclientset "kubevirt.io/client-go/generated/kubevirt/clientset/versioned/typed/instancetype/v1alpha2"
+	instancetypeclientset "kubevirt.io/client-go/generated/kubevirt/clientset/versioned/typed/instancetype/v1beta1"
 
 	"kubevirt.io/kubevirt/pkg/apimachinery/patch"
 	"kubevirt.io/kubevirt/pkg/testutils"
@@ -60,15 +60,18 @@ var _ = Describe("VirtualMachine Mutator", func() {
 	var mutator *VMsMutator
 	var ctrl *gomock.Controller
 	var virtClient *kubecli.MockKubevirtClient
-	var fakeInstancetypeClients instancetypeclientset.InstancetypeV1alpha2Interface
+	var fakeInstancetypeClients instancetypeclientset.InstancetypeV1beta1Interface
 	var fakePreferenceClient instancetypeclientset.VirtualMachinePreferenceInterface
 	var fakeClusterPreferenceClient instancetypeclientset.VirtualMachineClusterPreferenceInterface
 	var k8sClient *k8sfake.Clientset
 	var cdiClient *cdifake.Clientset
 
 	machineTypeFromConfig := "pc-q35-3.0"
+	ignoreInferFromVolumeFailure := v1.IgnoreInferFromVolumeFailure
+	rejectInferFromVolumeFailure := v1.RejectInferFromVolumeFailure
 
-	admitVM := func() *admissionv1.AdmissionResponse {
+	admitVM := func(arch string) *admissionv1.AdmissionResponse {
+		vm.Spec.Template.Spec.Architecture = arch
 		vmBytes, err := json.Marshal(vm)
 		Expect(err).ToNot(HaveOccurred())
 		By("Creating the test admissions review from the VM")
@@ -84,8 +87,8 @@ var _ = Describe("VirtualMachine Mutator", func() {
 		return mutator.Mutate(ar)
 	}
 
-	getVMSpecMetaFromResponse := func() (*v1.VirtualMachineSpec, *k8smetav1.ObjectMeta) {
-		resp := admitVM()
+	getVMSpecMetaFromResponse := func(arch string) (*v1.VirtualMachineSpec, *k8smetav1.ObjectMeta) {
+		resp := admitVM(arch)
 		Expect(resp.Allowed).To(BeTrue())
 
 		By("Getting the VM spec from the response")
@@ -139,7 +142,7 @@ var _ = Describe("VirtualMachine Mutator", func() {
 		ctrl = gomock.NewController(GinkgoT())
 		virtClient = kubecli.NewMockKubevirtClient(ctrl)
 
-		fakeInstancetypeClients = fakeclientset.NewSimpleClientset().InstancetypeV1alpha2()
+		fakeInstancetypeClients = fakeclientset.NewSimpleClientset().InstancetypeV1beta1()
 		fakePreferenceClient = fakeInstancetypeClients.VirtualMachinePreferences(vm.Namespace)
 		fakeClusterPreferenceClient = fakeInstancetypeClients.VirtualMachineClusterPreferences()
 		virtClient.EXPECT().VirtualMachinePreference(gomock.Any()).Return(fakePreferenceClient).AnyTimes()
@@ -156,33 +159,54 @@ var _ = Describe("VirtualMachine Mutator", func() {
 	It("should allow VM being deleted without applying mutations", func() {
 		now := k8smetav1.Now()
 		vm.ObjectMeta.DeletionTimestamp = &now
-		resp := admitVM()
+		resp := admitVM(rt.GOARCH)
 		Expect(resp.Allowed).To(BeTrue())
 		Expect(resp.Patch).To(BeEmpty())
 	})
 
 	It("should apply defaults on VM create", func() {
-		vmSpec, _ := getVMSpecMetaFromResponse()
-		if webhooks.IsPPC64() {
+		vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
+		if webhooks.IsPPC64(&vmSpec.Template.Spec) {
 			Expect(vmSpec.Template.Spec.Domain.Machine.Type).To(Equal("pseries"))
-		} else if webhooks.IsARM64() {
+		} else if webhooks.IsARM64(&vmSpec.Template.Spec) {
 			Expect(vmSpec.Template.Spec.Domain.Machine.Type).To(Equal("virt"))
 		} else {
 			Expect(vmSpec.Template.Spec.Domain.Machine.Type).To(Equal("q35"))
 		}
 	})
 
-	It("should apply configurable defaults on VM create", func() {
+	DescribeTable("should apply configurable defaults on VM create", func(arch string, amd64MachineType string, arm64MachineType string, ppcle64MachineType string, result string) {
 		testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, &v1.KubeVirt{
 			Spec: v1.KubeVirtSpec{
 				Configuration: v1.KubeVirtConfiguration{
-					MachineType: machineTypeFromConfig,
+					ArchitectureConfiguration: &v1.ArchConfiguration{
+						Amd64:   &v1.ArchSpecificConfiguration{MachineType: amd64MachineType},
+						Arm64:   &v1.ArchSpecificConfiguration{MachineType: arm64MachineType},
+						Ppc64le: &v1.ArchSpecificConfiguration{MachineType: ppcle64MachineType},
+					},
 				},
 			},
 		})
 
-		vmSpec, _ := getVMSpecMetaFromResponse()
+		vmSpec, _ := getVMSpecMetaFromResponse(arch)
 		Expect(vmSpec.Template.Spec.Domain.Machine.Type).To(Equal(machineTypeFromConfig))
+
+	},
+		Entry("when override is for amd64 architecture", "amd64", machineTypeFromConfig, "", "", machineTypeFromConfig),
+		Entry("when override is for arm64 architecture", "arm64", "", machineTypeFromConfig, "", machineTypeFromConfig),
+		Entry("when override is for ppc64le architecture", "ppc64le", "", "", machineTypeFromConfig, machineTypeFromConfig),
+	)
+
+	It("should not override default architecture with defaults on VM create", func() {
+		testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, &v1.KubeVirt{
+			Status: v1.KubeVirtStatus{
+				DefaultArchitecture: "arm64",
+			},
+		})
+
+		vmSpec, _ := getVMSpecMetaFromResponse("amd64")
+		Expect(vmSpec.Template.Spec.Architecture).To(Equal("amd64"))
+
 	})
 
 	It("should not override specified properties with defaults on VM create", func() {
@@ -196,22 +220,22 @@ var _ = Describe("VirtualMachine Mutator", func() {
 
 		vm.Spec.Template.Spec.Domain.Machine = &v1.Machine{Type: "pc-q35-2.0"}
 
-		vmSpec, _ := getVMSpecMetaFromResponse()
+		vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 		Expect(vmSpec.Template.Spec.Domain.Machine.Type).To(Equal(vm.Spec.Template.Spec.Domain.Machine.Type))
 	})
 
 	It("should not override user specified MachineType with PreferredMachineType or cluster config on VM create", func() {
 		vm.Spec.Template.Spec.Domain.Machine = &v1.Machine{Type: "pc-q35-2.0"}
-		preference := &instancetypev1alpha2.VirtualMachinePreference{
+		preference := &instancetypev1beta1.VirtualMachinePreference{
 			ObjectMeta: k8smetav1.ObjectMeta{
 				Name: "machineTypePreference",
 			},
 			TypeMeta: k8smetav1.TypeMeta{
 				Kind:       apiinstancetype.SingularPreferenceResourceName,
-				APIVersion: instancetypev1alpha2.SchemeGroupVersion.String(),
+				APIVersion: instancetypev1beta1.SchemeGroupVersion.String(),
 			},
-			Spec: instancetypev1alpha2.VirtualMachinePreferenceSpec{
-				Machine: &instancetypev1alpha2.MachinePreferences{
+			Spec: instancetypev1beta1.VirtualMachinePreferenceSpec{
+				Machine: &instancetypev1beta1.MachinePreferences{
 					PreferredMachineType: "pc-q35-4.0",
 				},
 			},
@@ -232,21 +256,21 @@ var _ = Describe("VirtualMachine Mutator", func() {
 			},
 		})
 
-		vmSpec, _ := getVMSpecMetaFromResponse()
+		vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 		Expect(vmSpec.Template.Spec.Domain.Machine.Type).To(Equal(vm.Spec.Template.Spec.Domain.Machine.Type))
 	})
 
 	It("should use PreferredMachineType over cluster config on VM create", func() {
-		preference := &instancetypev1alpha2.VirtualMachinePreference{
+		preference := &instancetypev1beta1.VirtualMachinePreference{
 			ObjectMeta: k8smetav1.ObjectMeta{
 				Name: "machineTypePreference",
 			},
 			TypeMeta: k8smetav1.TypeMeta{
 				Kind:       apiinstancetype.SingularPreferenceResourceName,
-				APIVersion: instancetypev1alpha2.SchemeGroupVersion.String(),
+				APIVersion: instancetypev1beta1.SchemeGroupVersion.String(),
 			},
-			Spec: instancetypev1alpha2.VirtualMachinePreferenceSpec{
-				Machine: &instancetypev1alpha2.MachinePreferences{
+			Spec: instancetypev1beta1.VirtualMachinePreferenceSpec{
+				Machine: &instancetypev1beta1.MachinePreferences{
 					PreferredMachineType: "pc-q35-4.0",
 				},
 			},
@@ -267,7 +291,7 @@ var _ = Describe("VirtualMachine Mutator", func() {
 			},
 		})
 
-		vmSpec, _ := getVMSpecMetaFromResponse()
+		vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 		Expect(vmSpec.Template.Spec.Domain.Machine.Type).To(Equal(preference.Spec.Machine.PreferredMachineType))
 	})
 
@@ -280,12 +304,16 @@ var _ = Describe("VirtualMachine Mutator", func() {
 		testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, &v1.KubeVirt{
 			Spec: v1.KubeVirtSpec{
 				Configuration: v1.KubeVirtConfiguration{
-					MachineType: machineTypeFromConfig,
+					ArchitectureConfiguration: &v1.ArchConfiguration{
+						Amd64:   &v1.ArchSpecificConfiguration{MachineType: machineTypeFromConfig},
+						Arm64:   &v1.ArchSpecificConfiguration{MachineType: machineTypeFromConfig},
+						Ppc64le: &v1.ArchSpecificConfiguration{MachineType: machineTypeFromConfig},
+					},
 				},
 			},
 		})
 
-		vmSpec, _ := getVMSpecMetaFromResponse()
+		vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 		Expect(vmSpec.Template.Spec.Domain.Machine.Type).To(Equal(machineTypeFromConfig))
 	})
 
@@ -293,7 +321,7 @@ var _ = Describe("VirtualMachine Mutator", func() {
 		vm.Spec.Instancetype = &v1.InstancetypeMatcher{
 			Name: "foobar",
 		}
-		vmSpec, _ := getVMSpecMetaFromResponse()
+		vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 		Expect(vmSpec.Instancetype.Kind).To(Equal(apiinstancetype.ClusterSingularResourceName))
 	})
 
@@ -301,21 +329,21 @@ var _ = Describe("VirtualMachine Mutator", func() {
 		vm.Spec.Preference = &v1.PreferenceMatcher{
 			Name: "foobar",
 		}
-		vmSpec, _ := getVMSpecMetaFromResponse()
+		vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 		Expect(vmSpec.Preference.Kind).To(Equal(apiinstancetype.ClusterSingularPreferenceResourceName))
 	})
 
 	It("should use PreferredMachineType from ClusterSingularPreferenceResourceName when no preference kind is provided", func() {
-		preference := &instancetypev1alpha2.VirtualMachineClusterPreference{
+		preference := &instancetypev1beta1.VirtualMachineClusterPreference{
 			ObjectMeta: k8smetav1.ObjectMeta{
 				Name: "machineTypeClusterPreference",
 			},
 			TypeMeta: k8smetav1.TypeMeta{
 				Kind:       apiinstancetype.ClusterSingularPreferenceResourceName,
-				APIVersion: instancetypev1alpha2.SchemeGroupVersion.String(),
+				APIVersion: instancetypev1beta1.SchemeGroupVersion.String(),
 			},
-			Spec: instancetypev1alpha2.VirtualMachinePreferenceSpec{
-				Machine: &instancetypev1alpha2.MachinePreferences{
+			Spec: instancetypev1beta1.VirtualMachinePreferenceSpec{
+				Machine: &instancetypev1beta1.MachinePreferences{
 					PreferredMachineType: "pc-q35-5.0",
 				},
 			},
@@ -327,74 +355,108 @@ var _ = Describe("VirtualMachine Mutator", func() {
 			Name: preference.Name,
 		}
 
-		vmSpec, _ := getVMSpecMetaFromResponse()
+		vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 		Expect(vmSpec.Template.Spec.Domain.Machine.Type).To(Equal(preference.Spec.Machine.PreferredMachineType))
 	})
 
-	It("should use storage class from VirtualMachinePreference", func() {
-		preference := &instancetypev1alpha2.VirtualMachineClusterPreference{
-			ObjectMeta: k8smetav1.ObjectMeta{
-				Name: "machineTypeClusterPreference",
-			},
-			TypeMeta: k8smetav1.TypeMeta{
-				Kind:       apiinstancetype.ClusterSingularPreferenceResourceName,
-				APIVersion: instancetypev1alpha2.SchemeGroupVersion.String(),
-			},
-			Spec: instancetypev1alpha2.VirtualMachinePreferenceSpec{
-				Volumes: &instancetypev1alpha2.VolumePreferences{
-					PreferredStorageClassName: "ceph",
+	DescribeTable("should admit valid values to InferFromVolumePolicy", func(instancetypeMatcher *v1.InstancetypeMatcher, preferenceMatcher *v1.PreferenceMatcher) {
+		vm.Spec.Instancetype = instancetypeMatcher
+		vm.Spec.Preference = preferenceMatcher
+		resp := admitVM(rt.GOARCH)
+		Expect(resp.Allowed).To(BeTrue())
+	},
+		Entry("InstancetypeMatcher with IgnoreInferFromVolumeFailure", &v1.InstancetypeMatcher{Name: "bar", InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure}, nil),
+		Entry("InstancetypeMatcher with RejectInferFromVolumeFailure", &v1.InstancetypeMatcher{Name: "bar", InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure}, nil),
+		Entry("PreferenceMatcher with IgnoreInferFromVolumeFailure", nil, &v1.PreferenceMatcher{Name: "bar", InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure}),
+		Entry("PreferenceMatcher with RejectInferFromVolumeFailure", nil, &v1.PreferenceMatcher{Name: "bar", InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure}),
+	)
+
+	Context("setPreferenceStorageClassName", func() {
+
+		var preference *instancetypev1beta1.VirtualMachineClusterPreference
+
+		BeforeEach(func() {
+			preference = &instancetypev1beta1.VirtualMachineClusterPreference{
+				ObjectMeta: k8smetav1.ObjectMeta{
+					Name: "machineTypeClusterPreference",
 				},
-			},
-		}
-		vm.Spec.Preference = &v1.PreferenceMatcher{
-			Name: preference.Name,
-		}
-
-		_, err := virtClient.VirtualMachineClusterPreference().Create(context.Background(), preference, k8smetav1.CreateOptions{})
-		Expect(err).ToNot(HaveOccurred())
-
-		vmSpec, _ := getVMSpecMetaFromResponse()
-		for _, dv := range vmSpec.DataVolumeTemplates {
-			Expect(*dv.Spec.PVC.StorageClassName).To(Equal(preference.Spec.Volumes.PreferredStorageClassName))
-		}
-	})
-
-	It("storage class name already defined in VM, value from VirtualMachinePreference should not be used", func() {
-		storageClass := "local"
-		storageSpec := v1.DataVolumeTemplateSpec{
-			Spec: cdiv1.DataVolumeSpec{
-				PVC: &k8sv1.PersistentVolumeClaimSpec{
-					StorageClassName: &storageClass,
+				TypeMeta: k8smetav1.TypeMeta{
+					Kind:       apiinstancetype.ClusterSingularPreferenceResourceName,
+					APIVersion: instancetypev1beta1.SchemeGroupVersion.String(),
 				},
-			},
-		}
-		vm.Spec.DataVolumeTemplates = append(vm.Spec.DataVolumeTemplates, storageSpec)
-
-		preference := &instancetypev1alpha2.VirtualMachineClusterPreference{
-			ObjectMeta: k8smetav1.ObjectMeta{
-				Name: "machineTypeClusterPreference",
-			},
-			TypeMeta: k8smetav1.TypeMeta{
-				Kind:       apiinstancetype.ClusterSingularPreferenceResourceName,
-				APIVersion: instancetypev1alpha2.SchemeGroupVersion.String(),
-			},
-			Spec: instancetypev1alpha2.VirtualMachinePreferenceSpec{
-				Volumes: &instancetypev1alpha2.VolumePreferences{
-					PreferredStorageClassName: "ceph",
+				Spec: instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Volumes: &instancetypev1beta1.VolumePreferences{
+						PreferredStorageClassName: "ceph",
+					},
 				},
-			},
+			}
+			_, err := virtClient.VirtualMachineClusterPreference().Create(context.Background(), preference, k8smetav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			vm.Spec.Preference = &v1.PreferenceMatcher{
+				Name: preference.Name,
+			}
+
+			vm.Spec.DataVolumeTemplates = []v1.DataVolumeTemplateSpec{{
+				Spec: v1beta1.DataVolumeSpec{},
+			}}
+		})
+
+		assertPVCStorageClassName := func(dataVolumeTemapltes []v1.DataVolumeTemplateSpec, expectedStorageClassName string) {
+			Expect(dataVolumeTemapltes).To(HaveLen(1))
+			Expect(*dataVolumeTemapltes[0].Spec.PVC.StorageClassName).To(Equal(expectedStorageClassName))
 		}
 
-		vm.Spec.Preference = &v1.PreferenceMatcher{
-			Name: preference.Name,
+		assertStorageStorageClassName := func(dataVolumeTemapltes []v1.DataVolumeTemplateSpec, expectedStorageClassName string) {
+			Expect(dataVolumeTemapltes).To(HaveLen(1))
+			Expect(*dataVolumeTemapltes[0].Spec.Storage.StorageClassName).To(Equal(expectedStorageClassName))
 		}
-		_, err := virtClient.VirtualMachineClusterPreference().Create(context.Background(), preference, k8smetav1.CreateOptions{})
-		Expect(err).ToNot(HaveOccurred())
 
-		vmSpec, _ := getVMSpecMetaFromResponse()
-		for _, dv := range vmSpec.DataVolumeTemplates {
-			Expect(*dv.Spec.PVC.StorageClassName).To(Equal(storageClass))
-		}
+		It("should apply PreferredStorageClassName to PVC", func() {
+			vm.Spec.DataVolumeTemplates[0].Spec.PVC = &k8sv1.PersistentVolumeClaimSpec{}
+			vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
+			assertPVCStorageClassName(vmSpec.DataVolumeTemplates, preference.Spec.Volumes.PreferredStorageClassName)
+		})
+
+		It("should apply PreferredStorageClassName to Storage", func() {
+			vm.Spec.DataVolumeTemplates[0].Spec.Storage = &v1beta1.StorageSpec{}
+			vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
+			assertStorageStorageClassName(vmSpec.DataVolumeTemplates, preference.Spec.Volumes.PreferredStorageClassName)
+		})
+
+		It("should not fail if DataVolumeSpec PersistentVolumeClaimSpec is nil - bug #9868", func() {
+			vm.Spec.DataVolumeTemplates = []v1.DataVolumeTemplateSpec{{
+				Spec: v1beta1.DataVolumeSpec{},
+			}}
+			resp := admitVM(rt.GOARCH)
+			Expect(resp.Allowed).To(BeTrue())
+		})
+
+		It("should not overwrite storageclass already defined in PVC of DataVolumeTemplate", func() {
+			storageClass := "local"
+			vm.Spec.DataVolumeTemplates = []v1.DataVolumeTemplateSpec{{
+				Spec: v1beta1.DataVolumeSpec{
+					PVC: &k8sv1.PersistentVolumeClaimSpec{
+						StorageClassName: &storageClass,
+					},
+				},
+			}}
+			vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
+			assertPVCStorageClassName(vmSpec.DataVolumeTemplates, storageClass)
+		})
+
+		It("should not overwrite storageclass already defined in Storage of DataVolumeTemplate", func() {
+			storageClass := "local"
+			vm.Spec.DataVolumeTemplates = []v1.DataVolumeTemplateSpec{{
+				Spec: v1beta1.DataVolumeSpec{
+					Storage: &v1beta1.StorageSpec{
+						StorageClassName: &storageClass,
+					},
+				},
+			}}
+			vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
+			assertStorageStorageClassName(vmSpec.DataVolumeTemplates, storageClass)
+		})
 	})
 
 	Context("on update", func() {
@@ -729,7 +791,7 @@ var _ = Describe("VirtualMachine Mutator", func() {
 					},
 				},
 			}}
-			vmSpec, _ := getVMSpecMetaFromResponse()
+			vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 			Expect(vmSpec.Instancetype).To(Equal(expectedInstancetypeMatcher))
 			Expect(vmSpec.Preference).To(Equal(expectedPreferenceMatcher))
 		},
@@ -766,7 +828,7 @@ var _ = Describe("VirtualMachine Mutator", func() {
 				},
 			}}
 
-			vmSpec, _ := getVMSpecMetaFromResponse()
+			vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 			Expect(vmSpec.Instancetype).To(Equal(expectedInstancetypeMatcher))
 			Expect(vmSpec.Preference).To(Equal(expectedPreferenceMatcher))
 		},
@@ -816,7 +878,7 @@ var _ = Describe("VirtualMachine Mutator", func() {
 				},
 			}}
 
-			vmSpec, _ := getVMSpecMetaFromResponse()
+			vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 			Expect(vmSpec.Instancetype).To(Equal(expectedInstancetypeMatcher))
 			Expect(vmSpec.Preference).To(Equal(expectedPreferenceMatcher))
 		},
@@ -875,7 +937,7 @@ var _ = Describe("VirtualMachine Mutator", func() {
 				},
 			})
 
-			vmSpec, _ := getVMSpecMetaFromResponse()
+			vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 			Expect(vmSpec.Instancetype).To(Equal(expectedInstancetypeMatcher))
 			Expect(vmSpec.Preference).To(Equal(expectedPreferenceMatcher))
 		},
@@ -932,7 +994,7 @@ var _ = Describe("VirtualMachine Mutator", func() {
 				},
 			}}
 
-			vmSpec, _ := getVMSpecMetaFromResponse()
+			vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 			Expect(vmSpec.Instancetype).To(Equal(expectedInstancetypeMatcher))
 			Expect(vmSpec.Preference).To(Equal(expectedPreferenceMatcher))
 		},
@@ -1046,7 +1108,7 @@ var _ = Describe("VirtualMachine Mutator", func() {
 				},
 			}}
 
-			vmSpec, _ := getVMSpecMetaFromResponse()
+			vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 			Expect(vmSpec.Instancetype).To(Equal(expectedInstancetypeMatcher))
 			Expect(vmSpec.Preference).To(Equal(expectedPreferenceMatcher))
 		},
@@ -1101,7 +1163,7 @@ var _ = Describe("VirtualMachine Mutator", func() {
 			// Remove all volumes to cause the failure
 			vm.Spec.Template.Spec.Volumes = []v1.Volume{}
 
-			resp := admitVM()
+			resp := admitVM(rt.GOARCH)
 			Expect(resp.Allowed).To(BeFalse())
 			Expect(resp.Result.Message).To(ContainSubstring("unable to find volume %s to infer defaults", inferVolumeName))
 		},
@@ -1110,24 +1172,58 @@ var _ = Describe("VirtualMachine Mutator", func() {
 					InferFromVolume: inferVolumeName,
 				}, nil,
 			),
+			Entry("for InstancetypeMatcher with IgnoreInferFromVolumeFailure",
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, nil,
+			),
+			Entry("for InstancetypeMatcher with RejectInferFromVolumeFailure",
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, nil,
+			),
 			Entry("for PreferenceMatcher",
 				nil,
 				&v1.PreferenceMatcher{
 					InferFromVolume: inferVolumeName,
 				},
 			),
+			Entry("for PreferenceMatcher with IgnoreInferFromVolumeFailure",
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				},
+			),
+			Entry("for PreferenceMatcher with RejectInferFromVolumeFailure",
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				},
+			),
 		)
 
-		DescribeTable("should fail to infer defaults from Volume ", func(volumeSource v1.VolumeSource, messageSubstring string, instancetypeMatcher *v1.InstancetypeMatcher, preferenceMatcher *v1.PreferenceMatcher) {
+		DescribeTable("should fail to infer defaults from Volume ", func(volumeSource v1.VolumeSource, messageSubstring string, instancetypeMatcher *v1.InstancetypeMatcher, preferenceMatcher *v1.PreferenceMatcher, allowed bool) {
 			vm.Spec.Instancetype = instancetypeMatcher
 			vm.Spec.Preference = preferenceMatcher
 			vm.Spec.Template.Spec.Volumes = []v1.Volume{{
 				Name:         inferVolumeName,
 				VolumeSource: volumeSource,
 			}}
-			resp := admitVM()
-			Expect(resp.Allowed).To(BeFalse())
-			Expect(resp.Result.Message).To(ContainSubstring(messageSubstring))
+			resp := admitVM(rt.GOARCH)
+
+			Expect(resp.Allowed).To(Equal(allowed))
+			if allowed {
+				// Expect matchers to be cleared on failure during inference
+				vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
+				Expect(vmSpec.Instancetype).To(BeNil())
+				Expect(vmSpec.Preference).To(BeNil())
+			} else {
+				Expect(resp.Result.Message).To(ContainSubstring(messageSubstring))
+			}
 		},
 			Entry("with unknown PersistentVolumeClaim for InstancetypeMatcher",
 				v1.VolumeSource{
@@ -1140,7 +1236,35 @@ var _ = Describe("VirtualMachine Mutator", func() {
 				fmt.Sprintf("persistentvolumeclaims \"%s\" not found", unknownPVCName),
 				&v1.InstancetypeMatcher{
 					InferFromVolume: inferVolumeName,
-				}, nil,
+				}, nil, false,
+			),
+			Entry("with unknown PersistentVolumeClaim for InstancetypeMatcher with IgnoreInferFromVolumeFailure",
+				v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+							ClaimName: unknownPVCName,
+						},
+					},
+				},
+				fmt.Sprintf("persistentvolumeclaims \"%s\" not found", unknownPVCName),
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, nil, false,
+			),
+			Entry("with unknown PersistentVolumeClaim for InstancetypeMatcher with RejectInferFromVolumeFailure",
+				v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+							ClaimName: unknownPVCName,
+						},
+					},
+				},
+				fmt.Sprintf("persistentvolumeclaims \"%s\" not found", unknownPVCName),
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, nil, false,
 			),
 			Entry("with unknown PersistentVolumeClaim for PreferenceMatcher",
 				v1.VolumeSource{
@@ -1154,7 +1278,37 @@ var _ = Describe("VirtualMachine Mutator", func() {
 				nil,
 				&v1.PreferenceMatcher{
 					InferFromVolume: inferVolumeName,
+				}, false,
+			),
+			Entry("with unknown PersistentVolumeClaim for PreferenceMatcher with IgnoreInferFromVolumeFailure",
+				v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+							ClaimName: unknownPVCName,
+						},
+					},
 				},
+				fmt.Sprintf("persistentvolumeclaims \"%s\" not found", unknownPVCName),
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, false,
+			),
+			Entry("with unknown PersistentVolumeClaim for PreferenceMatcher with RejectInferFromVolumeFailure",
+				v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+							ClaimName: unknownPVCName,
+						},
+					},
+				},
+				fmt.Sprintf("persistentvolumeclaims \"%s\" not found", unknownPVCName),
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, false,
 			),
 			Entry("with unknown DataVolume and PersistentVolumeClaim for InstancetypeMatcher",
 				v1.VolumeSource{
@@ -1164,7 +1318,29 @@ var _ = Describe("VirtualMachine Mutator", func() {
 				}, fmt.Sprintf("persistentvolumeclaims \"%s\" not found", unknownDVName),
 				&v1.InstancetypeMatcher{
 					InferFromVolume: inferVolumeName,
-				}, nil,
+				}, nil, false,
+			),
+			Entry("with unknown DataVolume and PersistentVolumeClaim for InstancetypeMatcher with IgnoreInferFromVolumeFailure",
+				v1.VolumeSource{
+					DataVolume: &v1.DataVolumeSource{
+						Name: unknownDVName,
+					},
+				}, fmt.Sprintf("persistentvolumeclaims \"%s\" not found", unknownDVName),
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, nil, false,
+			),
+			Entry("with unknown DataVolume and PersistentVolumeClaim for InstancetypeMatcher with RejectInferFromVolumeFailure",
+				v1.VolumeSource{
+					DataVolume: &v1.DataVolumeSource{
+						Name: unknownDVName,
+					},
+				}, fmt.Sprintf("persistentvolumeclaims \"%s\" not found", unknownDVName),
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, nil, false,
 			),
 			Entry("with unknown DataVolume and PersistentVolumeClaim for PreferenceMatcher",
 				v1.VolumeSource{
@@ -1175,7 +1351,31 @@ var _ = Describe("VirtualMachine Mutator", func() {
 				nil,
 				&v1.PreferenceMatcher{
 					InferFromVolume: inferVolumeName,
-				},
+				}, false,
+			),
+			Entry("with unknown DataVolume and PersistentVolumeClaim for PreferenceMatcher with IgnoreInferFromVolumeFailure",
+				v1.VolumeSource{
+					DataVolume: &v1.DataVolumeSource{
+						Name: unknownDVName,
+					},
+				}, fmt.Sprintf("persistentvolumeclaims \"%s\" not found", unknownDVName),
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, false,
+			),
+			Entry("with unknown DataVolume and PersistentVolumeClaim for PreferenceMatcher with RejectInferFromVolumeFailure",
+				v1.VolumeSource{
+					DataVolume: &v1.DataVolumeSource{
+						Name: unknownDVName,
+					},
+				}, fmt.Sprintf("persistentvolumeclaims \"%s\" not found", unknownDVName),
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, false,
 			),
 			Entry("with unsupported VolumeSource type for InstancetypeMatcher",
 				v1.VolumeSource{
@@ -1184,7 +1384,26 @@ var _ = Describe("VirtualMachine Mutator", func() {
 				fmt.Sprintf("unable to infer defaults from volume %s as type is not supported", inferVolumeName),
 				&v1.InstancetypeMatcher{
 					InferFromVolume: inferVolumeName,
-				}, nil,
+				}, nil, false,
+			),
+			Entry("but still admit with unsupported VolumeSource type for InstancetypeMatcher with IgnoreInferFromVolumeFailure",
+				v1.VolumeSource{
+					Secret: &v1.SecretVolumeSource{},
+				}, "",
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, nil, true,
+			),
+			Entry("with unsupported VolumeSource type for InstancetypeMatcher with RejectInferFromVolumeFailure",
+				v1.VolumeSource{
+					Secret: &v1.SecretVolumeSource{},
+				},
+				fmt.Sprintf("unable to infer defaults from volume %s as type is not supported", inferVolumeName),
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, nil, false,
 			),
 			Entry("with unsupported VolumeSource type for PreferenceMatcher",
 				v1.VolumeSource{
@@ -1194,11 +1413,31 @@ var _ = Describe("VirtualMachine Mutator", func() {
 				nil,
 				&v1.PreferenceMatcher{
 					InferFromVolume: inferVolumeName,
+				}, false,
+			),
+			Entry("but still admit with unsupported VolumeSource type for PreferenceMatcher with IgnoreInferFromVolumeFailure",
+				v1.VolumeSource{
+					Secret: &v1.SecretVolumeSource{},
+				}, "", nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, true,
+			),
+			Entry("with unsupported VolumeSource type for PreferenceMatcher with RejectInferFromVolumeFailure",
+				v1.VolumeSource{
+					Secret: &v1.SecretVolumeSource{},
 				},
+				fmt.Sprintf("unable to infer defaults from volume %s as type is not supported", inferVolumeName),
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, false,
 			),
 		)
 
-		DescribeTable("should fail to infer defaults from DataVolume with an unsupported DataVolumeSource", func(instancetypeMatcher *v1.InstancetypeMatcher, preferenceMatcher *v1.PreferenceMatcher) {
+		DescribeTable("should fail to infer defaults from DataVolume with an unsupported DataVolumeSource", func(instancetypeMatcher *v1.InstancetypeMatcher, preferenceMatcher *v1.PreferenceMatcher, allowed bool) {
 			vm.Spec.Instancetype = instancetypeMatcher
 			vm.Spec.Preference = preferenceMatcher
 			dvWithUnsupportedSource := &v1beta1.DataVolume{
@@ -1223,24 +1462,57 @@ var _ = Describe("VirtualMachine Mutator", func() {
 					},
 				},
 			}}
-			resp := admitVM()
-			Expect(resp.Allowed).To(BeFalse())
-			Expect(resp.Result.Message).To(ContainSubstring("unable to infer defaults from DataVolumeSpec as DataVolumeSource is not supported"))
+			resp := admitVM(rt.GOARCH)
+			Expect(resp.Allowed).To(Equal(allowed))
+			if allowed {
+				// Expect matchers to be cleared on failure during inference
+				vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
+				Expect(vmSpec.Instancetype).To(BeNil())
+				Expect(vmSpec.Preference).To(BeNil())
+			} else {
+				Expect(resp.Result.Message).To(ContainSubstring("unable to infer defaults from DataVolumeSpec as DataVolumeSource is not supported"))
+			}
 		},
 			Entry("for InstancetypeMatcher",
 				&v1.InstancetypeMatcher{
 					InferFromVolume: inferVolumeName,
-				}, nil,
+				}, nil, false,
+			),
+			Entry("but still admit for InstancetypeMatcher with IgnoreInferFromVolumeFailure",
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, nil, true,
+			),
+			Entry("for InstancetypeMatcher with RejectInferFromVolumeFailure",
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, nil, false,
 			),
 			Entry("for PreferenceMatcher",
 				nil,
 				&v1.PreferenceMatcher{
 					InferFromVolume: inferVolumeName,
-				},
+				}, false,
+			),
+			Entry("but still admit for PreferenceMatcher with IgnoreInferFromVolumeFailure",
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, true,
+			),
+			Entry("for PreferenceMatcher with RejectInferFromVolumeFailure",
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, false,
 			),
 		)
 
-		DescribeTable("should fail to infer defaults from DataVolume with an unknown DataVolumeSourceRef Kind", func(instancetypeMatcher *v1.InstancetypeMatcher, preferenceMatcher *v1.PreferenceMatcher) {
+		DescribeTable("should fail to infer defaults from DataVolume with an unknown DataVolumeSourceRef Kind", func(instancetypeMatcher *v1.InstancetypeMatcher, preferenceMatcher *v1.PreferenceMatcher, allowed bool) {
 			vm.Spec.Instancetype = instancetypeMatcher
 			vm.Spec.Preference = preferenceMatcher
 			dvWithUnknownSourceRefKind := &v1beta1.DataVolume{
@@ -1265,24 +1537,57 @@ var _ = Describe("VirtualMachine Mutator", func() {
 					},
 				},
 			}}
-			resp := admitVM()
-			Expect(resp.Allowed).To(BeFalse())
-			Expect(resp.Result.Message).To(ContainSubstring("unable to infer defaults from DataVolumeSourceRef as Kind foo is not supported"))
+			resp := admitVM(rt.GOARCH)
+			Expect(resp.Allowed).To(Equal(allowed))
+			if allowed {
+				// Expect matchers to be cleared on failure during inference
+				vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
+				Expect(vmSpec.Instancetype).To(BeNil())
+				Expect(vmSpec.Preference).To(BeNil())
+			} else {
+				Expect(resp.Result.Message).To(ContainSubstring("unable to infer defaults from DataVolumeSourceRef as Kind foo is not supported"))
+			}
 		},
 			Entry("for InstancetypeMatcher",
 				&v1.InstancetypeMatcher{
 					InferFromVolume: inferVolumeName,
-				}, nil,
+				}, nil, false,
+			),
+			Entry("but still admit for InstancetypeMatcher with IgnoreInferFromVolumeFailure",
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, nil, true,
+			),
+			Entry("for InstancetypeMatcher with RejectInferFromVolumeFailure",
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, nil, false,
 			),
 			Entry("for PreferenceMatcher",
 				nil,
 				&v1.PreferenceMatcher{
 					InferFromVolume: inferVolumeName,
-				},
+				}, false,
+			),
+			Entry("but still admit for PreferenceMatcher with IgnoreInferFromVolumeFailure",
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, true,
+			),
+			Entry("for PreferenceMatcher with RejectInferFromVolumeFailure",
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, false,
 			),
 		)
 
-		DescribeTable("should fail to infer defaults from DataSource missing DataVolumeSourcePVC", func(instancetypeMatcher *v1.InstancetypeMatcher, preferenceMatcher *v1.PreferenceMatcher) {
+		DescribeTable("should fail to infer defaults from DataSource missing DataVolumeSourcePVC", func(instancetypeMatcher *v1.InstancetypeMatcher, preferenceMatcher *v1.PreferenceMatcher, allowed bool) {
 			vm.Spec.Instancetype = instancetypeMatcher
 			vm.Spec.Preference = preferenceMatcher
 			dsWithoutSourcePVC := &v1beta1.DataSource{
@@ -1317,24 +1622,57 @@ var _ = Describe("VirtualMachine Mutator", func() {
 					},
 				},
 			}}
-			resp := admitVM()
-			Expect(resp.Allowed).To(BeFalse())
-			Expect(resp.Result.Message).To(ContainSubstring("unable to infer defaults from DataSource that doesn't provide DataVolumeSourcePVC"))
+			resp := admitVM(rt.GOARCH)
+			Expect(resp.Allowed).To(Equal(allowed))
+			if allowed {
+				// Expect matchers to be cleared on failure during inference
+				vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
+				Expect(vmSpec.Instancetype).To(BeNil())
+				Expect(vmSpec.Preference).To(BeNil())
+			} else {
+				Expect(resp.Result.Message).To(ContainSubstring("unable to infer defaults from DataSource that doesn't provide DataVolumeSourcePVC"))
+			}
 		},
 			Entry("for InstancetypeMatcher",
 				&v1.InstancetypeMatcher{
 					InferFromVolume: inferVolumeName,
-				}, nil,
+				}, nil, false,
+			),
+			Entry("but still admit for InstancetypeMatcher with IgnoreInferFromVolumeFailure",
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, nil, true,
+			),
+			Entry("for InstancetypeMatcher with RejectInferFromVolumeFailure",
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, nil, false,
 			),
 			Entry("for PreferenceMatcher",
 				nil,
 				&v1.PreferenceMatcher{
 					InferFromVolume: inferVolumeName,
-				},
+				}, false,
+			),
+			Entry("but still admit for PreferenceMatcher with IgnoreInferFromVolumeFailure",
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, true,
+			),
+			Entry("for PreferenceMatcher with RejectInferFromVolumeFailure",
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, false,
 			),
 		)
 
-		DescribeTable("should fail to infer defaults from PersistentVolumeClaim without default instance type label", func(instancetypeMatcher *v1.InstancetypeMatcher, preferenceMatcher *v1.PreferenceMatcher, requiredLabel string) {
+		DescribeTable("should fail to infer defaults from PersistentVolumeClaim without default instance type label", func(instancetypeMatcher *v1.InstancetypeMatcher, preferenceMatcher *v1.PreferenceMatcher, requiredLabel string, allowed bool) {
 			vm.Spec.Instancetype = instancetypeMatcher
 			vm.Spec.Preference = preferenceMatcher
 			pvcWithoutLabels := &k8sv1.PersistentVolumeClaim{
@@ -1355,20 +1693,53 @@ var _ = Describe("VirtualMachine Mutator", func() {
 					},
 				},
 			}}
-			resp := admitVM()
-			Expect(resp.Allowed).To(BeFalse())
-			Expect(resp.Result.Message).To(ContainSubstring("unable to find required %s label on the volume", requiredLabel))
+			resp := admitVM(rt.GOARCH)
+			Expect(resp.Allowed).To(Equal(allowed))
+			if allowed {
+				// Expect matchers to be cleared on failure during inference
+				vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
+				Expect(vmSpec.Instancetype).To(BeNil())
+				Expect(vmSpec.Preference).To(BeNil())
+			} else {
+				Expect(resp.Result.Message).To(ContainSubstring("unable to find required %s label on the volume", requiredLabel))
+			}
 		},
 			Entry("for InstancetypeMatcher",
 				&v1.InstancetypeMatcher{
 					InferFromVolume: inferVolumeName,
-				}, nil, apiinstancetype.DefaultInstancetypeLabel,
+				}, nil, apiinstancetype.DefaultInstancetypeLabel, false,
+			),
+			Entry("but still admit for InstancetypeMatcher with IgnoreInferFromVolumeFailure",
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, nil, apiinstancetype.DefaultInstancetypeLabel, true,
+			),
+			Entry("for InstancetypeMatcher with RejectInferFromVolumeFailure",
+				&v1.InstancetypeMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, nil, apiinstancetype.DefaultInstancetypeLabel, false,
 			),
 			Entry("for PreferenceMatcher",
 				nil,
 				&v1.PreferenceMatcher{
 					InferFromVolume: inferVolumeName,
-				}, apiinstancetype.DefaultPreferenceLabel,
+				}, apiinstancetype.DefaultPreferenceLabel, false,
+			),
+			Entry("but still admit for PreferenceMatcher with with IgnoreInferFromVolumeFailure",
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &ignoreInferFromVolumeFailure,
+				}, apiinstancetype.DefaultPreferenceLabel, true,
+			),
+			Entry("for PreferenceMatcher with RejectInferFromVolumeFailure",
+				nil,
+				&v1.PreferenceMatcher{
+					InferFromVolume:              inferVolumeName,
+					InferFromVolumeFailurePolicy: &rejectInferFromVolumeFailure,
+				}, apiinstancetype.DefaultPreferenceLabel, false,
 			),
 		)
 
@@ -1397,7 +1768,7 @@ var _ = Describe("VirtualMachine Mutator", func() {
 					},
 				},
 			}}
-			vmSpec, _ := getVMSpecMetaFromResponse()
+			vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 			if instancetypeMatcher != nil {
 				Expect(vmSpec.Instancetype.Kind).To(Equal(apiinstancetype.ClusterSingularResourceName))
 			}
@@ -1434,7 +1805,7 @@ var _ = Describe("VirtualMachine Mutator", func() {
 					},
 				},
 			}}
-			vmSpec, _ := getVMSpecMetaFromResponse()
+			vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
 			Expect(vmSpec.Instancetype).To(Equal(&v1.InstancetypeMatcher{
 				Name: defaultInferedNameFromPVC,
 				Kind: defaultInferedKindFromPVC,
@@ -1444,9 +1815,59 @@ var _ = Describe("VirtualMachine Mutator", func() {
 				Kind: defaultInferedKindFromPVC,
 			}))
 		})
+
+		DescribeTable("When inference was successful", func(failurePolicy v1.InferFromVolumeFailurePolicy, expectMemoryCleared bool) {
+			By("Setting guest memory")
+			guestMemory := resource.MustParse("512Mi")
+			vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{
+				Guest: &guestMemory,
+			}
+
+			By("Creating a VM using a PVC as boot and inference Volume")
+			vm.Spec.Instancetype = &v1.InstancetypeMatcher{
+				InferFromVolume:              inferVolumeName,
+				InferFromVolumeFailurePolicy: &failurePolicy,
+			}
+			vm.Spec.Template.Spec.Volumes = []v1.Volume{{
+				Name: inferVolumeName,
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvc.Name,
+						},
+					},
+				},
+			}}
+			vmSpec, _ := getVMSpecMetaFromResponse(rt.GOARCH)
+
+			expectedInstancetypeMatcher := &v1.InstancetypeMatcher{
+				Name: defaultInferedNameFromPVC,
+				Kind: defaultInferedKindFromPVC,
+			}
+			Expect(vmSpec.Instancetype).To(Equal(expectedInstancetypeMatcher))
+
+			if expectMemoryCleared {
+				Expect(vmSpec.Template.Spec.Domain.Memory).To(BeNil())
+			} else {
+				Expect(vmSpec.Template.Spec.Domain.Memory).ToNot(BeNil())
+				Expect(vmSpec.Template.Spec.Domain.Memory.Guest).ToNot(BeNil())
+				Expect(*vmSpec.Template.Spec.Domain.Memory.Guest).To(Equal(guestMemory))
+			}
+		},
+			Entry("it should clear guest memory when ignoring inference failures", v1.IgnoreInferFromVolumeFailure, true),
+			Entry("it should not clear guest memory when rejecting inference failures", v1.RejectInferFromVolumeFailure, false),
+		)
+	})
+
+	It("should default architecture to compiled architecture when not provided", func() {
+		// provide empty string for architecture so that default will apply
+		vmSpec, _ := getVMSpecMetaFromResponse("")
+		Expect(vmSpec.Template.Spec.Architecture).To(Equal(rt.GOARCH))
 	})
 
 	Context("failure tests", func() {
+		invalidInferFromVolumeFailurePolicy := v1.InferFromVolumeFailurePolicy("not-valid")
+
 		It("should fail if passed resource is not VirtualMachine", func() {
 			vmBytes, err := json.Marshal(vm)
 			Expect(err).ToNot(HaveOccurred())
@@ -1493,7 +1914,7 @@ var _ = Describe("VirtualMachine Mutator", func() {
 		DescribeTable("should fail if", func(instancetypeMatcher *v1.InstancetypeMatcher, preferenceMatcher *v1.PreferenceMatcher, expectedField, expectedMessage string) {
 			vm.Spec.Instancetype = instancetypeMatcher
 			vm.Spec.Preference = preferenceMatcher
-			resp := admitVM()
+			resp := admitVM(rt.GOARCH)
 			Expect(resp.Allowed).To(BeFalse())
 			Expect(resp.Result.Message).To(ContainSubstring(expectedMessage))
 			Expect(resp.Result.Details.Causes).To(HaveLen(1))
@@ -1502,9 +1923,11 @@ var _ = Describe("VirtualMachine Mutator", func() {
 			Entry("InstancetypeMatcher does not provide Name or InferFromVolume", &v1.InstancetypeMatcher{}, nil, k8sfield.NewPath("spec", "instancetype").String(), "Either Name or InferFromVolume should be provided within the InstancetypeMatcher"),
 			Entry("InstancetypeMatcher provides Name and InferFromVolume", &v1.InstancetypeMatcher{Name: "foo", InferFromVolume: "bar"}, nil, k8sfield.NewPath("spec", "instancetype", "name").String(), "Name should not be provided when InferFromVolume is used within the InstancetypeMatcher"),
 			Entry("InstancetypeMatcher provides Kind and InferFromVolume", &v1.InstancetypeMatcher{Kind: "foo", InferFromVolume: "bar"}, nil, k8sfield.NewPath("spec", "instancetype", "kind").String(), "Kind should not be provided when InferFromVolume is used within the InstancetypeMatcher"),
+			Entry("InstancetypeMatcher provides invalid value to InferFromVolumeFailurePolicy", &v1.InstancetypeMatcher{InferFromVolume: "bar", InferFromVolumeFailurePolicy: &invalidInferFromVolumeFailurePolicy}, nil, k8sfield.NewPath("spec", "instancetype", "inferFromVolumeFailurePolicy").String(), "Invalid value 'not-valid' for InferFromVolumeFailurePolicy"),
 			Entry("PreferenceMatcher does not provide Name or InferFromVolume", nil, &v1.PreferenceMatcher{}, k8sfield.NewPath("spec", "preference").String(), "Either Name or InferFromVolume should be provided within the PreferenceMatcher"),
 			Entry("PreferenceMatcher provides Name and InferFromVolume", nil, &v1.PreferenceMatcher{Name: "foo", InferFromVolume: "bar"}, k8sfield.NewPath("spec", "preference", "name").String(), "Name should not be provided when InferFromVolume is used within the PreferenceMatcher"),
 			Entry("PreferenceMatcher provides Kind and InferFromVolume", nil, &v1.PreferenceMatcher{Kind: "foo", InferFromVolume: "bar"}, k8sfield.NewPath("spec", "preference", "kind").String(), "Kind should not be provided when InferFromVolume is used within the PreferenceMatcher"),
+			Entry("PreferenceMatcher provides invalid value to InferFromVolumeFailurePolicy", nil, &v1.PreferenceMatcher{InferFromVolume: "bar", InferFromVolumeFailurePolicy: &invalidInferFromVolumeFailurePolicy}, k8sfield.NewPath("spec", "preference", "inferFromVolumeFailurePolicy").String(), "Invalid value 'not-valid' for InferFromVolumeFailurePolicy"),
 		)
 	})
 })

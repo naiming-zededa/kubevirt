@@ -17,12 +17,14 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
 
+	"kubevirt.io/kubevirt/pkg/storage/reservation"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 	"kubevirt.io/kubevirt/tests"
 	"kubevirt.io/kubevirt/tests/console"
 	"kubevirt.io/kubevirt/tests/exec"
 	"kubevirt.io/kubevirt/tests/flags"
 	"kubevirt.io/kubevirt/tests/framework/checks"
+	"kubevirt.io/kubevirt/tests/libnode"
 	"kubevirt.io/kubevirt/tests/libstorage"
 	"kubevirt.io/kubevirt/tests/libvmi"
 	"kubevirt.io/kubevirt/tests/libwait"
@@ -70,8 +72,7 @@ var _ = SIGDescribe("[Serial]SCSI persistent reservation", Serial, func() {
 		Expect(err).ToNot(HaveOccurred())
 
 		stdout, stderr, err := exec.ExecuteCommandOnPodWithResults(virtClient, pod, "targetcli", cmd)
-		By(fmt.Sprintf("targetcli: stdout: %v stderr: %v", stdout, stderr))
-		Expect(err).ToNot(HaveOccurred())
+		Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("command='targetcli %v' stdout='%s' stderr='%s'", args, stdout, stderr))
 	}
 
 	// createSCSIDisk creates a SCSI using targetcli utility and LinuxIO (see
@@ -95,10 +96,13 @@ var _ = SIGDescribe("[Serial]SCSI persistent reservation", Serial, func() {
 		By(fmt.Sprintf("ldconfig: stdout: %v stderr: %v", stdout, stderr))
 		Expect(err).ToNot(HaveOccurred())
 
-		// Create backend file
+		// Create backend file. Let some room for metedata and create a
+		// slightly smaller backend image, we use 800M instead of 1G. In
+		// this case, the disk size doesn't matter as the disk is used
+		// mostly to test the SCSI persistent reservation ioctls.
 		executeTargetCli(podName, []string{
 			"backstores/fileio",
-			"create", backendDisk, "/disks/disk.img", "1G"})
+			"create", backendDisk, "/disks/disk.img", "800M"})
 		executeTargetCli(podName, []string{
 			"loopback/", "create", naa})
 		// Create LUN
@@ -119,8 +123,7 @@ var _ = SIGDescribe("[Serial]SCSI persistent reservation", Serial, func() {
 
 		stdout, stderr, err := exec.ExecuteCommandOnPodWithResults(virtClient, pod, "targetcli",
 			[]string{"/bin/lsblk", "--scsi", "-o", "NAME,MODEL", "-p", "-n"})
-		By(fmt.Sprintf("targetcli: stdout: %v stderr: %v", stdout, stderr))
-		Expect(err).ToNot(HaveOccurred())
+		Expect(err).ToNot(HaveOccurred(), stdout, stderr)
 		lines := strings.Split(stdout, "\n")
 		for _, line := range lines {
 			if strings.Contains(line, model) {
@@ -201,13 +204,17 @@ var _ = SIGDescribe("[Serial]SCSI persistent reservation", Serial, func() {
 			// Create the scsi disk
 			createSCSIDisk(targetCliPod, disk)
 			// Avoid races if there is some delay in the device creation
-			Eventually(findSCSIdisk(targetCliPod, backendDisk), 20*time.Second, 1*time.Second).ShouldNot(BeEmpty())
+			Eventually(findSCSIdisk, 20*time.Second, 1*time.Second).WithArguments(targetCliPod, backendDisk).ShouldNot(BeEmpty())
 			device = findSCSIdisk(targetCliPod, backendDisk)
 			Expect(device).ToNot(BeEmpty())
 			By(fmt.Sprintf("Create PVC with SCSI disk %s", device))
 			pv, pvc, err = tests.CreatePVandPVCwithSCSIDisk(node, device, util.NamespaceTestDefault, "scsi-disks", "scsipv", "scsipvc")
 			Expect(err).ToNot(HaveOccurred())
 			waitForVirtHandlerWithPrHelperReadyOnNode(node)
+			// Switching the PersistentReservation feature gate on/off
+			// causes redeployment of all KubeVirt components.
+			By("Ensuring all KubeVirt components are ready")
+			testsuite.EnsureKubevirtReady()
 		})
 
 		AfterEach(func() {
@@ -227,17 +234,24 @@ var _ = SIGDescribe("[Serial]SCSI persistent reservation", Serial, func() {
 			)
 			vmi.Namespace = util.NamespaceTestDefault
 			vmi = tests.CreateVmiOnNode(vmi, node)
-			libwait.WaitForSuccessfulVMIStartWithTimeoutIgnoreWarnings(vmi, 180)
+			libwait.WaitForSuccessfulVMIStart(vmi,
+				libwait.WithFailOnWarnings(false),
+				libwait.WithTimeout(180),
+			)
 			By("Requesting SCSI persistent reservation")
 			Expect(console.LoginToFedora(vmi)).To(Succeed(), "Should be able to login to the Fedora VM")
 			Expect(checkResultCommand(vmi, "sg_persist -i -k /dev/sda",
 				"there are NO registered reservation keys")).To(BeTrue())
 			Expect(checkResultCommand(vmi, "sg_persist -o -G  --param-sark=12345678 /dev/sda",
 				"Peripheral device type: disk")).To(BeTrue())
-			Eventually(checkResultCommand(vmi, "sg_persist -i -k /dev/sda",
-				"1 registered reservation key follows:\r\n    0x12345678\r\n"),
-				60*time.Second, 10*time.Second).Should(BeTrue())
-
+			Eventually(func(g Gomega) {
+				g.Expect(
+					checkResultCommand(vmi, "sg_persist -i -k /dev/sda", "1 registered reservation key follows:\r\n    0x12345678\r\n"),
+				).To(BeTrue())
+			}).
+				Within(60 * time.Second).
+				WithPolling(10 * time.Second).
+				Should(Succeed())
 		})
 
 		It("Should successfully start 2 VMs with persistent reservation on the same LUN", func() {
@@ -247,14 +261,20 @@ var _ = SIGDescribe("[Serial]SCSI persistent reservation", Serial, func() {
 			)
 			vmi.Namespace = util.NamespaceTestDefault
 			vmi = tests.CreateVmiOnNode(vmi, node)
-			libwait.WaitForSuccessfulVMIStartWithTimeoutIgnoreWarnings(vmi, 180)
+			libwait.WaitForSuccessfulVMIStart(vmi,
+				libwait.WithFailOnWarnings(false),
+				libwait.WithTimeout(180),
+			)
 
 			vmi2 := libvmi.NewFedora(
 				libvmi.WithPersistentVolumeClaimLun("lun0", pvc.Name, true),
 			)
 			vmi2.Namespace = util.NamespaceTestDefault
 			vmi2 = tests.CreateVmiOnNode(vmi2, node)
-			libwait.WaitForSuccessfulVMIStartWithTimeoutIgnoreWarnings(vmi2, 180)
+			libwait.WaitForSuccessfulVMIStart(vmi2,
+				libwait.WithFailOnWarnings(false),
+				libwait.WithTimeout(180),
+			)
 
 			By("Requesting SCSI persistent reservation from the first VM")
 			Expect(console.LoginToFedora(vmi)).To(Succeed(), "Should be able to login to the Fedora VM")
@@ -262,9 +282,14 @@ var _ = SIGDescribe("[Serial]SCSI persistent reservation", Serial, func() {
 				"there are NO registered reservation keys")).To(BeTrue())
 			Expect(checkResultCommand(vmi, "sg_persist -o -G  --param-sark=12345678 /dev/sda",
 				"Peripheral device type: disk")).To(BeTrue())
-			Eventually(checkResultCommand(vmi, "sg_persist -i -k /dev/sda",
-				"1 registered reservation key follows:\r\n    0x12345678\r\n"),
-				60*time.Second, 10*time.Second).Should(BeTrue())
+			Eventually(func(g Gomega) {
+				g.Expect(
+					checkResultCommand(vmi, "sg_persist -i -k /dev/sda", "1 registered reservation key follows:\r\n    0x12345678\r\n"),
+				).To(BeTrue())
+			}).
+				Within(60 * time.Second).
+				WithPolling(10 * time.Second).
+				Should(Succeed())
 
 			By("Requesting SCSI persistent reservation from the second VM")
 			// The second VM should be able to see the reservation key used by the first VM and
@@ -288,6 +313,21 @@ var _ = SIGDescribe("[Serial]SCSI persistent reservation", Serial, func() {
 				}
 				return len(ds.Spec.Template.Spec.Containers) == 1
 			}, time.Minute*5, time.Second*2).Should(BeTrue())
+
+			// Switching the PersistentReservation feature gate on/off
+			// causes redeployment of all KubeVirt components.
+			By("Ensuring all KubeVirt components are ready")
+			testsuite.EnsureKubevirtReady()
+
+			nodes := libnode.GetAllSchedulableNodes(virtClient)
+			for _, node := range nodes.Items {
+				output, err := tests.ExecuteCommandInVirtHandlerPod(node.Name, []string{"mount"})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(output).ToNot(ContainSubstring("kubevirt/daemons/pr"))
+				output, err = tests.ExecuteCommandInVirtHandlerPod(node.Name, []string{"ls", reservation.GetPrHelperSocketDir()})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(output).To(BeEmpty())
+			}
 		})
 	})
 

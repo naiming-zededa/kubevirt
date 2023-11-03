@@ -48,7 +48,7 @@ import (
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
 	instancetypeapi "kubevirt.io/api/instancetype"
-	instanceType "kubevirt.io/api/instancetype/v1alpha2"
+	instanceType "kubevirt.io/api/instancetype/v1beta1"
 
 	"kubevirt.io/kubevirt/pkg/apimachinery/patch"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
@@ -246,7 +246,7 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 
 				// This will only work on storage with binding mode WaitForFirstConsumer,
 				if libstorage.IsStorageClassBindingModeWaitForFirstConsumer(libstorage.Config.StorageRWOFileSystem) {
-					Eventually(ThisDV(dataVolume), 40).Should(BeInPhase(cdiv1.WaitForFirstConsumer))
+					Eventually(ThisDV(dataVolume), 40).Should(Or(BeInPhase(cdiv1.WaitForFirstConsumer), BeInPhase(cdiv1.PendingPopulation)))
 				}
 				num := 2
 				By("Starting and stopping the VirtualMachineInstance a number of times")
@@ -297,7 +297,10 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 				}
 
 				for idx := 0; idx < numVmis; idx++ {
-					libwait.WaitForSuccessfulVMIStartWithTimeoutIgnoreWarnings(vmis[idx], 500)
+					libwait.WaitForSuccessfulVMIStart(vmis[idx],
+						libwait.WithFailOnWarnings(false),
+						libwait.WithTimeout(500),
+					)
 					By(checkingVMInstanceConsoleExpectedOut)
 					Expect(console.LoginToAlpine(vmis[idx])).To(Succeed())
 
@@ -324,7 +327,7 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 				Expect(err).ToNot(HaveOccurred())
 				// This will only work on storage with binding mode WaitForFirstConsumer,
 				if libstorage.IsStorageClassBindingModeWaitForFirstConsumer(libstorage.Config.StorageRWOFileSystem) {
-					Eventually(ThisDV(dataVolume), 40).Should(BeInPhase(cdiv1.WaitForFirstConsumer))
+					Eventually(ThisDV(dataVolume), 40).Should(Or(BeInPhase(cdiv1.WaitForFirstConsumer), BeInPhase(cdiv1.PendingPopulation)))
 				}
 				// with WFFC the run actually starts the import and then runs VM, so the timeout has to include both
 				// import and start
@@ -754,10 +757,10 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 			var vm *v1.VirtualMachine
 
 			BeforeEach(func() {
-				var exists bool
-				storageClass, exists = libstorage.GetRWOFileSystemStorageClass()
-				if !exists {
-					Skip("Skip test when RWOFileSystem storage class is not present")
+				storageClass, err = libstorage.GetSnapshotStorageClass(virtClient)
+				Expect(err).ToNot(HaveOccurred())
+				if storageClass == "" {
+					Skip("Skiping test, no VolumeSnapshot support")
 				}
 
 				dataVolume = libdv.NewDataVolume(
@@ -781,7 +784,7 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 						},
 					},
 				}
-				vm.Spec.DataVolumeTemplates[0].Spec.PVC.StorageClassName = pointer.StringPtr(storageClass)
+				vm.Spec.DataVolumeTemplates[0].Spec.PVC.StorageClassName = pointer.String(storageClass)
 				vm.Spec.Template.Spec.Volumes = append(vm.Spec.Template.Spec.Volumes, saVol)
 				vm.Spec.Template.Spec.Domain.Devices.Disks = append(vm.Spec.Template.Spec.Domain.Devices.Disks, v1.Disk{Name: volumeName})
 			})
@@ -800,7 +803,7 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 				}
 			})
 
-			createVmSuccess := func() {
+			createVMSuccess := func() {
 				// sometimes it takes a bit for permission to actually be applied so eventually
 				Eventually(func() bool {
 					_, err = virtClient.VirtualMachine(vm.Namespace).Create(context.Background(), vm)
@@ -817,10 +820,9 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 				libstorage.EventuallyDVWith(vm.Namespace, targetDVName, 90, HaveSucceeded())
 			}
 
-			It("should resolve DataVolume sourceRef", func() {
-				// convert DV to use datasource
+			createPVCDataSource := func() *cdiv1.DataSource {
 				dvt := &vm.Spec.DataVolumeTemplates[0]
-				ds := &cdiv1.DataSource{
+				return &cdiv1.DataSource{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "ds-" + rand.String(12),
 					},
@@ -830,6 +832,65 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 						},
 					},
 				}
+			}
+
+			snapshotCloneMutateFunc := func() {
+				snapshotClassName, err := libstorage.GetSnapshotClass(storageClass, virtClient)
+				Expect(err).ToNot(HaveOccurred())
+				if snapshotClassName == "" {
+					Fail("The clone permission suite uses a snapshot-capable storage class, must have associated snapshot class")
+				}
+
+				dvt := &vm.Spec.DataVolumeTemplates[0]
+				snap := libstorage.NewVolumeSnapshot(dvt.Spec.Source.PVC.Name, dvt.Spec.Source.PVC.Namespace, dvt.Spec.Source.PVC.Name, &snapshotClassName)
+				snap, err = virtClient.KubernetesSnapshotClient().
+					SnapshotV1().
+					VolumeSnapshots(snap.Namespace).
+					Create(context.Background(), snap, metav1.CreateOptions{})
+				Expect(err).ToNot(HaveOccurred())
+
+				dvt.Spec.Source = &cdiv1.DataVolumeSource{
+					Snapshot: &cdiv1.DataVolumeSourceSnapshot{
+						Namespace: snap.Namespace,
+						Name:      snap.Name,
+					},
+				}
+			}
+
+			createSnapshotDataSource := func() *cdiv1.DataSource {
+				snapshotClassName, err := libstorage.GetSnapshotClass(storageClass, virtClient)
+				Expect(err).ToNot(HaveOccurred())
+				if snapshotClassName == "" {
+					Fail("The clone permission suite uses a snapshot-capable storage class, must have associated snapshot class")
+				}
+
+				dvt := &vm.Spec.DataVolumeTemplates[0]
+				snap := libstorage.NewVolumeSnapshot(dvt.Spec.Source.PVC.Name, dvt.Spec.Source.PVC.Namespace, dvt.Spec.Source.PVC.Name, &snapshotClassName)
+				snap, err = virtClient.KubernetesSnapshotClient().
+					SnapshotV1().
+					VolumeSnapshots(snap.Namespace).
+					Create(context.Background(), snap, metav1.CreateOptions{})
+				Expect(err).ToNot(HaveOccurred())
+
+				return &cdiv1.DataSource{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "ds-" + rand.String(12),
+					},
+					Spec: cdiv1.DataSourceSpec{
+						Source: cdiv1.DataSourceSource{
+							Snapshot: &cdiv1.DataVolumeSourceSnapshot{
+								Namespace: snap.Namespace,
+								Name:      snap.Name,
+							},
+						},
+					},
+				}
+			}
+
+			DescribeTable("should resolve DataVolume sourceRef", func(createDataSourceFunc func() *cdiv1.DataSource) {
+				// convert DV to use datasource
+				dvt := &vm.Spec.DataVolumeTemplates[0]
+				ds := createDataSourceFunc()
 				ds, err := virtClient.CdiClient().CdiV1beta1().DataSources(vm.Namespace).Create(context.TODO(), ds, metav1.CreateOptions{})
 				Expect(err).ToNot(HaveOccurred())
 
@@ -852,7 +913,7 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 					testsuite.NamespaceTestAlternative,
 				)
 
-				createVmSuccess()
+				createVMSuccess()
 
 				dv, err := virtClient.CdiClient().CdiV1beta1().DataVolumes(vm.Namespace).Get(context.TODO(), dvt.Name, metav1.GetOptions{})
 				if libstorage.IsDataVolumeGC(virtClient) {
@@ -861,9 +922,20 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 				}
 				Expect(err).ToNot(HaveOccurred())
 				Expect(dv.Spec.SourceRef).To(BeNil())
-				Expect(dv.Spec.Source.PVC.Namespace).To(Equal(ds.Spec.Source.PVC.Namespace))
-				Expect(dv.Spec.Source.PVC.Name).To(Equal(ds.Spec.Source.PVC.Name))
-			})
+				switch {
+				case dv.Spec.Source.PVC != nil:
+					Expect(dv.Spec.Source.PVC.Namespace).To(Equal(ds.Spec.Source.PVC.Namespace))
+					Expect(dv.Spec.Source.PVC.Name).To(Equal(ds.Spec.Source.PVC.Name))
+				case dv.Spec.Source.Snapshot != nil:
+					Expect(dv.Spec.Source.Snapshot.Namespace).To(Equal(ds.Spec.Source.Snapshot.Namespace))
+					Expect(dv.Spec.Source.Snapshot.Name).To(Equal(ds.Spec.Source.Snapshot.Name))
+				default:
+					Fail(fmt.Sprintf("wrong dv source %+v", dv))
+				}
+			},
+				Entry("with PVC source", createPVCDataSource),
+				Entry("with Snapshot source", createSnapshotDataSource),
+			)
 
 			It("should report DataVolume without source PVC", func() {
 				cloneRole, cloneRoleBinding = addClonePermission(
@@ -909,10 +981,13 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 				}, 30*time.Second, 5*time.Second).Should(BeTrue())
 			})
 
-			DescribeTable("[storage-req] deny then allow clone request", decorators.StorageReq, func(role *rbacv1.Role, allServiceAccounts, allServiceAccountsInNamespace bool) {
+			DescribeTable("[storage-req] deny then allow clone request", decorators.StorageReq, func(role *rbacv1.Role, allServiceAccounts, allServiceAccountsInNamespace bool, cloneMutateFunc func(), fail bool) {
+				if cloneMutateFunc != nil {
+					cloneMutateFunc()
+				}
 				_, err := virtClient.VirtualMachine(vm.Namespace).Create(context.Background(), vm)
 				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(ContainSubstring("Authorization failed, message is:"))
+				Expect(err.Error()).To(ContainSubstring("insufficient permissions in clone source namespace"))
 
 				saName := testsuite.AdminServiceAccountName
 				saNamespace := testsuite.GetTestNamespace(nil)
@@ -926,16 +1001,29 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 
 				// add permission
 				cloneRole, cloneRoleBinding = addClonePermission(virtClient, role, saName, saNamespace, testsuite.NamespaceTestAlternative)
+				if fail {
+					Consistently(func() error {
+						_, err = virtClient.VirtualMachine(vm.Namespace).Create(context.Background(), vm)
+						return err
+					}, 5*time.Second, 1*time.Second).Should(HaveOccurred())
+					Expect(err.Error()).To(ContainSubstring("insufficient permissions in clone source namespace"))
 
-				createVmSuccess()
+					return
+				}
+				createVMSuccess()
 
 				// stop vm
 				vm = tests.StopVirtualMachine(vm)
 			},
-				Entry("[test_id:3193]with explicit role", explicitCloneRole, false, false),
-				Entry("[test_id:3194]with implicit role", implicitCloneRole, false, false),
-				Entry("[test_id:5253]with explicit role (all namespaces)", explicitCloneRole, true, false),
-				Entry("[test_id:5254]with explicit role (one namespace)", explicitCloneRole, false, true),
+				Entry("[test_id:3193]with explicit role", explicitCloneRole, false, false, nil, false),
+				Entry("[test_id:3194]with implicit role", implicitCloneRole, false, false, nil, false),
+				Entry("[test_id:5253]with explicit role (all namespaces)", explicitCloneRole, true, false, nil, false),
+				Entry("[test_id:5254]with explicit role (one namespace)", explicitCloneRole, false, true, nil, false),
+				Entry("with explicit role snapshot clone", explicitCloneRole, false, false, snapshotCloneMutateFunc, false),
+				Entry("with implicit insufficient role snapshot clone", implicitCloneRole, false, false, snapshotCloneMutateFunc, true),
+				Entry("with implicit sufficient role snapshot clone", implicitSnapshotCloneRole, false, false, snapshotCloneMutateFunc, false),
+				Entry("with explicit role (all namespaces) snapshot clone", explicitCloneRole, true, false, snapshotCloneMutateFunc, false),
+				Entry("with explicit role (one namespace) snapshot clone", explicitCloneRole, false, true, snapshotCloneMutateFunc, false),
 			)
 		})
 	})
@@ -1034,14 +1122,14 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 			return dv
 		}
 		addThickProvisionedTrueAnnotation := func(dv *cdiv1.DataVolume) *cdiv1.DataVolume {
-			dv.Annotations = map[string]string{"user.custom.annotation/storage.thick-provisioned": "true"}
+			dv.Annotations["user.custom.annotation/storage.thick-provisioned"] = "true"
 			return dv
 		}
 		addThickProvisionedFalseAnnotation := func(dv *cdiv1.DataVolume) *cdiv1.DataVolume {
-			dv.Annotations = map[string]string{"user.custom.annotation/storage.thick-provisioned": "false"}
+			dv.Annotations["user.custom.annotation/storage.thick-provisioned"] = "false"
 			return dv
 		}
-		DescribeTable("[QUARANTINE][rfe_id:5070][crit:medium][vendor:cnv-qe@redhat.com][level:component]fstrim from the VM influences disk.img", func(dvChange func(*cdiv1.DataVolume) *cdiv1.DataVolume, expectSmaller bool) {
+		DescribeTable("[rfe_id:5070][crit:medium][vendor:cnv-qe@redhat.com][level:component]fstrim from the VM influences disk.img", func(dvChange func(*cdiv1.DataVolume) *cdiv1.DataVolume, expectSmaller bool) {
 			sc, exists := libstorage.GetRWOFileSystemStorageClass()
 			if !exists {
 				Skip("Skip test when Filesystem storage is not present")
@@ -1050,6 +1138,7 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 			dataVolume := libdv.NewDataVolume(
 				libdv.WithRegistryURLSource(cd.DataVolumeImportUrlForContainerDisk(cd.ContainerDiskFedoraTestTooling)),
 				libdv.WithPVC(libdv.PVCWithStorageClass(sc), libdv.PVCWithVolumeSize(cd.FedoraVolumeSize)),
+				libdv.WithForceBindAnnotation(), // So we can wait for DV to finish before starting the VMI
 			)
 
 			dataVolume = dvChange(dataVolume)
@@ -1062,6 +1151,11 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 
 			dataVolume, err = virtClient.CdiClient().CdiV1beta1().DataVolumes(testsuite.GetTestNamespace(nil)).Create(context.Background(), dataVolume, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
+
+			// Importing Fedora is so slow that we get "resourceVersion too old" when trying
+			// to watch for events between the VMI creation and VMI starting.
+			By("Making sure the slow Fedora import is complete before creating the VMI")
+			libstorage.EventuallyDV(dataVolume, 500, HaveSucceeded())
 
 			vmi = tests.RunVMIAndExpectLaunchWithDataVolume(vmi, dataVolume, 500)
 
@@ -1083,9 +1177,9 @@ var _ = SIGDescribe("DataVolume Integration", func() {
 
 			if preallocated {
 				// Preallocation means no changes to disk size
-				Eventually(imageSizeEqual(getImageSize(vmi, dataVolume), imageSizeAfterBoot), 120*time.Second).Should(BeTrue())
+				Eventually(imageSizeEqual, 120*time.Second).WithArguments(getImageSize(vmi, dataVolume), imageSizeAfterBoot).Should(BeTrue())
 			} else {
-				Eventually(getImageSize(vmi, dataVolume), 120*time.Second).Should(BeNumerically(">", imageSizeAfterBoot))
+				Eventually(getImageSize, 120*time.Second).WithArguments(vmi, dataVolume).Should(BeNumerically(">", imageSizeAfterBoot))
 			}
 
 			imageSizeBeforeTrim := getImageSize(vmi, dataVolume)
@@ -1230,6 +1324,26 @@ var implicitCloneRole = &rbacv1.Role{
 			},
 			Resources: []string{
 				"pods",
+			},
+			Verbs: []string{
+				"create",
+			},
+		},
+	},
+}
+
+var implicitSnapshotCloneRole = &rbacv1.Role{
+	ObjectMeta: metav1.ObjectMeta{
+		Name: "implicit-clone-role",
+	},
+	Rules: []rbacv1.PolicyRule{
+		{
+			APIGroups: []string{
+				"",
+			},
+			Resources: []string{
+				"pods",
+				"pvcs",
 			},
 			Verbs: []string{
 				"create",

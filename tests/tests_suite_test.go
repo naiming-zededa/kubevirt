@@ -41,7 +41,12 @@ import (
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	_ "kubevirt.io/kubevirt/tests/compute"
+	_ "kubevirt.io/kubevirt/tests/guestlog"
+	_ "kubevirt.io/kubevirt/tests/hotplug"
+	_ "kubevirt.io/kubevirt/tests/infrastructure"
 	_ "kubevirt.io/kubevirt/tests/launchsecurity"
+	_ "kubevirt.io/kubevirt/tests/migration"
 	_ "kubevirt.io/kubevirt/tests/monitoring"
 	_ "kubevirt.io/kubevirt/tests/network"
 	_ "kubevirt.io/kubevirt/tests/numa"
@@ -50,6 +55,7 @@ import (
 	_ "kubevirt.io/kubevirt/tests/realtime"
 	_ "kubevirt.io/kubevirt/tests/scale"
 	_ "kubevirt.io/kubevirt/tests/storage"
+	_ "kubevirt.io/kubevirt/tests/usb"
 	_ "kubevirt.io/kubevirt/tests/virtctl"
 	_ "kubevirt.io/kubevirt/tests/virtiofs"
 )
@@ -121,10 +127,6 @@ var _ = ReportAfterSuite("TestTests", func(report Report) {
 	for _, reporter := range afterSuiteReporters {
 		ginkgo_reporters.ReportViaDeprecatedReporter(reporter, report)
 	}
-})
-
-var _ = JustBeforeEach(func() {
-	k8sReporter.JustBeforeEach(CurrentSpecReport())
 })
 
 var _ = JustAfterEach(func() {

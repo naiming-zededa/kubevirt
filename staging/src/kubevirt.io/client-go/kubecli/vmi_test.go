@@ -44,9 +44,9 @@ var _ = Describe("Kubevirt VirtualMachineInstance Client", func() {
 
 	var upgrader websocket.Upgrader
 	var server *ghttp.Server
-	basePath := "/apis/kubevirt.io/v1alpha3/namespaces/default/virtualmachineinstances"
+	basePath := "/apis/kubevirt.io/v1/namespaces/default/virtualmachineinstances"
 	vmiPath := path.Join(basePath, "testvm")
-	subVMIPath := "/apis/subresources.kubevirt.io/v1alpha3/namespaces/default/virtualmachineinstances/testvm"
+	subVMIPath := "/apis/subresources.kubevirt.io/v1/namespaces/default/virtualmachineinstances/testvm"
 	proxyPath := "/proxy/path"
 
 	BeforeEach(func() {
@@ -100,10 +100,13 @@ var _ = Describe("Kubevirt VirtualMachineInstance Client", func() {
 			ghttp.RespondWithJSONEncoded(http.StatusOK, NewVMIList(*vmi)),
 		))
 		fetchedVMIList, err := client.VirtualMachineInstance(k8sv1.NamespaceDefault).List(context.Background(), &k8smetav1.ListOptions{})
+		apiVersion, kind := v1.VirtualMachineInstanceGroupVersionKind.ToAPIVersionAndKind()
 
 		Expect(server.ReceivedRequests()).To(HaveLen(1))
 		Expect(err).ToNot(HaveOccurred())
 		Expect(fetchedVMIList.Items).To(HaveLen(1))
+		Expect(fetchedVMIList.Items[0].APIVersion).To(Equal(apiVersion))
+		Expect(fetchedVMIList.Items[0].Kind).To(Equal(kind))
 		Expect(fetchedVMIList.Items[0]).To(Equal(*vmi))
 	},
 		Entry("with regular server URL", ""),
@@ -169,7 +172,7 @@ var _ = Describe("Kubevirt VirtualMachineInstance Client", func() {
 		client, err := GetKubevirtClientFromFlags(server.URL()+proxyPath, "")
 		Expect(err).ToNot(HaveOccurred())
 
-		vncPath := "/apis/subresources.kubevirt.io/v1alpha3/namespaces/default/virtualmachineinstances/testvm/vnc"
+		vncPath := "/apis/subresources.kubevirt.io/v1/namespaces/default/virtualmachineinstances/testvm/vnc"
 
 		server.AppendHandlers(ghttp.CombineHandlers(
 			ghttp.VerifyRequest("GET", path.Join(proxyPath, vncPath)),
@@ -191,7 +194,7 @@ var _ = Describe("Kubevirt VirtualMachineInstance Client", func() {
 		client, err := GetKubevirtClientFromFlags(server.URL()+proxyPath, "")
 		Expect(err).ToNot(HaveOccurred())
 
-		vncPath := "/apis/subresources.kubevirt.io/v1alpha3/namespaces/default/virtualmachineinstances/testvm/vnc"
+		vncPath := "/apis/subresources.kubevirt.io/v1/namespaces/default/virtualmachineinstances/testvm/vnc"
 
 		server.AppendHandlers(ghttp.CombineHandlers(
 			ghttp.VerifyRequest("GET", path.Join(proxyPath, vncPath)),
@@ -427,6 +430,75 @@ var _ = Describe("Kubevirt VirtualMachineInstance Client", func() {
 		Entry("with regular server URL", ""),
 		Entry("with proxied server URL", proxyPath),
 	)
+
+	It("should fetch SEV platform info via subresource", func() {
+		client, err := GetKubevirtClientFromFlags(server.URL()+proxyPath, "")
+		Expect(err).ToNot(HaveOccurred())
+
+		sevPlatformIfo := v1.SEVPlatformInfo{
+			PDH:       "AAABBB",
+			CertChain: "CCCDDD",
+		}
+
+		server.AppendHandlers(ghttp.CombineHandlers(
+			ghttp.VerifyRequest("GET", path.Join(subVMIPath, "sev/fetchcertchain")),
+			ghttp.RespondWithJSONEncoded(http.StatusOK, sevPlatformIfo),
+		))
+		fetchedInfo, err := client.VirtualMachineInstance(k8sv1.NamespaceDefault).SEVFetchCertChain("testvm")
+
+		Expect(err).ToNot(HaveOccurred(), "should fetch info normally")
+		Expect(fetchedInfo).To(Equal(sevPlatformIfo), "fetched info should be the same as passed in")
+	})
+
+	It("should query SEV launch measurement info via subresource", func() {
+		client, err := GetKubevirtClientFromFlags(server.URL()+proxyPath, "")
+		Expect(err).ToNot(HaveOccurred())
+
+		sevMeasurementInfo := v1.SEVMeasurementInfo{
+			Measurement: "AAABBB",
+			APIMajor:    1,
+			APIMinor:    2,
+			BuildID:     0xFFEE,
+			Policy:      0xFF,
+		}
+
+		server.AppendHandlers(ghttp.CombineHandlers(
+			ghttp.VerifyRequest("GET", path.Join(subVMIPath, "sev/querylaunchmeasurement")),
+			ghttp.RespondWithJSONEncoded(http.StatusOK, sevMeasurementInfo),
+		))
+		fetchedInfo, err := client.VirtualMachineInstance(k8sv1.NamespaceDefault).SEVQueryLaunchMeasurement("testvm")
+
+		Expect(err).ToNot(HaveOccurred(), "should fetch info normally")
+		Expect(fetchedInfo).To(Equal(sevMeasurementInfo), "fetched info should be the same as passed in")
+	})
+
+	It("should setup SEV session for a VirtualMachineInstance", func() {
+		client, err := GetKubevirtClientFromFlags(server.URL()+proxyPath, "")
+		Expect(err).ToNot(HaveOccurred())
+
+		server.AppendHandlers(ghttp.CombineHandlers(
+			ghttp.VerifyRequest("PUT", path.Join(subVMIPath, "sev/setupsession")),
+			ghttp.RespondWithJSONEncoded(http.StatusOK, nil),
+		))
+		err = client.VirtualMachineInstance(k8sv1.NamespaceDefault).SEVSetupSession("testvm", &v1.SEVSessionOptions{})
+
+		Expect(server.ReceivedRequests()).To(HaveLen(1))
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("should inject SEV launch secret into a VirtualMachineInstance", func() {
+		client, err := GetKubevirtClientFromFlags(server.URL()+proxyPath, "")
+		Expect(err).ToNot(HaveOccurred())
+
+		server.AppendHandlers(ghttp.CombineHandlers(
+			ghttp.VerifyRequest("PUT", path.Join(subVMIPath, "sev/injectlaunchsecret")),
+			ghttp.RespondWithJSONEncoded(http.StatusOK, nil),
+		))
+		err = client.VirtualMachineInstance(k8sv1.NamespaceDefault).SEVInjectLaunchSecret("testvm", &v1.SEVSecretOptions{})
+
+		Expect(server.ReceivedRequests()).To(HaveLen(1))
+		Expect(err).ToNot(HaveOccurred())
+	})
 
 	AfterEach(func() {
 		server.Close()

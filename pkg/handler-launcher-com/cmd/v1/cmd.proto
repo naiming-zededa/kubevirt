@@ -29,6 +29,11 @@ service Cmd {
   rpc GuestPing(GuestPingRequest) returns (GuestPingResponse) {}
   rpc VirtualMachineMemoryDump(MemoryDumpRequest) returns (Response) {}
   rpc GetQemuVersion(EmptyRequest) returns (QemuVersionResponse){}
+  rpc SyncVirtualMachineCPUs(VMIRequest) returns (Response) {}
+  rpc SyncVirtualMachineMemory(VMIRequest) returns (Response) {}
+  rpc GetSEVInfo(EmptyRequest) returns (SEVInfoResponse) {}
+  rpc GetLaunchMeasurement(VMIRequest) returns (LaunchMeasurementResponse) {}
+  rpc InjectLaunchSecret(InjectLaunchSecretRequest) returns (Response) {}
 }
 
 message QemuVersionResponse {
@@ -51,9 +56,9 @@ message Sibling {
 }
 
 message Pages {
-    uint64 count = 1;
-    string unit = 2;
-    uint32 size = 3;
+  uint64 count = 1;
+  string unit = 2;
+  uint32 size = 3;
 }
 
 message Memory {
@@ -82,10 +87,17 @@ message SMBios {
 }
 
 message DiskInfo {
-    string format = 1;
-    string backingFile = 2;
-    uint64 actualSize = 3;
-    uint64 virtualSize = 4;
+  string format = 1;
+  string backingFile = 2;
+  uint64 actualSize = 3;
+  uint64 virtualSize = 4;
+}
+
+message ClusterConfig{
+  bool ExpandDisksEnabled = 1;
+  bool FreePageReportingDisabled = 2;
+  bool BochsDisplayForEFIGuests = 3;
+  bool SerialConsoleLogDisabled = 4;
 }
 
 message VirtualMachineOptions {
@@ -94,7 +106,9 @@ message VirtualMachineOptions {
   repeated string PreallocatedVolumes = 3;
   Topology topology = 4;
   map<string, DiskInfo> DisksInfo = 5;
+  // Deprecated, use clusterConfig.ExpandDisksEnabled
   bool ExpandDisksEnabled = 6;
+  ClusterConfig clusterConfig = 7;
 }
 
 message VMIRequest {
@@ -169,4 +183,19 @@ message FreezeRequest {
 message MemoryDumpRequest {
   VMI vmi = 1;
   string dumpPath = 2;
+}
+
+message SEVInfoResponse {
+  Response response = 1;
+  bytes sevInfo = 2;
+}
+
+message LaunchMeasurementResponse {
+  Response response = 1;
+  bytes launchMeasurement = 2;
+}
+
+message InjectLaunchSecretRequest {
+    VMI vmi = 1;
+    bytes options = 2;
 }

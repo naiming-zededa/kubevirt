@@ -3,7 +3,7 @@ package rest
 import (
 	"fmt"
 
-	restful "github.com/emicklei/go-restful"
+	restful "github.com/emicklei/go-restful/v3"
 	"k8s.io/apimachinery/pkg/api/errors"
 
 	v1 "kubevirt.io/api/core/v1"
@@ -36,6 +36,9 @@ func validateVMIForConsole(vmi *v1.VirtualMachineInstance) *errors.StatusError {
 	}
 	if vmi.Status.Phase == v1.Failed {
 		return errors.NewConflict(v1.Resource("virtualmachineinstance"), vmi.Name, fmt.Errorf("VMI is in failed status"))
+	}
+	if !vmi.IsRunning() {
+		return errors.NewBadRequest(vmiNotRunning)
 	}
 	return nil
 }

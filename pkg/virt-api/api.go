@@ -31,10 +31,11 @@ import (
 	"syscall"
 	"time"
 
+	"k8s.io/kube-openapi/pkg/validation/spec"
+
 	kvtls "kubevirt.io/kubevirt/pkg/util/tls"
 
-	restful "github.com/emicklei/go-restful"
-	"github.com/go-openapi/spec"
+	restful "github.com/emicklei/go-restful/v3"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	flag "github.com/spf13/pflag"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,6 +44,7 @@ import (
 	certificate2 "k8s.io/client-go/util/certificate"
 	"k8s.io/client-go/util/flowcontrol"
 	aggregatorclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
+	builderv3 "k8s.io/kube-openapi/pkg/builder3"
 
 	"kubevirt.io/kubevirt/pkg/util/ratelimiter"
 
@@ -51,6 +53,8 @@ import (
 	"kubevirt.io/client-go/log"
 	clientutil "kubevirt.io/client-go/util"
 	virtversion "kubevirt.io/client-go/version"
+
+	v12 "kubevirt.io/client-go/api"
 
 	"kubevirt.io/kubevirt/pkg/certificates/bootstrap"
 	"kubevirt.io/kubevirt/pkg/controller"
@@ -500,21 +504,42 @@ func (app *virtAPIApp) composeSubresources() {
 			Returns(http.StatusOK, "OK", "").
 			Returns(http.StatusInternalServerError, httpStatusInternalServerError, ""))
 
-		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("addinterface")).
-			To(subresourceApp.VMIAddInterfaceRequestHandler).
-			Reads(v1.AddInterfaceOptions{}).
+		// AMD SEV endpoints
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("sev/fetchcertchain")).
+			To(subresourceApp.SEVFetchCertChainRequestHandler).
 			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
-			Operation(version.Version+"vmi-addinterface").
-			Doc("Add a network interface to a running Virtual Machine Instance").
+			Consumes(restful.MIME_JSON).
+			Produces(restful.MIME_JSON).
+			Operation(version.Version+"SEVFetchCertChain").
+			Doc("Fetch SEV certificate chain from the node where Virtual Machine is scheduled").
+			Writes(v1.SEVPlatformInfo{}).
+			Returns(http.StatusOK, "OK", v1.SEVPlatformInfo{}))
+
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("sev/querylaunchmeasurement")).
+			To(subresourceApp.SEVQueryLaunchMeasurementHandler).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Consumes(restful.MIME_JSON).
+			Produces(restful.MIME_JSON).
+			Operation(version.Version+"SEVQueryLaunchMeasurement").
+			Doc("Query SEV launch measurement from a Virtual Machine").
+			Writes(v1.SEVMeasurementInfo{}).
+			Returns(http.StatusOK, "OK", v1.SEVMeasurementInfo{}))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("sev/setupsession")).
+			To(subresourceApp.SEVSetupSessionHandler).
+			Reads(v1.SEVSessionOptions{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"SEVSetupSession").
+			Doc("Setup SEV session parameters for a Virtual Machine").
 			Returns(http.StatusOK, "OK", "").
 			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
 
-		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmGVR)+definitions.SubResourcePath("addinterface")).
-			To(subresourceApp.VMAddInterfaceRequestHandler).
-			Reads(v1.AddInterfaceOptions{}).
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("sev/injectlaunchsecret")).
+			To(subresourceApp.SEVInjectLaunchSecretHandler).
+			Reads(v1.SEVSecretOptions{}).
 			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
-			Operation(version.Version+"vm-addinterface").
-			Doc("Add a network interface to a running Virtual Machine.").
+			Operation(version.Version+"SEVInjectLaunchSecret").
+			Doc("Inject SEV launch secret into a Virtual Machine").
 			Returns(http.StatusOK, "OK", "").
 			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
 
@@ -589,10 +614,6 @@ func (app *virtAPIApp) composeSubresources() {
 						Namespaced: true,
 					},
 					{
-						Name:       "virtualmachines/addinterface",
-						Namespaced: true,
-					},
-					{
 						Name:       "virtualmachineinstances/guestosinfo",
 						Namespaced: true,
 					},
@@ -613,7 +634,19 @@ func (app *virtAPIApp) composeSubresources() {
 						Namespaced: true,
 					},
 					{
-						Name:       "virtualmachineinstances/addinterface",
+						Name:       "virtualmachineinstances/sev/fetchcertchain",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/sev/querylaunchmeasurement",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/sev/setupsession",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/sev/injectlaunchsecret",
 						Namespaced: true,
 					},
 				}
@@ -723,10 +756,15 @@ func (app *virtAPIApp) Compose() {
 }
 
 func (app *virtAPIApp) ConfigureOpenAPIService() {
-	spec := openapi.LoadOpenAPISpec(restful.RegisteredWebServices())
-	config := openapi.CreateOpenAPIConfig(restful.RegisteredWebServices())
+	config := openapi.CreateConfig()
+	config.GetDefinitions = v12.GetOpenAPIDefinitions
+	spec, err := builderv3.BuildOpenAPISpec(restful.RegisteredWebServices(), config)
+	if err != nil {
+		panic(err)
+	}
+
 	ws := new(restful.WebService)
-	ws.Path(config.APIPath)
+	ws.Path("/swaggerapi")
 	ws.Produces(restful.MIME_JSON)
 	f := func(req *restful.Request, resp *restful.Response) {
 		resp.WriteAsJson(spec)
@@ -921,6 +959,9 @@ func (app *virtAPIApp) startTLS(informerFactory controller.KubeInformerFactory) 
 	server := &http.Server{
 		Addr:      fmt.Sprintf("%s:%d", app.BindAddress, app.Port),
 		TLSConfig: app.tlsConfig,
+		// Disable HTTP/2
+		// See CVE-2023-44487
+		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
 
 	// start TLS server
@@ -1001,13 +1042,17 @@ func (app *virtAPIApp) Run() {
 	crdInformer := kubeInformerFactory.CRD()
 	vmiPresetInformer := kubeInformerFactory.VirtualMachinePreset()
 	vmRestoreInformer := kubeInformerFactory.VirtualMachineRestore()
+	namespaceInformer := kubeInformerFactory.Namespace()
 
 	stopChan := make(chan struct{}, 1)
 	defer close(stopChan)
 	kubeInformerFactory.Start(stopChan)
 	kubeInformerFactory.WaitForCacheSync(stopChan)
 
-	app.clusterConfig = virtconfig.NewClusterConfig(crdInformer, kubeVirtInformer, app.namespace)
+	app.clusterConfig, err = virtconfig.NewClusterConfig(crdInformer, kubeVirtInformer, app.namespace)
+	if err != nil {
+		panic(err)
+	}
 	app.hasCDIDataSource = app.clusterConfig.HasDataSourceAPI()
 	app.clusterConfig.SetConfigModifiedCallback(app.configModificationCallback)
 	app.clusterConfig.SetConfigModifiedCallback(app.shouldChangeLogVerbosity)
@@ -1035,6 +1080,7 @@ func (app *virtAPIApp) Run() {
 		VMIPresetInformer:  vmiPresetInformer,
 		VMRestoreInformer:  vmRestoreInformer,
 		DataSourceInformer: dataSourceInformer,
+		NamespaceInformer:  namespaceInformer,
 	}
 
 	// Build webhook subresources

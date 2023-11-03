@@ -106,6 +106,18 @@ func CleanNamespaces() {
 			util.PanicOnError(virtCli.VirtualMachineInstancetype(namespace).Delete(context.Background(), instancetype.Name, metav1.DeleteOptions{}))
 		}
 
+		clusterPreference, err := virtCli.VirtualMachineClusterPreference().List(context.Background(), listOptions)
+		util.PanicOnError(err)
+		for _, clusterpreference := range clusterPreference.Items {
+			util.PanicOnError(virtCli.VirtualMachineClusterPreference().Delete(context.Background(), clusterpreference.Name, metav1.DeleteOptions{}))
+		}
+
+		vmPreference, err := virtCli.VirtualMachinePreference(namespace).List(context.Background(), metav1.ListOptions{})
+		util.PanicOnError(err)
+		for _, preference := range vmPreference.Items {
+			util.PanicOnError(virtCli.VirtualMachinePreference(namespace).Delete(context.Background(), preference.Name, metav1.DeleteOptions{}))
+		}
+
 		//Remove all Jobs
 		jobDeleteStrategy := metav1.DeletePropagationOrphan
 		jobDeleteOptions := metav1.DeleteOptions{PropagationPolicy: &jobDeleteStrategy}
@@ -152,6 +164,17 @@ func CleanNamespaces() {
 		util.PanicOnError(err)
 		for _, svc := range svcList.Items {
 			err := virtCli.CoreV1().Services(namespace).Delete(context.Background(), svc.Name, metav1.DeleteOptions{})
+			if errors.IsNotFound(err) {
+				continue
+			}
+			Expect(err).ToNot(HaveOccurred())
+		}
+
+		// Remove all ResourceQuota
+		rqList, err := virtCli.CoreV1().ResourceQuotas(namespace).List(context.Background(), metav1.ListOptions{})
+		util.PanicOnError(err)
+		for _, rq := range rqList.Items {
+			err := virtCli.CoreV1().ResourceQuotas(namespace).Delete(context.Background(), rq.Name, metav1.DeleteOptions{})
 			if errors.IsNotFound(err) {
 				continue
 			}
@@ -258,6 +281,17 @@ func CleanNamespaces() {
 		}
 
 		util.PanicOnError(virtCli.VirtualMachineRestore(namespace).DeleteCollection(context.Background(), metav1.DeleteOptions{}, metav1.ListOptions{}))
+
+		// Remove events
+		util.PanicOnError(virtCli.CoreV1().Events(namespace).DeleteCollection(context.Background(), metav1.DeleteOptions{}, metav1.ListOptions{}))
+
+		// Remove vmexports
+		vmexportList, err := virtCli.VirtualMachineExport(namespace).List(context.Background(), metav1.ListOptions{})
+		util.PanicOnError(err)
+		for _, export := range vmexportList.Items {
+			util.PanicOnError(virtCli.VirtualMachineExport(namespace).Delete(context.Background(), export.Name, metav1.DeleteOptions{}))
+		}
+
 	}
 }
 

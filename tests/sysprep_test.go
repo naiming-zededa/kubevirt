@@ -26,6 +26,8 @@ import (
 	"strings"
 	"time"
 
+	"kubevirt.io/kubevirt/tests/libvmi"
+
 	"kubevirt.io/kubevirt/tests/decorators"
 
 	"kubevirt.io/kubevirt/tests/exec"
@@ -219,7 +221,7 @@ func insertProductKeyToAnswerFileTemplate(answerFileTemplate string) string {
 var getWindowsSysprepVMISpec = func() v1.VirtualMachineInstanceSpec {
 	gracePeriod := int64(0)
 	spinlocks := uint32(8191)
-	firmware := types.UID(windowsFirmware)
+	firmware := types.UID(libvmi.WindowsFirmware)
 	_false := false
 	return v1.VirtualMachineInstanceSpec{
 		TerminationGracePeriodSeconds: &gracePeriod,
@@ -328,7 +330,9 @@ var _ = Describe("[Serial][Sysprep][sig-compute]Syspreped VirtualMachineInstance
 			windowsVMI, err = virtClient.VirtualMachineInstance(util.NamespaceTestDefault).Create(context.Background(), windowsVMI)
 			Expect(err).ToNot(HaveOccurred())
 
-			libwait.WaitForSuccessfulVMIStartWithTimeout(windowsVMI, 720)
+			libwait.WaitForSuccessfulVMIStart(windowsVMI,
+				libwait.WithTimeout(720),
+			)
 
 			windowsVMI, err = virtClient.VirtualMachineInstance(util.NamespaceTestDefault).Get(context.Background(), windowsVMI.Name, &metav1.GetOptions{})
 			vmiIp = windowsVMI.Status.Interfaces[0].IP

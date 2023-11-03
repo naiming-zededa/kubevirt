@@ -1,7 +1,9 @@
+//nolint:dupl,lll
 package instancetype_test
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo/v2"
@@ -13,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/utils/pointer"
@@ -28,13 +31,15 @@ import (
 
 	v1 "kubevirt.io/api/core/v1"
 	apiinstancetype "kubevirt.io/api/instancetype"
-	instancetypev1alpha2 "kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1alpha1 "kubevirt.io/api/instancetype/v1alpha1"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 	fakeclientset "kubevirt.io/client-go/generated/kubevirt/clientset/versioned/fake"
-	"kubevirt.io/client-go/generated/kubevirt/clientset/versioned/typed/instancetype/v1alpha2"
+	instancetypeclientv1beta1 "kubevirt.io/client-go/generated/kubevirt/clientset/versioned/typed/instancetype/v1beta1"
 )
 
 const resourceUID types.UID = "9160e5de-2540-476a-86d9-af0081aee68a"
 const resourceGeneration int64 = 1
+const nonExistingResourceName = "non-existing-resource"
 
 var _ = Describe("Instancetype and Preferences", func() {
 	var (
@@ -44,7 +49,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 		vmi                              *v1.VirtualMachineInstance
 		virtClient                       *kubecli.MockKubevirtClient
 		vmInterface                      *kubecli.MockVirtualMachineInterface
-		fakeInstancetypeClients          v1alpha2.InstancetypeV1alpha2Interface
+		fakeInstancetypeClients          instancetypeclientv1beta1.InstancetypeV1beta1Interface
 		k8sClient                        *k8sfake.Clientset
 		instancetypeInformerStore        cache.Store
 		clusterInstancetypeInformerStore cache.Store
@@ -53,13 +58,20 @@ var _ = Describe("Instancetype and Preferences", func() {
 		controllerrevisionInformerStore  cache.Store
 	)
 
-	expectControllerRevisionCreation := func(instancetypeSpecRevision *appsv1.ControllerRevision) {
+	expectControllerRevisionCreation := func(expectedControllerRevision *appsv1.ControllerRevision) {
 		k8sClient.Fake.PrependReactor("create", "controllerrevisions", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
 			created, ok := action.(testing.CreateAction)
 			Expect(ok).To(BeTrue())
 
 			createObj := created.GetObject().(*appsv1.ControllerRevision)
-			Expect(createObj).To(Equal(instancetypeSpecRevision))
+
+			// This is already covered by the below assertion but be explicit here to ensure coverage
+			Expect(createObj.Labels).To(HaveKey(apiinstancetype.ControllerRevisionObjectGenerationLabel))
+			Expect(createObj.Labels).To(HaveKey(apiinstancetype.ControllerRevisionObjectKindLabel))
+			Expect(createObj.Labels).To(HaveKey(apiinstancetype.ControllerRevisionObjectNameLabel))
+			Expect(createObj.Labels).To(HaveKey(apiinstancetype.ControllerRevisionObjectUIDLabel))
+			Expect(createObj.Labels).To(HaveKey(apiinstancetype.ControllerRevisionObjectVersionLabel))
+			Expect(createObj).To(Equal(expectedControllerRevision))
 
 			return true, created.GetObject(), nil
 		})
@@ -72,18 +84,18 @@ var _ = Describe("Instancetype and Preferences", func() {
 		vmInterface = kubecli.NewMockVirtualMachineInterface(ctrl)
 		virtClient.EXPECT().VirtualMachine(metav1.NamespaceDefault).Return(vmInterface).AnyTimes()
 		virtClient.EXPECT().AppsV1().Return(k8sClient.AppsV1()).AnyTimes()
-		fakeInstancetypeClients = fakeclientset.NewSimpleClientset().InstancetypeV1alpha2()
+		fakeInstancetypeClients = fakeclientset.NewSimpleClientset().InstancetypeV1beta1()
 
-		instancetypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineInstancetype{})
+		instancetypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineInstancetype{})
 		instancetypeInformerStore = instancetypeInformer.GetStore()
 
-		clusterInstancetypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineClusterInstancetype{})
+		clusterInstancetypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineClusterInstancetype{})
 		clusterInstancetypeInformerStore = clusterInstancetypeInformer.GetStore()
 
-		preferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachinePreference{})
+		preferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachinePreference{})
 		preferenceInformerStore = preferenceInformer.GetStore()
 
-		clusterPreferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineClusterPreference{})
+		clusterPreferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineClusterPreference{})
 		clusterPreferenceInformerStore = clusterPreferenceInformer.GetStore()
 
 		controllerrevisionInformer, _ := testutils.NewFakeInformerFor(&appsv1.ControllerRevision{})
@@ -107,7 +119,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 		vm.Namespace = k8sv1.NamespaceDefault
 	})
 
-	Context("Find and store Instancetype Spec", func() {
+	Context("Find and store instancetype", func() {
 
 		It("find returns nil when no instancetype is specified", func() {
 			vm.Spec.Instancetype = nil
@@ -140,26 +152,29 @@ var _ = Describe("Instancetype and Preferences", func() {
 		})
 
 		Context("Using global ClusterInstancetype", func() {
-			var clusterInstancetype *instancetypev1alpha2.VirtualMachineClusterInstancetype
-			var fakeClusterInstancetypeClient v1alpha2.VirtualMachineClusterInstancetypeInterface
+			var clusterInstancetype *instancetypev1beta1.VirtualMachineClusterInstancetype
+			var fakeClusterInstancetypeClient instancetypeclientv1beta1.VirtualMachineClusterInstancetypeInterface
 
 			BeforeEach(func() {
 				fakeClusterInstancetypeClient = fakeInstancetypeClients.VirtualMachineClusterInstancetypes()
 				virtClient.EXPECT().VirtualMachineClusterInstancetype().Return(fakeClusterInstancetypeClient).AnyTimes()
 
-				clusterInstancetype = &instancetypev1alpha2.VirtualMachineClusterInstancetype{
+				clusterInstancetype = &instancetypev1beta1.VirtualMachineClusterInstancetype{
 					TypeMeta: metav1.TypeMeta{
 						Kind:       "VirtualMachineClusterInstancetype",
-						APIVersion: instancetypev1alpha2.SchemeGroupVersion.String(),
+						APIVersion: instancetypev1beta1.SchemeGroupVersion.String(),
 					},
 					ObjectMeta: metav1.ObjectMeta{
 						Name:       "test-cluster-instancetype",
 						UID:        resourceUID,
 						Generation: resourceGeneration,
 					},
-					Spec: instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-						CPU: instancetypev1alpha2.CPUInstancetype{
+					Spec: instancetypev1beta1.VirtualMachineInstancetypeSpec{
+						CPU: instancetypev1beta1.CPUInstancetype{
 							Guest: uint32(2),
+						},
+						Memory: instancetypev1beta1.MemoryInstancetype{
+							Guest: resource.MustParse("128Mi"),
 						},
 					},
 				}
@@ -199,7 +214,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 			})
 
 			It("find fails when instancetype does not exist", func() {
-				vm.Spec.Instancetype.Name = "non-existing-instancetype"
+				vm.Spec.Instancetype.Name = nonExistingResourceName
 				_, err := instancetypeMethods.FindInstancetypeSpec(vm)
 				Expect(err).To(HaveOccurred())
 				Expect(errors.IsNotFound(err)).To(BeTrue())
@@ -239,7 +254,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 			})
 
 			It("store fails when instancetype does not exist", func() {
-				vm.Spec.Instancetype.Name = "non-existing-instancetype"
+				vm.Spec.Instancetype.Name = nonExistingResourceName
 				err := instancetypeMethods.StoreControllerRevisions(vm)
 				Expect(err).To(HaveOccurred())
 				Expect(errors.IsNotFound(err)).To(BeTrue())
@@ -280,20 +295,64 @@ var _ = Describe("Instancetype and Preferences", func() {
 				}
 				Expect(instancetypeMethods.StoreControllerRevisions(vm)).To(MatchError(ContainSubstring("VM field conflicts with selected Instancetype")))
 			})
+
+			It("find successfully decodes v1alpha1 VirtualMachineInstancetypeSpecRevision ControllerRevision without APIVersion set - bug #9261", func() {
+				clusterInstancetype.Spec.CPU = instancetypev1beta1.CPUInstancetype{
+					Guest: uint32(2),
+					// Set the following values to be compatible with objects converted from v1alpha1
+					Model:                 pointer.String(""),
+					DedicatedCPUPlacement: pointer.Bool(false),
+					IsolateEmulatorThread: pointer.Bool(false),
+				}
+
+				specData, err := json.Marshal(clusterInstancetype.Spec)
+				Expect(err).ToNot(HaveOccurred())
+
+				// Do not set APIVersion as part of VirtualMachineInstancetypeSpecRevision in order to trigger bug #9261
+				specRevision := instancetypev1alpha1.VirtualMachineInstancetypeSpecRevision{
+					Spec: specData,
+				}
+				specRevisionData, err := json.Marshal(specRevision)
+				Expect(err).ToNot(HaveOccurred())
+
+				controllerRevision := &appsv1.ControllerRevision{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "crName",
+						Namespace:       vm.Namespace,
+						OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(vm, v1.VirtualMachineGroupVersionKind)},
+					},
+					Data: runtime.RawExtension{
+						Raw: specRevisionData,
+					},
+				}
+
+				_, err = virtClient.AppsV1().ControllerRevisions(vm.Namespace).Create(context.Background(), controllerRevision, metav1.CreateOptions{})
+				Expect(err).ToNot(HaveOccurred())
+
+				vm.Spec.Instancetype = &v1.InstancetypeMatcher{
+					Name:         clusterInstancetype.Name,
+					RevisionName: controllerRevision.Name,
+					Kind:         apiinstancetype.ClusterSingularResourceName,
+				}
+
+				foundInstancetypeSpec, err := instancetypeMethods.FindInstancetypeSpec(vm)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(*foundInstancetypeSpec).To(Equal(clusterInstancetype.Spec))
+			})
 		})
 
 		Context("Using namespaced Instancetype", func() {
-			var fakeInstancetype *instancetypev1alpha2.VirtualMachineInstancetype
-			var fakeInstancetypeClient v1alpha2.VirtualMachineInstancetypeInterface
+			var fakeInstancetype *instancetypev1beta1.VirtualMachineInstancetype
+			var fakeInstancetypeClient instancetypeclientv1beta1.VirtualMachineInstancetypeInterface
 
 			BeforeEach(func() {
 				fakeInstancetypeClient = fakeInstancetypeClients.VirtualMachineInstancetypes(vm.Namespace)
 				virtClient.EXPECT().VirtualMachineInstancetype(gomock.Any()).Return(fakeInstancetypeClient).AnyTimes()
 
-				fakeInstancetype = &instancetypev1alpha2.VirtualMachineInstancetype{
+				fakeInstancetype = &instancetypev1beta1.VirtualMachineInstancetype{
 					TypeMeta: metav1.TypeMeta{
 						Kind:       "VirtualMachineInstancetype",
-						APIVersion: instancetypev1alpha2.SchemeGroupVersion.String(),
+						APIVersion: instancetypev1beta1.SchemeGroupVersion.String(),
 					},
 					ObjectMeta: metav1.ObjectMeta{
 						Name:       "test-instancetype",
@@ -301,9 +360,12 @@ var _ = Describe("Instancetype and Preferences", func() {
 						UID:        resourceUID,
 						Generation: resourceGeneration,
 					},
-					Spec: instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-						CPU: instancetypev1alpha2.CPUInstancetype{
+					Spec: instancetypev1beta1.VirtualMachineInstancetypeSpec{
+						CPU: instancetypev1beta1.CPUInstancetype{
 							Guest: uint32(2),
+						},
+						Memory: instancetypev1beta1.MemoryInstancetype{
+							Guest: resource.MustParse("128Mi"),
 						},
 					},
 				}
@@ -342,7 +404,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 			})
 
 			It("find fails when instancetype does not exist", func() {
-				vm.Spec.Instancetype.Name = "non-existing-instancetype"
+				vm.Spec.Instancetype.Name = nonExistingResourceName
 				_, err := instancetypeMethods.FindInstancetypeSpec(vm)
 				Expect(err).To(HaveOccurred())
 				Expect(errors.IsNotFound(err)).To(BeTrue())
@@ -364,7 +426,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 			})
 
 			It("store fails when instancetype does not exist", func() {
-				vm.Spec.Instancetype.Name = "non-existing-instancetype"
+				vm.Spec.Instancetype.Name = nonExistingResourceName
 				err := instancetypeMethods.StoreControllerRevisions(vm)
 				Expect(err).To(HaveOccurred())
 				Expect(errors.IsNotFound(err)).To(BeTrue())
@@ -423,6 +485,50 @@ var _ = Describe("Instancetype and Preferences", func() {
 				}
 				Expect(instancetypeMethods.StoreControllerRevisions(vm)).To(MatchError(ContainSubstring("VM field conflicts with selected Instancetype")))
 			})
+
+			It("find successfully decodes v1alpha1 VirtualMachineInstancetypeSpecRevision ControllerRevision without APIVersion set - bug #9261", func() {
+				fakeInstancetype.Spec.CPU = instancetypev1beta1.CPUInstancetype{
+					Guest: uint32(2),
+					// Set the following values to be compatible with objects converted from v1alpha1
+					Model:                 pointer.String(""),
+					DedicatedCPUPlacement: pointer.Bool(false),
+					IsolateEmulatorThread: pointer.Bool(false),
+				}
+
+				specData, err := json.Marshal(fakeInstancetype.Spec)
+				Expect(err).ToNot(HaveOccurred())
+
+				// Do not set APIVersion as part of VirtualMachineInstancetypeSpecRevision in order to trigger bug #9261
+				specRevision := instancetypev1alpha1.VirtualMachineInstancetypeSpecRevision{
+					Spec: specData,
+				}
+				specRevisionData, err := json.Marshal(specRevision)
+				Expect(err).ToNot(HaveOccurred())
+
+				controllerRevision := &appsv1.ControllerRevision{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "crName",
+						Namespace:       vm.Namespace,
+						OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(vm, v1.VirtualMachineGroupVersionKind)},
+					},
+					Data: runtime.RawExtension{
+						Raw: specRevisionData,
+					},
+				}
+
+				_, err = virtClient.AppsV1().ControllerRevisions(vm.Namespace).Create(context.Background(), controllerRevision, metav1.CreateOptions{})
+				Expect(err).ToNot(HaveOccurred())
+
+				vm.Spec.Instancetype = &v1.InstancetypeMatcher{
+					Name:         fakeInstancetype.Name,
+					RevisionName: controllerRevision.Name,
+					Kind:         apiinstancetype.SingularResourceName,
+				}
+
+				foundInstancetypeSpec, err := instancetypeMethods.FindInstancetypeSpec(vm)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(*foundInstancetypeSpec).To(Equal(fakeInstancetype.Spec))
+			})
 		})
 	})
 
@@ -465,7 +571,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 		})
 	})
 
-	Context("Find and store VirtualMachinePreferenceSpec", func() {
+	Context("Find and store preference", func() {
 
 		It("find returns nil when no preference is specified", func() {
 			vm.Spec.Preference = nil
@@ -498,22 +604,27 @@ var _ = Describe("Instancetype and Preferences", func() {
 		})
 
 		Context("Using global ClusterPreference", func() {
-			var clusterPreference *instancetypev1alpha2.VirtualMachineClusterPreference
-			var fakeClusterPreferenceClient v1alpha2.VirtualMachineClusterPreferenceInterface
+			var clusterPreference *instancetypev1beta1.VirtualMachineClusterPreference
+			var fakeClusterPreferenceClient instancetypeclientv1beta1.VirtualMachineClusterPreferenceInterface
 
 			BeforeEach(func() {
 				fakeClusterPreferenceClient = fakeInstancetypeClients.VirtualMachineClusterPreferences()
 				virtClient.EXPECT().VirtualMachineClusterPreference().Return(fakeClusterPreferenceClient).AnyTimes()
 
-				clusterPreference = &instancetypev1alpha2.VirtualMachineClusterPreference{
+				preferredCPUTopology := instancetypev1beta1.PreferCores
+				clusterPreference = &instancetypev1beta1.VirtualMachineClusterPreference{
+					TypeMeta: metav1.TypeMeta{
+						Kind:       "VirtualMachineClusterPreference",
+						APIVersion: instancetypev1beta1.SchemeGroupVersion.String(),
+					},
 					ObjectMeta: metav1.ObjectMeta{
 						Name:       "test-cluster-preference",
 						UID:        resourceUID,
 						Generation: resourceGeneration,
 					},
-					Spec: instancetypev1alpha2.VirtualMachinePreferenceSpec{
-						CPU: &instancetypev1alpha2.CPUPreferences{
-							PreferredCPUTopology: instancetypev1alpha2.PreferCores,
+					Spec: instancetypev1beta1.VirtualMachinePreferenceSpec{
+						CPU: &instancetypev1beta1.CPUPreferences{
+							PreferredCPUTopology: &preferredCPUTopology,
 						},
 					},
 				}
@@ -552,7 +663,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 			})
 
 			It("find fails when preference does not exist", func() {
-				vm.Spec.Preference.Name = "non-existing-preference"
+				vm.Spec.Preference.Name = nonExistingResourceName
 				_, err := instancetypeMethods.FindPreferenceSpec(vm)
 				Expect(err).To(HaveOccurred())
 				Expect(errors.IsNotFound(err)).To(BeTrue())
@@ -574,7 +685,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 			})
 
 			It("store fails when VirtualMachineClusterPreference doesn't exist", func() {
-				vm.Spec.Preference.Name = "non-existing-preference"
+				vm.Spec.Preference.Name = nonExistingResourceName
 				err := instancetypeMethods.StoreControllerRevisions(vm)
 				Expect(err).To(HaveOccurred())
 				Expect(errors.IsNotFound(err)).To(BeTrue())
@@ -612,7 +723,8 @@ var _ = Describe("Instancetype and Preferences", func() {
 
 			It("store ControllerRevision fails if a revision exists with unexpected data", func() {
 				unexpectedPreference := clusterPreference.DeepCopy()
-				unexpectedPreference.Spec.CPU.PreferredCPUTopology = instancetypev1alpha2.PreferThreads
+				preferredCPUTopology := instancetypev1beta1.PreferThreads
+				unexpectedPreference.Spec.CPU.PreferredCPUTopology = &preferredCPUTopology
 
 				clusterPreferenceControllerRevision, err := instancetype.CreateControllerRevision(vm, unexpectedPreference)
 				Expect(err).ToNot(HaveOccurred())
@@ -625,23 +737,28 @@ var _ = Describe("Instancetype and Preferences", func() {
 		})
 
 		Context("Using namespaced Preference", func() {
-			var preference *instancetypev1alpha2.VirtualMachinePreference
-			var fakePreferenceClient v1alpha2.VirtualMachinePreferenceInterface
+			var preference *instancetypev1beta1.VirtualMachinePreference
+			var fakePreferenceClient instancetypeclientv1beta1.VirtualMachinePreferenceInterface
 
 			BeforeEach(func() {
 				fakePreferenceClient = fakeInstancetypeClients.VirtualMachinePreferences(vm.Namespace)
 				virtClient.EXPECT().VirtualMachinePreference(gomock.Any()).Return(fakePreferenceClient).AnyTimes()
 
-				preference = &instancetypev1alpha2.VirtualMachinePreference{
+				preferredCPUTopology := instancetypev1beta1.PreferCores
+				preference = &instancetypev1beta1.VirtualMachinePreference{
+					TypeMeta: metav1.TypeMeta{
+						Kind:       "VirtualMachinePreference",
+						APIVersion: instancetypev1beta1.SchemeGroupVersion.String(),
+					},
 					ObjectMeta: metav1.ObjectMeta{
 						Name:       "test-preference",
 						Namespace:  vm.Namespace,
 						UID:        resourceUID,
 						Generation: resourceGeneration,
 					},
-					Spec: instancetypev1alpha2.VirtualMachinePreferenceSpec{
-						CPU: &instancetypev1alpha2.CPUPreferences{
-							PreferredCPUTopology: instancetypev1alpha2.PreferCores,
+					Spec: instancetypev1beta1.VirtualMachinePreferenceSpec{
+						CPU: &instancetypev1beta1.CPUPreferences{
+							PreferredCPUTopology: &preferredCPUTopology,
 						},
 					},
 				}
@@ -681,7 +798,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 			})
 
 			It("find fails when preference does not exist", func() {
-				vm.Spec.Preference.Name = "non-existing-preference"
+				vm.Spec.Preference.Name = nonExistingResourceName
 				_, err := instancetypeMethods.FindPreferenceSpec(vm)
 				Expect(err).To(HaveOccurred())
 				Expect(errors.IsNotFound(err)).To(BeTrue())
@@ -704,7 +821,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 			})
 
 			It("store fails when VirtualMachinePreference doesn't exist", func() {
-				vm.Spec.Preference.Name = "non-existing-preference"
+				vm.Spec.Preference.Name = nonExistingResourceName
 				err := instancetypeMethods.StoreControllerRevisions(vm)
 				Expect(err).To(HaveOccurred())
 				Expect(errors.IsNotFound(err)).To(BeTrue())
@@ -743,7 +860,8 @@ var _ = Describe("Instancetype and Preferences", func() {
 
 			It("store ControllerRevision fails if a revision exists with unexpected data", func() {
 				unexpectedPreference := preference.DeepCopy()
-				unexpectedPreference.Spec.CPU.PreferredCPUTopology = instancetypev1alpha2.PreferThreads
+				preferredCPUTopology := instancetypev1beta1.PreferThreads
+				unexpectedPreference.Spec.CPU.PreferredCPUTopology = &preferredCPUTopology
 
 				preferenceControllerRevision, err := instancetype.CreateControllerRevision(vm, unexpectedPreference)
 				Expect(err).ToNot(HaveOccurred())
@@ -798,8 +916,8 @@ var _ = Describe("Instancetype and Preferences", func() {
 	Context("Apply", func() {
 
 		var (
-			instancetypeSpec *instancetypev1alpha2.VirtualMachineInstancetypeSpec
-			preferenceSpec   *instancetypev1alpha2.VirtualMachinePreferenceSpec
+			instancetypeSpec *instancetypev1beta1.VirtualMachineInstancetypeSpec
+			preferenceSpec   *instancetypev1beta1.VirtualMachinePreferenceSpec
 			field            *k8sfield.Path
 		)
 
@@ -812,15 +930,79 @@ var _ = Describe("Instancetype and Preferences", func() {
 			field = k8sfield.NewPath("spec", "template", "spec")
 		})
 
+		Context("instancetype.spec.NodeSelector", func() {
+			It("should apply to VMI", func() {
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					NodeSelector: map[string]string{"key": "value"},
+				}
+
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(BeEmpty())
+				Expect(vmi.Spec.NodeSelector).To(Equal(instancetypeSpec.NodeSelector))
+			})
+
+			It("should be no-op if vmi.Spec.NodeSelector is already set but instancetype.NodeSelector is empty", func() {
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{}
+				vmi.Spec.NodeSelector = map[string]string{"key": "value"}
+
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(BeEmpty())
+				Expect(vmi.Spec.NodeSelector).To(Equal(map[string]string{"key": "value"}))
+			})
+
+			It("should return a conflict if vmi.Spec.NodeSelector is already set and instancetype.NodeSelector is defined", func() {
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					NodeSelector: map[string]string{"key": "value"},
+				}
+				vmi.Spec.NodeSelector = map[string]string{"key": "value"}
+
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(HaveLen(1))
+				Expect(conflicts[0].String()).To(Equal("spec.template.spec.nodeSelector"))
+			})
+		})
+
+		Context("instancetype.spec.SchedulerName", func() {
+			It("should apply to VMI", func() {
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					SchedulerName: "ultra-scheduler",
+				}
+
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(BeEmpty())
+				Expect(vmi.Spec.SchedulerName).To(Equal(instancetypeSpec.SchedulerName))
+			})
+
+			It("should be no-op if vmi.Spec.SchedulerName is already set but instancetype.SchedulerName is empty", func() {
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{}
+				vmi.Spec.SchedulerName = "super-fast-scheduler"
+
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(BeEmpty())
+				Expect(vmi.Spec.SchedulerName).To(Equal("super-fast-scheduler"))
+			})
+
+			It("should return a conflict if vmi.Spec.SchedulerName is already set and instancetype.SchedulerName is defined", func() {
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					SchedulerName: "ultra-fast-scheduler",
+				}
+				vmi.Spec.SchedulerName = "slow-scheduler"
+
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(HaveLen(1))
+				Expect(conflicts[0].String()).To(Equal("spec.template.spec.schedulerName"))
+			})
+		})
+
 		Context("instancetype.spec.CPU and preference.spec.CPU", func() {
 
 			BeforeEach(func() {
-				instancetypeSpec = &instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-					CPU: instancetypev1alpha2.CPUInstancetype{
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					CPU: instancetypev1beta1.CPUInstancetype{
 						Guest:                 uint32(2),
-						Model:                 "host-passthrough",
-						DedicatedCPUPlacement: true,
-						IsolateEmulatorThread: true,
+						Model:                 pointer.String("host-passthrough"),
+						DedicatedCPUPlacement: pointer.Bool(true),
+						IsolateEmulatorThread: pointer.Bool(true),
 						NUMA: &v1.NUMA{
 							GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
 						},
@@ -829,77 +1011,108 @@ var _ = Describe("Instancetype and Preferences", func() {
 						},
 					},
 				}
-				preferenceSpec = &instancetypev1alpha2.VirtualMachinePreferenceSpec{
-					CPU: &instancetypev1alpha2.CPUPreferences{},
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					CPU: &instancetypev1beta1.CPUPreferences{},
 				}
 			})
 
 			It("should default to PreferSockets", func() {
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(vmi.Spec.Domain.CPU.Sockets).To(Equal(instancetypeSpec.CPU.Guest))
 				Expect(vmi.Spec.Domain.CPU.Cores).To(Equal(uint32(1)))
 				Expect(vmi.Spec.Domain.CPU.Threads).To(Equal(uint32(1)))
-				Expect(vmi.Spec.Domain.CPU.Model).To(Equal(instancetypeSpec.CPU.Model))
-				Expect(vmi.Spec.Domain.CPU.DedicatedCPUPlacement).To(Equal(instancetypeSpec.CPU.DedicatedCPUPlacement))
-				Expect(vmi.Spec.Domain.CPU.IsolateEmulatorThread).To(Equal(instancetypeSpec.CPU.IsolateEmulatorThread))
+				Expect(vmi.Spec.Domain.CPU.Model).To(Equal(*instancetypeSpec.CPU.Model))
+				Expect(vmi.Spec.Domain.CPU.DedicatedCPUPlacement).To(Equal(*instancetypeSpec.CPU.DedicatedCPUPlacement))
+				Expect(vmi.Spec.Domain.CPU.IsolateEmulatorThread).To(Equal(*instancetypeSpec.CPU.IsolateEmulatorThread))
 				Expect(*vmi.Spec.Domain.CPU.NUMA).To(Equal(*instancetypeSpec.CPU.NUMA))
 				Expect(*vmi.Spec.Domain.CPU.Realtime).To(Equal(*instancetypeSpec.CPU.Realtime))
+			})
 
+			It("should default to Sockets, when instancetype is used with PreferAny", func() {
+				preferredCPUTopology := instancetypev1beta1.PreferAny
+				preferenceSpec.CPU.PreferredCPUTopology = &preferredCPUTopology
+
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(BeEmpty())
+				Expect(vmi.Spec.Domain.CPU.Sockets).To(Equal(instancetypeSpec.CPU.Guest))
+				Expect(vmi.Spec.Domain.CPU.Cores).To(Equal(uint32(1)))
+				Expect(vmi.Spec.Domain.CPU.Threads).To(Equal(uint32(1)))
 			})
 
 			It("should apply in full with PreferCores selected", func() {
-				preferenceSpec.CPU.PreferredCPUTopology = instancetypev1alpha2.PreferCores
+				preferredCPUTopology := instancetypev1beta1.PreferCores
+				preferenceSpec.CPU.PreferredCPUTopology = &preferredCPUTopology
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(vmi.Spec.Domain.CPU.Sockets).To(Equal(uint32(1)))
 				Expect(vmi.Spec.Domain.CPU.Cores).To(Equal(instancetypeSpec.CPU.Guest))
 				Expect(vmi.Spec.Domain.CPU.Threads).To(Equal(uint32(1)))
-				Expect(vmi.Spec.Domain.CPU.Model).To(Equal(instancetypeSpec.CPU.Model))
-				Expect(vmi.Spec.Domain.CPU.DedicatedCPUPlacement).To(Equal(instancetypeSpec.CPU.DedicatedCPUPlacement))
-				Expect(vmi.Spec.Domain.CPU.IsolateEmulatorThread).To(Equal(instancetypeSpec.CPU.IsolateEmulatorThread))
+				Expect(vmi.Spec.Domain.CPU.Model).To(Equal(*instancetypeSpec.CPU.Model))
+				Expect(vmi.Spec.Domain.CPU.DedicatedCPUPlacement).To(Equal(*instancetypeSpec.CPU.DedicatedCPUPlacement))
+				Expect(vmi.Spec.Domain.CPU.IsolateEmulatorThread).To(Equal(*instancetypeSpec.CPU.IsolateEmulatorThread))
 				Expect(*vmi.Spec.Domain.CPU.NUMA).To(Equal(*instancetypeSpec.CPU.NUMA))
 				Expect(*vmi.Spec.Domain.CPU.Realtime).To(Equal(*instancetypeSpec.CPU.Realtime))
 			})
 
 			It("should apply in full with PreferThreads selected", func() {
-				preferenceSpec.CPU.PreferredCPUTopology = instancetypev1alpha2.PreferThreads
+				preferredCPUTopology := instancetypev1beta1.PreferThreads
+				preferenceSpec.CPU.PreferredCPUTopology = &preferredCPUTopology
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(vmi.Spec.Domain.CPU.Sockets).To(Equal(uint32(1)))
 				Expect(vmi.Spec.Domain.CPU.Cores).To(Equal(uint32(1)))
 				Expect(vmi.Spec.Domain.CPU.Threads).To(Equal(instancetypeSpec.CPU.Guest))
-				Expect(vmi.Spec.Domain.CPU.Model).To(Equal(instancetypeSpec.CPU.Model))
-				Expect(vmi.Spec.Domain.CPU.DedicatedCPUPlacement).To(Equal(instancetypeSpec.CPU.DedicatedCPUPlacement))
-				Expect(vmi.Spec.Domain.CPU.IsolateEmulatorThread).To(Equal(instancetypeSpec.CPU.IsolateEmulatorThread))
+				Expect(vmi.Spec.Domain.CPU.Model).To(Equal(*instancetypeSpec.CPU.Model))
+				Expect(vmi.Spec.Domain.CPU.DedicatedCPUPlacement).To(Equal(*instancetypeSpec.CPU.DedicatedCPUPlacement))
+				Expect(vmi.Spec.Domain.CPU.IsolateEmulatorThread).To(Equal(*instancetypeSpec.CPU.IsolateEmulatorThread))
 				Expect(*vmi.Spec.Domain.CPU.NUMA).To(Equal(*instancetypeSpec.CPU.NUMA))
 				Expect(*vmi.Spec.Domain.CPU.Realtime).To(Equal(*instancetypeSpec.CPU.Realtime))
 			})
 
 			It("should apply in full with PreferSockets selected", func() {
-				preferenceSpec.CPU.PreferredCPUTopology = instancetypev1alpha2.PreferSockets
+				preferredCPUTopology := instancetypev1beta1.PreferSockets
+				preferenceSpec.CPU.PreferredCPUTopology = &preferredCPUTopology
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(vmi.Spec.Domain.CPU.Sockets).To(Equal(instancetypeSpec.CPU.Guest))
 				Expect(vmi.Spec.Domain.CPU.Cores).To(Equal(uint32(1)))
 				Expect(vmi.Spec.Domain.CPU.Threads).To(Equal(uint32(1)))
-				Expect(vmi.Spec.Domain.CPU.Model).To(Equal(instancetypeSpec.CPU.Model))
-				Expect(vmi.Spec.Domain.CPU.DedicatedCPUPlacement).To(Equal(instancetypeSpec.CPU.DedicatedCPUPlacement))
-				Expect(vmi.Spec.Domain.CPU.IsolateEmulatorThread).To(Equal(instancetypeSpec.CPU.IsolateEmulatorThread))
+				Expect(vmi.Spec.Domain.CPU.Model).To(Equal(*instancetypeSpec.CPU.Model))
+				Expect(vmi.Spec.Domain.CPU.DedicatedCPUPlacement).To(Equal(*instancetypeSpec.CPU.DedicatedCPUPlacement))
+				Expect(vmi.Spec.Domain.CPU.IsolateEmulatorThread).To(Equal(*instancetypeSpec.CPU.IsolateEmulatorThread))
 				Expect(*vmi.Spec.Domain.CPU.NUMA).To(Equal(*instancetypeSpec.CPU.NUMA))
 				Expect(*vmi.Spec.Domain.CPU.Realtime).To(Equal(*instancetypeSpec.CPU.Realtime))
 			})
 
+			DescribeTable("should spread between cores and sockets with PreferSpread selected", func(CPU, expectedCores, expectedSockets, spreadRatio int) {
+				preferredCPUTopology := instancetypev1beta1.PreferSpread
+				preferenceSpec.CPU.PreferredCPUTopology = &preferredCPUTopology
+				preferenceSpec.PreferSpreadSocketToCoreRatio = uint32(spreadRatio)
+				instancetypeSpec.CPU.Guest = uint32(CPU)
+
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(BeEmpty())
+
+				Expect(vmi.Spec.Domain.CPU.Cores).To(Equal(uint32(expectedCores)))
+				Expect(vmi.Spec.Domain.CPU.Sockets).To(Equal(uint32(expectedSockets)))
+				Expect(vmi.Spec.Domain.CPU.Threads).To(Equal(uint32(1)))
+			},
+				Entry("with default PreferSpreadSocketToCoreRatio", 4, 2, 2, 0),
+				Entry("with even PreferSpreadSocketToCoreRatio set", 8, 4, 2, 4),
+				Entry("with odd PreferSpreadSocketToCoreRatio set", 9, 3, 3, 3),
+			)
+
 			It("should return a conflict if vmi.Spec.Domain.CPU already defined", func() {
-				instancetypeSpec = &instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-					CPU: instancetypev1alpha2.CPUInstancetype{
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					CPU: instancetypev1beta1.CPUInstancetype{
 						Guest: uint32(2),
 					},
 				}
@@ -910,14 +1123,16 @@ var _ = Describe("Instancetype and Preferences", func() {
 					Threads: 1,
 				}
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
-				Expect(conflicts).To(HaveLen(1))
-				Expect(conflicts[0].String()).To(Equal("spec.template.spec.domain.cpu"))
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(HaveLen(3))
+				Expect(conflicts[0].String()).To(Equal("spec.template.spec.domain.cpu.sockets"))
+				Expect(conflicts[1].String()).To(Equal("spec.template.spec.domain.cpu.cores"))
+				Expect(conflicts[2].String()).To(Equal("spec.template.spec.domain.cpu.threads"))
 			})
 
 			It("should return a conflict if vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceCPU] already defined", func() {
-				instancetypeSpec = &instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-					CPU: instancetypev1alpha2.CPUInstancetype{
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					CPU: instancetypev1beta1.CPUInstancetype{
 						Guest: uint32(2),
 					},
 				}
@@ -928,14 +1143,14 @@ var _ = Describe("Instancetype and Preferences", func() {
 					},
 				}
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(HaveLen(1))
 				Expect(conflicts[0].String()).To(Equal("spec.template.spec.domain.resources.requests.cpu"))
 			})
 
 			It("should return a conflict if vmi.Spec.Domain.Resources.Limits[k8sv1.ResourceCPU] already defined", func() {
-				instancetypeSpec = &instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-					CPU: instancetypev1alpha2.CPUInstancetype{
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					CPU: instancetypev1beta1.CPUInstancetype{
 						Guest: uint32(2),
 					},
 				}
@@ -946,15 +1161,53 @@ var _ = Describe("Instancetype and Preferences", func() {
 					},
 				}
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(HaveLen(1))
 				Expect(conflicts[0].String()).To(Equal("spec.template.spec.domain.resources.limits.cpu"))
 			})
+
+			It("should apply PreferredCPUFeatures", func() {
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					CPU: &instancetypev1beta1.CPUPreferences{
+						PreferredCPUFeatures: []v1.CPUFeature{
+							{
+								Name:   "foo",
+								Policy: "require",
+							},
+							{
+								Name:   "bar",
+								Policy: "force",
+							},
+						},
+					},
+				}
+				vmi.Spec.Domain.CPU = &v1.CPU{
+					Features: []v1.CPUFeature{
+						{
+							Name:   "bar",
+							Policy: "optional",
+						},
+					},
+				}
+				Expect(instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)).To(BeEmpty())
+				Expect(vmi.Spec.Domain.CPU.Features).To(HaveLen(2))
+				Expect(vmi.Spec.Domain.CPU.Features).To(ContainElements([]v1.CPUFeature{
+					{
+						Name:   "foo",
+						Policy: "require",
+					},
+					{
+						Name:   "bar",
+						Policy: "optional",
+					},
+				}))
+			})
 		})
+
 		Context("instancetype.Spec.Memory", func() {
 			BeforeEach(func() {
-				instancetypeSpec = &instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-					Memory: instancetypev1alpha2.MemoryInstancetype{
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					Memory: instancetypev1beta1.MemoryInstancetype{
 						Guest: resource.MustParse("512M"),
 						Hugepages: &v1.Hugepages{
 							PageSize: "1Gi",
@@ -964,11 +1217,24 @@ var _ = Describe("Instancetype and Preferences", func() {
 			})
 
 			It("should apply to VMI", func() {
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(*vmi.Spec.Domain.Memory.Guest).To(Equal(instancetypeSpec.Memory.Guest))
 				Expect(*vmi.Spec.Domain.Memory.Hugepages).To(Equal(*instancetypeSpec.Memory.Hugepages))
+			})
+
+			It("should apply memory overcommit correctly to VMI", func() {
+				instancetypeSpec.Memory.Hugepages = nil
+				instancetypeSpec.Memory.OvercommitPercent = 15
+
+				expectedOverhead := int64(float32(instancetypeSpec.Memory.Guest.Value()) * (1 - float32(instancetypeSpec.Memory.OvercommitPercent)/100))
+				Expect(expectedOverhead).ToNot(Equal(instancetypeSpec.Memory.Guest.Value()))
+
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(BeEmpty())
+				memRequest := vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory]
+				Expect(memRequest.Value()).To(Equal(expectedOverhead))
 			})
 
 			It("should detect memory conflict", func() {
@@ -977,14 +1243,14 @@ var _ = Describe("Instancetype and Preferences", func() {
 					Guest: &vmiMemGuest,
 				}
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(HaveLen(1))
 				Expect(conflicts[0].String()).To(Equal("spec.template.spec.domain.memory"))
 			})
 
 			It("should return a conflict if vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory] already defined", func() {
-				instancetypeSpec = &instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-					Memory: instancetypev1alpha2.MemoryInstancetype{
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					Memory: instancetypev1beta1.MemoryInstancetype{
 						Guest: resource.MustParse("512M"),
 					},
 				}
@@ -995,14 +1261,14 @@ var _ = Describe("Instancetype and Preferences", func() {
 					},
 				}
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(HaveLen(1))
 				Expect(conflicts[0].String()).To(Equal("spec.template.spec.domain.resources.requests.memory"))
 			})
 
 			It("should return a conflict if vmi.Spec.Domain.Resources.Limits[k8sv1.ResourceMemory] already defined", func() {
-				instancetypeSpec = &instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-					Memory: instancetypev1alpha2.MemoryInstancetype{
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					Memory: instancetypev1beta1.MemoryInstancetype{
 						Guest: resource.MustParse("512M"),
 					},
 				}
@@ -1013,7 +1279,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 					},
 				}
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(HaveLen(1))
 				Expect(conflicts[0].String()).To(Equal("spec.template.spec.domain.resources.limits.memory"))
 			})
@@ -1024,13 +1290,13 @@ var _ = Describe("Instancetype and Preferences", func() {
 
 			BeforeEach(func() {
 				instancetypePolicy = v1.IOThreadsPolicyShared
-				instancetypeSpec = &instancetypev1alpha2.VirtualMachineInstancetypeSpec{
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
 					IOThreadsPolicy: &instancetypePolicy,
 				}
 			})
 
 			It("should apply to VMI", func() {
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(*vmi.Spec.Domain.IOThreadsPolicy).To(Equal(*instancetypeSpec.IOThreadsPolicy))
@@ -1039,7 +1305,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 			It("should detect IOThreadsPolicy conflict", func() {
 				vmi.Spec.Domain.IOThreadsPolicy = &instancetypePolicy
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(HaveLen(1))
 				Expect(conflicts[0].String()).To(Equal("spec.template.spec.domain.ioThreadsPolicy"))
 			})
@@ -1048,7 +1314,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 		Context("instancetype.Spec.LaunchSecurity", func() {
 
 			BeforeEach(func() {
-				instancetypeSpec = &instancetypev1alpha2.VirtualMachineInstancetypeSpec{
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
 					LaunchSecurity: &v1.LaunchSecurity{
 						SEV: &v1.SEV{},
 					},
@@ -1056,7 +1322,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 			})
 
 			It("should apply to VMI", func() {
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(*vmi.Spec.Domain.LaunchSecurity).To(Equal(*instancetypeSpec.LaunchSecurity))
@@ -1067,7 +1333,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 					SEV: &v1.SEV{},
 				}
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(HaveLen(1))
 				Expect(conflicts[0].String()).To(Equal("spec.template.spec.domain.launchSecurity"))
 			})
@@ -1076,7 +1342,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 		Context("instancetype.Spec.GPUs", func() {
 
 			BeforeEach(func() {
-				instancetypeSpec = &instancetypev1alpha2.VirtualMachineInstancetypeSpec{
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
 					GPUs: []v1.GPU{
 						{
 							Name:       "barfoo",
@@ -1087,7 +1353,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 			})
 
 			It("should apply to VMI", func() {
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(vmi.Spec.Domain.Devices.GPUs).To(Equal(instancetypeSpec.GPUs))
@@ -1101,7 +1367,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 					},
 				}
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(HaveLen(1))
 				Expect(conflicts[0].String()).To(Equal("spec.template.spec.domain.devices.gpus"))
 			})
@@ -1110,7 +1376,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 		Context("instancetype.Spec.HostDevices", func() {
 
 			BeforeEach(func() {
-				instancetypeSpec = &instancetypev1alpha2.VirtualMachineInstancetypeSpec{
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
 					HostDevices: []v1.HostDevice{
 						{
 							Name:       "foobar",
@@ -1121,7 +1387,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 			})
 
 			It("should apply to VMI", func() {
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(vmi.Spec.Domain.Devices.HostDevices).To(Equal(instancetypeSpec.HostDevices))
@@ -1135,9 +1401,92 @@ var _ = Describe("Instancetype and Preferences", func() {
 					},
 				}
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(HaveLen(1))
 				Expect(conflicts[0].String()).To(Equal("spec.template.spec.domain.devices.hostDevices"))
+			})
+		})
+
+		Context("Instancetype.Spec.Annotations", func() {
+
+			var multipleAnnotations map[string]string
+
+			BeforeEach(func() {
+				multipleAnnotations = map[string]string{
+					"annotation-1": "1",
+					"annotation-2": "2",
+				}
+
+				instancetypeSpec = &instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					Annotations: make(map[string]string),
+				}
+			})
+
+			It("should apply to VMI", func() {
+				instancetypeSpec.Annotations = multipleAnnotations
+
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, nil, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(BeEmpty())
+				Expect(vmi.Annotations).To(Equal(instancetypeSpec.Annotations))
+			})
+
+			It("should not detect conflict when annotation with the same value already exists", func() {
+				instancetypeSpec.Annotations = multipleAnnotations
+				vmi.Annotations = multipleAnnotations
+
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, nil, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(BeEmpty())
+				Expect(vmi.Annotations).To(Equal(instancetypeSpec.Annotations))
+			})
+
+			It("should detect conflict when annotation with different value already exists", func() {
+				instancetypeSpec.Annotations = multipleAnnotations
+				vmi.Annotations = map[string]string{
+					"annotation-1": "conflict",
+				}
+
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, nil, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(HaveLen(1))
+				Expect(conflicts[0].String()).To(Equal("annotations.annotation-1"))
+			})
+		})
+
+		Context("Preference.Spec.Annotations", func() {
+
+			var multipleAnnotations map[string]string
+
+			BeforeEach(func() {
+				multipleAnnotations = map[string]string{
+					"annotation-1": "1",
+					"annotation-2": "2",
+				}
+
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Annotations: make(map[string]string),
+				}
+			})
+
+			It("should apply to VMI", func() {
+				preferenceSpec.Annotations = multipleAnnotations
+
+				conflicts := instancetypeMethods.ApplyToVmi(field, nil, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(BeEmpty())
+				Expect(vmi.Annotations).To(Equal(preferenceSpec.Annotations))
+			})
+
+			It("should not overwrite already existing values", func() {
+				preferenceSpec.Annotations = multipleAnnotations
+				vmiAnnotations := map[string]string{
+					"annotation-1": "dont-overwrite",
+					"annotation-2": "dont-overwrite",
+					"annotation-3": "dont-overwrite",
+				}
+				vmi.Annotations = vmiAnnotations
+
+				conflicts := instancetypeMethods.ApplyToVmi(field, nil, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(BeEmpty())
+				Expect(vmi.Annotations).To(HaveLen(3))
+				Expect(vmi.Annotations).To(Equal(vmiAnnotations))
 			})
 		})
 
@@ -1206,14 +1555,17 @@ var _ = Describe("Instancetype and Preferences", func() {
 				}
 				vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{
 					{
+						Name:  "primary",
 						Model: "e1000",
 					},
-					{},
+					{
+						Name: "secondary",
+					},
 				}
 				vmi.Spec.Domain.Devices.Sound = &v1.SoundDevice{}
 
-				preferenceSpec = &instancetypev1alpha2.VirtualMachinePreferenceSpec{
-					Devices: &instancetypev1alpha2.DevicePreferences{
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Devices: &instancetypev1beta1.DevicePreferences{
 						PreferredAutoattachGraphicsDevice:   pointer.Bool(true),
 						PreferredAutoattachMemBalloon:       pointer.Bool(true),
 						PreferredAutoattachPodInterface:     pointer.Bool(true),
@@ -1230,23 +1582,51 @@ var _ = Describe("Instancetype and Preferences", func() {
 								Physical: 4096,
 							},
 						},
-						PreferredDiskCache:      v1.CacheWriteThrough,
-						PreferredDiskIO:         v1.IONative,
-						PreferredDiskBus:        v1.DiskBusVirtio,
-						PreferredCdromBus:       v1.DiskBusSCSI,
-						PreferredLunBus:         v1.DiskBusSATA,
-						PreferredInputBus:       v1.InputBusVirtio,
-						PreferredInputType:      v1.InputTypeTablet,
-						PreferredInterfaceModel: v1.VirtIO,
-						PreferredSoundModel:     "ac97",
-						PreferredRng:            &v1.Rng{},
-						PreferredTPM:            &v1.TPMDevice{},
+						PreferredDiskCache:           v1.CacheWriteThrough,
+						PreferredDiskIO:              v1.IONative,
+						PreferredDiskBus:             v1.DiskBusVirtio,
+						PreferredCdromBus:            v1.DiskBusSCSI,
+						PreferredLunBus:              v1.DiskBusSATA,
+						PreferredInputBus:            v1.InputBusVirtio,
+						PreferredInputType:           v1.InputTypeTablet,
+						PreferredInterfaceModel:      v1.VirtIO,
+						PreferredSoundModel:          "ac97",
+						PreferredRng:                 &v1.Rng{},
+						PreferredTPM:                 &v1.TPMDevice{},
+						PreferredInterfaceMasquerade: &v1.InterfaceMasquerade{},
 					},
 				}
 			})
 
+			Context("PreferredInterfaceMasquerade", func() {
+				It("should be applied to interface on Pod network", func() {
+					vmi.Spec.Networks = []v1.Network{{
+						Name: vmi.Spec.Domain.Devices.Interfaces[0].Name,
+						NetworkSource: v1.NetworkSource{
+							Pod: &v1.PodNetwork{},
+						},
+					}}
+					Expect(instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)).To(BeNil())
+					Expect(vmi.Spec.Domain.Devices.Interfaces[0].Masquerade).ToNot(BeNil())
+					Expect(vmi.Spec.Domain.Devices.Interfaces[1].Masquerade).To(BeNil())
+				})
+				It("should not be applied on interface that has another binding set", func() {
+					vmi.Spec.Domain.Devices.Interfaces[0].SRIOV = &v1.InterfaceSRIOV{}
+					Expect(instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)).To(BeNil())
+					Expect(vmi.Spec.Domain.Devices.Interfaces[0].Masquerade).To(BeNil())
+					Expect(vmi.Spec.Domain.Devices.Interfaces[0].SRIOV).ToNot(BeNil())
+				})
+				It("should not be applied on interface that is not on Pod network", func() {
+					vmi.Spec.Networks = []v1.Network{{
+						Name: vmi.Spec.Domain.Devices.Interfaces[0].Name,
+					}}
+					Expect(instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)).To(BeNil())
+					Expect(vmi.Spec.Domain.Devices.Interfaces[0].Masquerade).To(BeNil())
+				})
+			})
+
 			It("should apply to VMI", func() {
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(*vmi.Spec.Domain.Devices.AutoattachGraphicsDevice).To(BeFalse())
@@ -1288,10 +1668,20 @@ var _ = Describe("Instancetype and Preferences", func() {
 			It("Should apply when a VMI disk doesn't have a DiskDevice target defined", func() {
 				vmi.Spec.Domain.Devices.Disks[1].DiskDevice.Disk = nil
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(vmi.Spec.Domain.Devices.Disks[1].DiskDevice.Disk.Bus).To(Equal(preferenceSpec.Devices.PreferredDiskBus))
+			})
+
+			It("[test_id:CNV-9817] Should ignore preference when a VMI disk have a DiskDevice defined", func() {
+				diskTypeForTest := v1.DiskBusSCSI
+
+				vmi.Spec.Domain.Devices.Disks[1].DiskDevice.Disk.Bus = diskTypeForTest
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
+				Expect(conflicts).To(BeEmpty())
+
+				Expect(vmi.Spec.Domain.Devices.Disks[1].DiskDevice.Disk.Bus).To(Equal(diskTypeForTest))
 			})
 		})
 
@@ -1299,8 +1689,8 @@ var _ = Describe("Instancetype and Preferences", func() {
 
 			BeforeEach(func() {
 				spinLockRetries := uint32(32)
-				preferenceSpec = &instancetypev1alpha2.VirtualMachinePreferenceSpec{
-					Features: &instancetypev1alpha2.FeaturePreferences{
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Features: &instancetypev1beta1.FeaturePreferences{
 						PreferredAcpi: &v1.FeatureState{},
 						PreferredApic: &v1.FeatureAPIC{
 							Enabled:        pointer.Bool(true),
@@ -1341,7 +1731,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 			})
 
 			It("should apply to VMI", func() {
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(vmi.Spec.Domain.Features.ACPI).To(Equal(*preferenceSpec.Features.PreferredAcpi))
@@ -1361,7 +1751,7 @@ var _ = Describe("Instancetype and Preferences", func() {
 					},
 				}
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(*vmi.Spec.Domain.Features.Hyperv.EVMCS.Enabled).To(BeFalse())
@@ -1371,8 +1761,8 @@ var _ = Describe("Instancetype and Preferences", func() {
 		Context("Preference.Firmware", func() {
 
 			It("should apply BIOS preferences full to VMI", func() {
-				preferenceSpec = &instancetypev1alpha2.VirtualMachinePreferenceSpec{
-					Firmware: &instancetypev1alpha2.FirmwarePreferences{
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Firmware: &instancetypev1beta1.FirmwarePreferences{
 						PreferredUseBios:       pointer.Bool(true),
 						PreferredUseBiosSerial: pointer.Bool(true),
 						PreferredUseEfi:        pointer.Bool(false),
@@ -1380,15 +1770,15 @@ var _ = Describe("Instancetype and Preferences", func() {
 					},
 				}
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(*vmi.Spec.Domain.Firmware.Bootloader.BIOS.UseSerial).To(Equal(*preferenceSpec.Firmware.PreferredUseBiosSerial))
 			})
 
 			It("should apply SecureBoot preferences full to VMI", func() {
-				preferenceSpec = &instancetypev1alpha2.VirtualMachinePreferenceSpec{
-					Firmware: &instancetypev1alpha2.FirmwarePreferences{
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Firmware: &instancetypev1beta1.FirmwarePreferences{
 						PreferredUseBios:       pointer.Bool(false),
 						PreferredUseBiosSerial: pointer.Bool(false),
 						PreferredUseEfi:        pointer.Bool(true),
@@ -1396,23 +1786,97 @@ var _ = Describe("Instancetype and Preferences", func() {
 					},
 				}
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(*vmi.Spec.Domain.Firmware.Bootloader.EFI.SecureBoot).To(Equal(*preferenceSpec.Firmware.PreferredUseSecureBoot))
+			})
+
+			It("should not overwrite user defined Bootloader.BIOS with PreferredUseEfi - bug #10313", func() {
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Firmware: &instancetypev1beta1.FirmwarePreferences{
+						PreferredUseEfi:        pointer.Bool(true),
+						PreferredUseSecureBoot: pointer.Bool(true),
+					},
+				}
+				vmi.Spec.Domain.Firmware = &v1.Firmware{
+					Bootloader: &v1.Bootloader{
+						BIOS: &v1.BIOS{
+							UseSerial: pointer.Bool(false),
+						},
+					},
+				}
+				Expect(instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)).To(BeEmpty())
+				Expect(vmi.Spec.Domain.Firmware.Bootloader.EFI).To(BeNil())
+				Expect(*vmi.Spec.Domain.Firmware.Bootloader.BIOS.UseSerial).To(BeFalse())
+			})
+
+			It("should not overwrite user defined value with PreferredUseBiosSerial - bug #10313", func() {
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Firmware: &instancetypev1beta1.FirmwarePreferences{
+						PreferredUseBios:       pointer.Bool(true),
+						PreferredUseBiosSerial: pointer.Bool(true),
+					},
+				}
+				vmi.Spec.Domain.Firmware = &v1.Firmware{
+					Bootloader: &v1.Bootloader{
+						BIOS: &v1.BIOS{
+							UseSerial: pointer.Bool(false),
+						},
+					},
+				}
+				Expect(instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)).To(BeEmpty())
+				Expect(*vmi.Spec.Domain.Firmware.Bootloader.BIOS.UseSerial).To(BeFalse())
+			})
+
+			It("should not overwrite user defined Bootloader.EFI with PreferredUseBios - bug #10313", func() {
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Firmware: &instancetypev1beta1.FirmwarePreferences{
+						PreferredUseBios:       pointer.Bool(true),
+						PreferredUseBiosSerial: pointer.Bool(true),
+					},
+				}
+				vmi.Spec.Domain.Firmware = &v1.Firmware{
+					Bootloader: &v1.Bootloader{
+						EFI: &v1.EFI{
+							SecureBoot: pointer.Bool(false),
+						},
+					},
+				}
+				Expect(instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)).To(BeEmpty())
+				Expect(vmi.Spec.Domain.Firmware.Bootloader.BIOS).To(BeNil())
+				Expect(*vmi.Spec.Domain.Firmware.Bootloader.EFI.SecureBoot).To(BeFalse())
+			})
+
+			It("should not overwrite user defined value with PreferredUseSecureBoot - bug #10313", func() {
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Firmware: &instancetypev1beta1.FirmwarePreferences{
+						PreferredUseEfi:        pointer.Bool(true),
+						PreferredUseSecureBoot: pointer.Bool(true),
+					},
+				}
+				vmi.Spec.Domain.Firmware = &v1.Firmware{
+					Bootloader: &v1.Bootloader{
+						EFI: &v1.EFI{
+							SecureBoot: pointer.Bool(false),
+						},
+					},
+				}
+				Expect(instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)).To(BeEmpty())
+				Expect(*vmi.Spec.Domain.Firmware.Bootloader.EFI.SecureBoot).To(BeFalse())
 			})
 		})
 
 		Context("Preference.Machine", func() {
 
 			It("should apply to VMI", func() {
-				preferenceSpec = &instancetypev1alpha2.VirtualMachinePreferenceSpec{
-					Machine: &instancetypev1alpha2.MachinePreferences{
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Machine: &instancetypev1beta1.MachinePreferences{
 						PreferredMachineType: "q35-rhel-8.0",
 					},
 				}
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(vmi.Spec.Domain.Machine.Type).To(Equal(preferenceSpec.Machine.PreferredMachineType))
@@ -1421,8 +1885,8 @@ var _ = Describe("Instancetype and Preferences", func() {
 		Context("Preference.Clock", func() {
 
 			It("should apply to VMI", func() {
-				preferenceSpec = &instancetypev1alpha2.VirtualMachinePreferenceSpec{
-					Clock: &instancetypev1alpha2.ClockPreferences{
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Clock: &instancetypev1beta1.ClockPreferences{
 						PreferredClockOffset: &v1.ClockOffset{
 							UTC: &v1.ClockOffsetUTC{
 								OffsetSeconds: pointer.Int(30),
@@ -1434,12 +1898,397 @@ var _ = Describe("Instancetype and Preferences", func() {
 					},
 				}
 
-				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec)
+				conflicts := instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 				Expect(conflicts).To(BeEmpty())
 
 				Expect(vmi.Spec.Domain.Clock.ClockOffset).To(Equal(*preferenceSpec.Clock.PreferredClockOffset))
 				Expect(*vmi.Spec.Domain.Clock.Timer).To(Equal(*preferenceSpec.Clock.PreferredTimer))
 			})
 		})
+
+		Context("Preference.PreferredSubdomain", func() {
+			It("should apply to VMI", func() {
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					PreferredSubdomain: pointer.String("kubevirt.io"),
+				}
+				Expect(instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)).To(BeEmpty())
+				Expect(vmi.Spec.Subdomain).To(Equal(*preferenceSpec.PreferredSubdomain))
+			})
+
+			It("should not overwrite user defined value", func() {
+				const userDefinedValue = "foo.com"
+				vmi.Spec.Subdomain = userDefinedValue
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					PreferredSubdomain: pointer.String("kubevirt.io"),
+				}
+				Expect(instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)).To(BeEmpty())
+				Expect(vmi.Spec.Subdomain).To(Equal(userDefinedValue))
+			})
+		})
+
+		Context("Preference.PreferredTerminationGracePeriodSeconds", func() {
+			It("should apply to VMI", func() {
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					PreferredTerminationGracePeriodSeconds: pointer.Int64(180),
+				}
+				Expect(instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)).To(BeEmpty())
+				Expect(*vmi.Spec.TerminationGracePeriodSeconds).To(Equal(*preferenceSpec.PreferredTerminationGracePeriodSeconds))
+			})
+
+			It("should not overwrite user defined value", func() {
+				const userDefinedValue = int64(100)
+				vmi.Spec.TerminationGracePeriodSeconds = pointer.Int64(userDefinedValue)
+				preferenceSpec = &instancetypev1beta1.VirtualMachinePreferenceSpec{
+					PreferredTerminationGracePeriodSeconds: pointer.Int64(180),
+				}
+				Expect(instancetypeMethods.ApplyToVmi(field, instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)).To(BeEmpty())
+				Expect(*vmi.Spec.TerminationGracePeriodSeconds).To(Equal(userDefinedValue))
+			})
+		})
+	})
+
+	Context("preference requirements check", func() {
+		var (
+			preferCores   = instancetypev1beta1.PreferCores
+			preferSockets = instancetypev1beta1.PreferSockets
+			preferThreads = instancetypev1beta1.PreferThreads
+			preferSpread  = instancetypev1beta1.PreferSpread
+			preferAny     = instancetypev1beta1.PreferAny
+		)
+
+		DescribeTable("should pass when sufficient resources are provided", func(instancetypeSpec *instancetypev1beta1.VirtualMachineInstancetypeSpec, preferenceSpec *instancetypev1beta1.VirtualMachinePreferenceSpec, vmiSpec *v1.VirtualMachineInstanceSpec) {
+			path, err := instancetypeMethods.CheckPreferenceRequirements(instancetypeSpec, preferenceSpec, vmiSpec)
+			Expect(path).To(BeNil())
+			Expect(err).ToNot(HaveOccurred())
+		},
+			Entry("by an instance type for vCPUs",
+				&instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					CPU: instancetypev1beta1.CPUInstancetype{
+						Guest: uint32(2),
+					},
+				},
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						CPU: &instancetypev1beta1.CPUPreferenceRequirement{
+							Guest: uint32(2),
+						},
+					},
+				},
+				nil,
+			),
+			Entry("by an instance type for Memory",
+				&instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					Memory: instancetypev1beta1.MemoryInstancetype{
+						Guest: resource.MustParse("1Gi"),
+					},
+				},
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						Memory: &instancetypev1beta1.MemoryPreferenceRequirement{
+							Guest: resource.MustParse("1Gi"),
+						},
+					},
+				},
+				nil,
+			),
+			Entry("by a VM for vCPUs using PreferSockets (default)",
+				nil,
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					CPU: &instancetypev1beta1.CPUPreferences{
+						PreferredCPUTopology: &preferSockets,
+					},
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						CPU: &instancetypev1beta1.CPUPreferenceRequirement{
+							Guest: uint32(2),
+						},
+					},
+				},
+				&v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						CPU: &v1.CPU{
+							Sockets: uint32(2),
+						},
+					},
+				},
+			),
+			Entry("by a VM for vCPUs using PreferCores",
+				nil,
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					CPU: &instancetypev1beta1.CPUPreferences{
+						PreferredCPUTopology: &preferCores,
+					},
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						CPU: &instancetypev1beta1.CPUPreferenceRequirement{
+							Guest: uint32(2),
+						},
+					},
+				},
+				&v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						CPU: &v1.CPU{
+							Cores: uint32(2),
+						},
+					},
+				},
+			),
+			Entry("by a VM for vCPUs using PreferThreads",
+				nil,
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					CPU: &instancetypev1beta1.CPUPreferences{
+						PreferredCPUTopology: &preferThreads,
+					},
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						CPU: &instancetypev1beta1.CPUPreferenceRequirement{
+							Guest: uint32(2),
+						},
+					},
+				},
+				&v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						CPU: &v1.CPU{
+							Threads: uint32(2),
+						},
+					},
+				},
+			),
+			Entry("by a VM for vCPUs using PreferSpread",
+				nil,
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					CPU: &instancetypev1beta1.CPUPreferences{
+						PreferredCPUTopology: &preferSpread,
+					},
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						CPU: &instancetypev1beta1.CPUPreferenceRequirement{
+							Guest: uint32(6),
+						},
+					},
+				},
+				&v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						CPU: &v1.CPU{
+							Cores:   uint32(2),
+							Sockets: uint32(3),
+						},
+					},
+				},
+			),
+			Entry("by a VM for vCPUs using PreferAny",
+				nil,
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					CPU: &instancetypev1beta1.CPUPreferences{
+						PreferredCPUTopology: &preferAny,
+					},
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						CPU: &instancetypev1beta1.CPUPreferenceRequirement{
+							Guest: uint32(4),
+						},
+					},
+				},
+				&v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						CPU: &v1.CPU{
+							Cores:   uint32(2),
+							Sockets: uint32(2),
+							Threads: uint32(1),
+						},
+					},
+				},
+			),
+			Entry("by a VM for Memory",
+				nil,
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						Memory: &instancetypev1beta1.MemoryPreferenceRequirement{
+							Guest: resource.MustParse("1Gi"),
+						},
+					},
+				},
+				&v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						Memory: &v1.Memory{
+							Guest: resource.NewQuantity(1024*1024*1024, resource.BinarySI),
+						},
+					},
+				},
+			),
+		)
+
+		DescribeTable("should be rejected when insufficient resources are provided", func(instancetypeSpec *instancetypev1beta1.VirtualMachineInstancetypeSpec, preferenceSpec *instancetypev1beta1.VirtualMachinePreferenceSpec, vmiSpec *v1.VirtualMachineInstanceSpec, expectedConflict instancetype.Conflicts, errSubString string) {
+			conflicts, err := instancetypeMethods.CheckPreferenceRequirements(instancetypeSpec, preferenceSpec, vmiSpec)
+			Expect(conflicts).To(Equal(expectedConflict))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring(errSubString))
+		},
+			Entry("by an instance type for vCPUs",
+				&instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					CPU: instancetypev1beta1.CPUInstancetype{
+						Guest: uint32(1),
+					},
+				},
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						CPU: &instancetypev1beta1.CPUPreferenceRequirement{
+							Guest: uint32(2),
+						},
+					},
+				},
+				nil,
+				instancetype.Conflicts{k8sfield.NewPath("spec", "instancetype")},
+				fmt.Sprintf(instancetype.InsufficientInstanceTypeCPUResourcesErrorFmt, uint32(1), uint32(2)),
+			),
+			Entry("by an instance type for Memory",
+				&instancetypev1beta1.VirtualMachineInstancetypeSpec{
+					Memory: instancetypev1beta1.MemoryInstancetype{
+						Guest: resource.MustParse("1Gi"),
+					},
+				},
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						Memory: &instancetypev1beta1.MemoryPreferenceRequirement{
+							Guest: resource.MustParse("2Gi"),
+						},
+					},
+				},
+				nil,
+				instancetype.Conflicts{k8sfield.NewPath("spec", "instancetype")},
+				fmt.Sprintf(instancetype.InsufficientInstanceTypeMemoryResourcesErrorFmt, "1Gi", "2Gi"),
+			),
+			Entry("by a VM for vCPUs using PreferSockets (default)",
+				nil,
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					CPU: &instancetypev1beta1.CPUPreferences{
+						PreferredCPUTopology: &preferSockets,
+					},
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						CPU: &instancetypev1beta1.CPUPreferenceRequirement{
+							Guest: uint32(2),
+						},
+					},
+				},
+				&v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						CPU: &v1.CPU{
+							Sockets: uint32(1),
+						},
+					},
+				},
+				instancetype.Conflicts{k8sfield.NewPath("spec", "template", "spec", "domain", "cpu", "sockets")},
+				fmt.Sprintf(instancetype.InsufficientVMCPUResourcesErrorFmt, uint32(1), uint32(2), "sockets"),
+			),
+			Entry("by a VM for vCPUs using PreferCores",
+				nil,
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					CPU: &instancetypev1beta1.CPUPreferences{
+						PreferredCPUTopology: &preferCores,
+					},
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						CPU: &instancetypev1beta1.CPUPreferenceRequirement{
+							Guest: uint32(2),
+						},
+					},
+				},
+				&v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						CPU: &v1.CPU{
+							Cores: uint32(1),
+						},
+					},
+				},
+				instancetype.Conflicts{k8sfield.NewPath("spec", "template", "spec", "domain", "cpu", "cores")},
+				fmt.Sprintf(instancetype.InsufficientVMCPUResourcesErrorFmt, uint32(1), uint32(2), "cores"),
+			),
+			Entry("by a VM for vCPUs using PreferThreads",
+				nil,
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					CPU: &instancetypev1beta1.CPUPreferences{
+						PreferredCPUTopology: &preferThreads,
+					},
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						CPU: &instancetypev1beta1.CPUPreferenceRequirement{
+							Guest: uint32(2),
+						},
+					},
+				},
+				&v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						CPU: &v1.CPU{
+							Threads: uint32(1),
+						},
+					},
+				},
+				instancetype.Conflicts{k8sfield.NewPath("spec", "template", "spec", "domain", "cpu", "threads")},
+				fmt.Sprintf(instancetype.InsufficientVMCPUResourcesErrorFmt, uint32(1), uint32(2), "threads"),
+			),
+			Entry("by a VM for vCPUs using PreferSpread",
+				nil,
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					CPU: &instancetypev1beta1.CPUPreferences{
+						PreferredCPUTopology: &preferSpread,
+					},
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						CPU: &instancetypev1beta1.CPUPreferenceRequirement{
+							Guest: uint32(4),
+						},
+					},
+				},
+				&v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						CPU: &v1.CPU{
+							Cores:   uint32(1),
+							Sockets: uint32(1),
+						},
+					},
+				},
+				instancetype.Conflicts{k8sfield.NewPath("spec", "template", "spec", "domain", "cpu", "cores"), k8sfield.NewPath("spec", "template", "spec", "domain", "cpu", "sockets")},
+				fmt.Sprintf(instancetype.InsufficientVMCPUResourcesErrorFmt, uint32(1), uint32(4), "cores and sockets"),
+			),
+			Entry("by a VM for vCPUs using PreferAny",
+				nil,
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					CPU: &instancetypev1beta1.CPUPreferences{
+						PreferredCPUTopology: &preferAny,
+					},
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						CPU: &instancetypev1beta1.CPUPreferenceRequirement{
+							Guest: uint32(4),
+						},
+					},
+				},
+				&v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						CPU: &v1.CPU{
+							Sockets: uint32(2),
+							Cores:   uint32(1),
+							Threads: uint32(1),
+						},
+					},
+				},
+				instancetype.Conflicts{
+					k8sfield.NewPath("spec", "template", "spec", "domain", "cpu", "cores"),
+					k8sfield.NewPath("spec", "template", "spec", "domain", "cpu", "sockets"),
+					k8sfield.NewPath("spec", "template", "spec", "domain", "cpu", "threads"),
+				},
+				fmt.Sprintf(instancetype.InsufficientVMCPUResourcesErrorFmt, uint32(2), uint32(4), "cores, sockets and threads"),
+			),
+			Entry("by a VM for Memory",
+				nil,
+				&instancetypev1beta1.VirtualMachinePreferenceSpec{
+					Requirements: &instancetypev1beta1.PreferenceRequirements{
+						Memory: &instancetypev1beta1.MemoryPreferenceRequirement{
+							Guest: resource.MustParse("2Gi"),
+						},
+					},
+				},
+				&v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						Memory: &v1.Memory{
+							Guest: resource.NewQuantity(1024*1024*1024, resource.BinarySI),
+						},
+					},
+				},
+				instancetype.Conflicts{k8sfield.NewPath("spec", "template", "spec", "domain", "memory")},
+				fmt.Sprintf(instancetype.InsufficientVMMemoryResourcesErrorFmt, "1Gi", "2Gi"),
+			))
+
 	})
 })

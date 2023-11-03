@@ -25,6 +25,8 @@ import (
 	"strings"
 	"time"
 
+	"kubevirt.io/kubevirt/tests/libmigration"
+
 	"kubevirt.io/kubevirt/pkg/virt-operator/resource/generate/components"
 	"kubevirt.io/kubevirt/tests/libnode"
 
@@ -129,9 +131,9 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 				Expect(err).ToNot(HaveOccurred())
 				libwait.WaitForSuccessfulVMIStart(vmi)
 
-				domSpec, err := tests.GetRunningVMIDomainSpec(vmi)
+				emulator, err := tests.GetRunningVMIEmulator(vmi)
 				Expect(err).ToNot(HaveOccurred())
-				emulator := "[/]" + strings.TrimPrefix(domSpec.Devices.Emulator, "/")
+				emulator = "[/]" + strings.TrimPrefix(emulator, "/")
 
 				pod := tests.GetRunningPodByVirtualMachineInstance(vmi, testsuite.GetTestNamespace(vmi))
 				qemuProcessSelinuxContext, err := exec.ExecuteCommandOnPod(
@@ -142,10 +144,10 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 				)
 				Expect(err).ToNot(HaveOccurred())
 
-				By("Checking that qemu-kvm process is of the SELinux type container_t")
+				By("Checking that qemu process is of the SELinux type container_t")
 				Expect(strings.Split(qemuProcessSelinuxContext, ":")[2]).To(Equal("container_t"))
 
-				By("Checking that qemu-kvm process has SELinux category_set")
+				By("Checking that qemu process has SELinux category_set")
 				Expect(strings.Split(qemuProcessSelinuxContext, ":")).To(HaveLen(5))
 
 				err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Delete(context.Background(), vmi.Name, &metav1.DeleteOptions{})
@@ -205,9 +207,9 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 				libwait.WaitUntilVMIReady(vmi, console.LoginToAlpine)
 
 				By("Fetching virt-launcher Pod")
-				domSpec, err := tests.GetRunningVMIDomainSpec(vmi)
+				emulator, err := tests.GetRunningVMIEmulator(vmi)
 				Expect(err).ToNot(HaveOccurred())
-				emulator := "[/]" + strings.TrimPrefix(domSpec.Devices.Emulator, "/")
+				emulator = "[/]" + strings.TrimPrefix(emulator, "/")
 
 				pod, err := libvmi.GetPodByVirtualMachineInstance(vmi, testsuite.NamespacePrivileged)
 				Expect(err).ToNot(HaveOccurred())
@@ -219,7 +221,7 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 				)
 				Expect(err).ToNot(HaveOccurred())
 
-				By("Checking that qemu-kvm process is of the SELinux type virt_launcher.process")
+				By("Checking that qemu process is of the SELinux type virt_launcher.process")
 				Expect(strings.Split(qemuProcessSelinuxContext, ":")[2]).To(Equal(launcherType))
 
 				By("Verifying SELinux context contains custom type in pod")
@@ -284,11 +286,13 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 			if policyRemovedByTest {
 				By("Re-installing custom SELinux policy on all nodes")
 				err = runOnAllSchedulableNodes(virtClient, []string{"cp", "/var/run/kubevirt/virt_launcher.cil", "/proc/1/root/tmp/"}, "")
-				Expect(err).ToNot(HaveOccurred())
-				err = runOnAllSchedulableNodes(virtClient, []string{"chroot", "/proc/1/root", "semodule", "-i", "/tmp/virt_launcher.cil"}, "")
-				Expect(err).ToNot(HaveOccurred())
-				err = runOnAllSchedulableNodes(virtClient, []string{"rm", "-f", "/proc/1/root/tmp/virt_launcher.cil"}, "")
-				Expect(err).ToNot(HaveOccurred())
+				// That file may not be deployed on clusters that don't need the policy anymore
+				if err == nil {
+					err = runOnAllSchedulableNodes(virtClient, []string{"chroot", "/proc/1/root", "semodule", "-i", "/tmp/virt_launcher.cil"}, "")
+					Expect(err).ToNot(HaveOccurred())
+					err = runOnAllSchedulableNodes(virtClient, []string{"rm", "-f", "/proc/1/root/tmp/virt_launcher.cil"}, "")
+					Expect(err).ToNot(HaveOccurred())
+				}
 			}
 		})
 
@@ -306,6 +310,56 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 			Consistently(func() error {
 				return runOnAllSchedulableNodes(virtClient, []string{"chroot", "/proc/1/root", "semodule", "-l"}, "virt_launcher")
 			}, 30*time.Second, 10*time.Second).Should(BeNil())
+		})
+	})
+	Context("The VMI SELinux context status", func() {
+		It("Should get set and stay the the same after a migration", decorators.RequiresTwoSchedulableNodes, func() {
+			vmi := libvmi.NewAlpine(libvmi.WithMasqueradeNetworking()...)
+
+			By("Starting a New VMI")
+			vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), vmi)
+			Expect(err).NotTo(HaveOccurred())
+			libwait.WaitForSuccessfulVMIStart(vmi)
+
+			By("Ensuring VMI is running by logging in")
+			libwait.WaitUntilVMIReady(vmi, console.LoginToAlpine)
+
+			By("Ensuring the VMI SELinux context status gets set")
+			seContext := ""
+			Eventually(func() string {
+				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Get(context.Background(), vmi.Name, &metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				seContext = vmi.Status.SelinuxContext
+				return seContext
+			}, 30*time.Second, 10*time.Second).ShouldNot(BeEmpty(), "VMI SELinux context status never got set")
+
+			By("Ensuring the VMI SELinux context status matches the virt-launcher pod files")
+			stdout := tests.RunCommandOnVmiPod(vmi, []string{"ls", "-lZd", "/"})
+			Expect(stdout).To(ContainSubstring(seContext))
+
+			By("Migrating the VMI")
+			migration := tests.NewRandomMigration(vmi.Name, vmi.Namespace)
+			libmigration.RunMigrationAndExpectToCompleteWithDefaultTimeout(virtClient, migration)
+
+			By("Ensuring the VMI SELinux context status didn't change")
+			vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Get(context.Background(), vmi.Name, &metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(vmi.Status.SelinuxContext).To(Equal(seContext))
+
+			By("Fetching virt-launcher Pod")
+			pod, err := virtClient.CoreV1().Pods(vmi.Namespace).Get(context.Background(), vmi.Status.MigrationState.TargetPod, metav1.GetOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Ensuring the right SELinux context is set on the target pod")
+			Expect(pod.Spec.SecurityContext).NotTo(BeNil())
+			Expect(pod.Spec.SecurityContext.SELinuxOptions).NotTo(BeNil(), fmt.Sprintf("%#v", pod.Spec.SecurityContext))
+			ctx := strings.Split(seContext, ":")
+			Expect(ctx).To(HaveLen(5))
+			Expect(pod.Spec.SecurityContext.SELinuxOptions.Level).To(Equal(strings.Join(ctx[3:], ":")))
+
+			By("Ensuring the target virt-launcher has the same SELinux context as the source")
+			stdout = tests.RunCommandOnVmiPod(vmi, []string{"ls", "-lZd", "/"})
+			Expect(stdout).To(ContainSubstring(seContext))
 		})
 	})
 })

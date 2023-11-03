@@ -20,7 +20,7 @@
 package prometheus
 
 import (
-	"fmt"
+	"kubevirt.io/kubevirt/pkg/pointer"
 
 	"github.com/prometheus/client_golang/prometheus"
 	io_prometheus_client "github.com/prometheus/client_model/go"
@@ -149,6 +149,31 @@ var _ = Describe("Prometheus", func() {
 			Expect(dto.Gauge.GetValue()).To(BeEquivalentTo(float64(1024)))
 		})
 
+		It("should send cached memory", func() {
+			ch := make(chan prometheus.Metric, 1)
+			defer close(ch)
+
+			ps := prometheusScraper{ch: ch}
+
+			domainStats := &stats.DomainStats{
+				Cpu: &stats.DomainStatsCPU{},
+				Memory: &stats.DomainStatsMemory{
+					CachedSet: true,
+					Cached:    1,
+				},
+			}
+			vmi := k6tv1.VirtualMachineInstance{}
+			ps.Report("test", &vmi, newVmStats(domainStats, nil))
+
+			result := <-ch
+			dto := &io_prometheus_client.Metric{}
+			result.Write(dto)
+
+			Expect(result).ToNot(BeNil())
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_memory_cached_bytes"))
+			Expect(dto.Gauge.GetValue()).To(BeEquivalentTo(float64(1024)))
+		})
+
 		It("should handle swapin", func() {
 			ch := make(chan prometheus.Metric, 1)
 			defer close(ch)
@@ -170,7 +195,7 @@ var _ = Describe("Prometheus", func() {
 			result.Write(dto)
 
 			Expect(result).ToNot(BeNil())
-			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_memory_swap_in_traffic_bytes_total"))
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_memory_swap_in_traffic_bytes"))
 			Expect(dto.Gauge.GetValue()).To(BeEquivalentTo(float64(1024)))
 		})
 
@@ -195,7 +220,7 @@ var _ = Describe("Prometheus", func() {
 			result.Write(dto)
 
 			Expect(result).ToNot(BeNil())
-			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_memory_swap_out_traffic_bytes_total"))
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_memory_swap_out_traffic_bytes"))
 			Expect(dto.Gauge.GetValue()).To(BeEquivalentTo(float64(1024)))
 		})
 
@@ -220,7 +245,7 @@ var _ = Describe("Prometheus", func() {
 			result.Write(dto)
 
 			Expect(result).ToNot(BeNil())
-			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_memory_pgmajfault"))
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_memory_pgmajfault_total"))
 			Expect(dto.Counter.GetValue()).To(BeEquivalentTo(float64(1024)))
 		})
 
@@ -245,7 +270,7 @@ var _ = Describe("Prometheus", func() {
 			result.Write(dto)
 
 			Expect(result).ToNot(BeNil())
-			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_memory_pgminfault"))
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_memory_pgminfault_total"))
 			Expect(dto.Counter.GetValue()).To(BeEquivalentTo(float64(1024)))
 		})
 
@@ -320,7 +345,7 @@ var _ = Describe("Prometheus", func() {
 			result.Write(dto)
 
 			Expect(result).ToNot(BeNil())
-			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_memory_domain_bytes_total"))
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_memory_domain_bytes"))
 			Expect(dto.Gauge.GetValue()).To(BeEquivalentTo(float64(1024)))
 		})
 
@@ -403,7 +428,7 @@ var _ = Describe("Prometheus", func() {
 
 			result := <-ch
 			Expect(result).ToNot(BeNil())
-			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_vcpu_seconds"))
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_vcpu_seconds_total"))
 		})
 
 		It("should not expose vcpu metrics for invalid DomainStats", func() {
@@ -649,7 +674,7 @@ var _ = Describe("Prometheus", func() {
 
 			result := <-ch
 			Expect(result).ToNot(BeNil())
-			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_storage_read_times_ms_total"))
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_storage_read_times_seconds_total"))
 		})
 
 		It("should handle block write time metrics", func() {
@@ -676,7 +701,7 @@ var _ = Describe("Prometheus", func() {
 
 			result := <-ch
 			Expect(result).ToNot(BeNil())
-			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_storage_write_times_ms_total"))
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_storage_write_times_seconds_total"))
 		})
 
 		It("should handle block flush requests metrics", func() {
@@ -730,7 +755,7 @@ var _ = Describe("Prometheus", func() {
 
 			result := <-ch
 			Expect(result).ToNot(BeNil())
-			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_storage_flush_times_ms_total"))
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_storage_flush_times_seconds_total"))
 		})
 
 		It("should use alias when alias is not empty", func() {
@@ -762,7 +787,11 @@ var _ = Describe("Prometheus", func() {
 			dto := &io_prometheus_client.Metric{}
 			err := result.Write(dto)
 			Expect(err).ShouldNot(HaveOccurred())
-			Expect(dto.String()).To(ContainSubstring("name:\"drive\" value:\"disk0\""))
+			expectedLabelPair := &io_prometheus_client.LabelPair{
+				Name:  pointer.P("drive"),
+				Value: pointer.P("disk0"),
+			}
+			Expect(dto.GetLabel()).To(ContainElement(expectedLabelPair))
 		})
 
 		It("should use the name when alias is empty", func() {
@@ -794,7 +823,11 @@ var _ = Describe("Prometheus", func() {
 			dto := &io_prometheus_client.Metric{}
 			err := result.Write(dto)
 			Expect(err).ShouldNot(HaveOccurred())
-			Expect(dto.String()).To(ContainSubstring("name:\"drive\" value:\"vda\""))
+			expectedLabelPair := &io_prometheus_client.LabelPair{
+				Name:  pointer.P("drive"),
+				Value: pointer.P("vda"),
+			}
+			Expect(dto.GetLabel()).To(ContainElement(expectedLabelPair))
 		})
 
 		It("should not expose nameless block metrics", func() {
@@ -1118,7 +1151,33 @@ var _ = Describe("Prometheus", func() {
 
 			result := <-ch
 			Expect(result).ToNot(BeNil())
-			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_vcpu_wait_seconds"))
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_vcpu_wait_seconds_total"))
+		})
+
+		It("should expose vcpu delay metric", func() {
+			ch := make(chan prometheus.Metric, 1)
+			defer close(ch)
+
+			ps := prometheusScraper{ch: ch}
+
+			domainStats := &stats.DomainStats{
+				Cpu:    &stats.DomainStatsCPU{},
+				Memory: &stats.DomainStatsMemory{},
+				Net:    []stats.DomainStatsNet{},
+				Vcpu: []stats.DomainStatsVcpu{
+					{
+						DelaySet: true,
+						Delay:    800000000,
+					},
+				},
+			}
+
+			vmi := k6tv1.VirtualMachineInstance{}
+			ps.Report("test", &vmi, newVmStats(domainStats, nil))
+
+			result := <-ch
+			Expect(result).ToNot(BeNil())
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_vcpu_delay_seconds_total"))
 		})
 
 		It("should expose vcpu to cpu pinning metric", func() {
@@ -1144,14 +1203,8 @@ var _ = Describe("Prometheus", func() {
 			result.Write(dto)
 
 			Expect(result).ToNot(BeNil())
-			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_cpu_affinity"))
-			s := ""
-			for _, lp := range dto.GetLabel() {
-				s += fmt.Sprintf("%v=%v ", lp.GetName(), lp.GetValue())
-			}
-			Expect(s).To(ContainSubstring("vcpu_0_cpu_0=true"))
-			Expect(s).To(ContainSubstring("vcpu_0_cpu_1=false"))
-			Expect(s).To(ContainSubstring("vcpu_0_cpu_2=true"))
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_node_cpu_affinity"))
+			Expect(dto.GetGauge().GetValue()).To(Equal(float64(2)))
 		})
 
 		It("should expose filesystem metrics", func() {
@@ -1181,7 +1234,7 @@ var _ = Describe("Prometheus", func() {
 			ps.Report("test", &vmi, newVmStats(domainStats, fsStats))
 			result := <-ch
 			Expect(result).ToNot(BeNil())
-			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_filesystem_capacity_bytes_total"))
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_filesystem_capacity_bytes"))
 			result = <-ch
 			Expect(result).ToNot(BeNil())
 			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_filesystem_used_bytes"))
@@ -1211,18 +1264,18 @@ var _ = Describe("Prometheus", func() {
 			dto := &io_prometheus_client.Metric{}
 			result.Write(dto)
 
-			Expect(dto.GetGauge().GetValue()).To(Equal(float64(MetricValue)))
+			Expect(dto.GetCounter().GetValue()).To(Equal(float64(MetricValue)))
 
 		},
-			Entry("Total CPU time spent in all modes (sum of both vcpu and hypervisor usage)", "kubevirt_vmi_cpu_usage_seconds", 123, &stats.DomainStatsCPU{
+			Entry("Total CPU time spent in all modes (sum of both vcpu and hypervisor usage)", "kubevirt_vmi_cpu_usage_seconds_total", 123, &stats.DomainStatsCPU{
 				TimeSet: true,
 				Time:    123000000000},
 			),
-			Entry("Total CPU time spent in user mode", "kubevirt_vmi_cpu_user_usage_seconds", 456, &stats.DomainStatsCPU{
+			Entry("Total CPU time spent in user mode", "kubevirt_vmi_cpu_user_usage_seconds_total", 456, &stats.DomainStatsCPU{
 				UserSet: true,
 				User:    456000000000},
 			),
-			Entry("Total CPU time spent in system mode", "kubevirt_vmi_cpu_system_usage_seconds", 789, &stats.DomainStatsCPU{
+			Entry("Total CPU time spent in system mode", "kubevirt_vmi_cpu_system_usage_seconds_total", 789, &stats.DomainStatsCPU{
 				SystemSet: true,
 				System:    789000000000},
 			))

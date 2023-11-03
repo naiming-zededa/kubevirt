@@ -26,7 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	v1 "kubevirt.io/api/core/v1"
-	instancetypev1alpha2 "kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 	generatedscheme "kubevirt.io/client-go/generated/kubevirt/clientset/versioned/scheme"
 
 	. "kubevirt.io/kubevirt/pkg/virtctl/create/instancetype"
@@ -52,7 +52,7 @@ var _ = Describe("create", func() {
 	})
 
 	Context("instancetype with arguments", func() {
-		var instancetypeSpec *instancetypev1alpha2.VirtualMachineInstancetypeSpec
+		var instancetypeSpec *instancetypev1beta1.VirtualMachineInstancetypeSpec
 
 		DescribeTable("should succeed with defined cpu and memory", func(namespacedFlag string, namespaced bool) {
 			bytes, err := clientcmd.NewRepeatableVirtctlCommandWithOut(create, Instancetype, namespacedFlag,
@@ -125,6 +125,23 @@ var _ = Describe("create", func() {
 			Entry("VirtualMachineClusterInstacetype set to shared", "", "shared", false, v1.IOThreadsPolicyShared),
 		)
 
+		It("should create namespaced object and apply namespace when namespace is specified", func() {
+			const namespace = "my-namespace"
+			bytes, err := clientcmd.NewRepeatableVirtctlCommandWithOut(create, Instancetype,
+				setFlag(CPUFlag, "1"),
+				setFlag(MemoryFlag, "128Mi"),
+				setFlag("namespace", namespace),
+			)()
+			Expect(err).ToNot(HaveOccurred())
+
+			decodedObj, err := runtime.Decode(generatedscheme.Codecs.UniversalDeserializer(), bytes)
+			Expect(err).ToNot(HaveOccurred())
+
+			instancetype, ok := decodedObj.(*instancetypev1beta1.VirtualMachineInstancetype)
+			Expect(ok).To(BeTrue())
+			Expect(instancetype.Namespace).To(Equal(namespace))
+		})
+
 		DescribeTable("invalid cpu and memory", func(cpu, memory, errMsg string) {
 			err := clientcmd.NewRepeatableVirtctlCommand(create, Instancetype, namespaced,
 				setFlag(CPUFlag, cpu),
@@ -167,16 +184,16 @@ func setFlag(flag, parameter string) string {
 	return fmt.Sprintf("--%s=%s", flag, parameter)
 }
 
-func getInstancetypeSpec(bytes []byte, namespaced bool) (*instancetypev1alpha2.VirtualMachineInstancetypeSpec, error) {
+func getInstancetypeSpec(bytes []byte, namespaced bool) (*instancetypev1beta1.VirtualMachineInstancetypeSpec, error) {
 	decodedObj, err := runtime.Decode(generatedscheme.Codecs.UniversalDeserializer(), bytes)
 	ExpectWithOffset(1, err).ToNot(HaveOccurred())
 
 	switch obj := decodedObj.(type) {
-	case *instancetypev1alpha2.VirtualMachineInstancetype:
+	case *instancetypev1beta1.VirtualMachineInstancetype:
 		ExpectWithOffset(1, namespaced).To(BeTrue(), "expected VirtualMachineInstancetype to be created")
 		ExpectWithOffset(1, obj.Kind).To(Equal("VirtualMachineInstancetype"))
 		return &obj.Spec, nil
-	case *instancetypev1alpha2.VirtualMachineClusterInstancetype:
+	case *instancetypev1beta1.VirtualMachineClusterInstancetype:
 		ExpectWithOffset(1, namespaced).To(BeFalse(), "expected VirtualMachineClusterInstancetype to be created")
 		ExpectWithOffset(1, obj.Kind).To(Equal("VirtualMachineClusterInstancetype"))
 		return &obj.Spec, nil

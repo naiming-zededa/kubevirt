@@ -8,8 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/time/rate"
+
+	"github.com/prometheus/client_golang/prometheus"
 	k8sv1 "k8s.io/api/core/v1"
 	policy "k8s.io/api/policy/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -38,16 +39,16 @@ const (
 	FailedCreateVirtualMachineInstanceMigrationReason = "FailedCreate"
 	// SuccessfulCreateVirtualMachineInstanceMigrationReason is added in an event if creating a VirtualMachineInstanceMigration succeeded.
 	SuccessfulCreateVirtualMachineInstanceMigrationReason = "SuccessfulCreate"
-	// FailedEvictVirtualMachineReason is added in an event if a deletion of a VMI fails
+	// FailedEvictVirtualMachineInstanceReason is added in an event if a deletion of a VMI fails
 	FailedEvictVirtualMachineInstanceReason = "FailedEvict"
-	// SuccessfulEvictVirtualMachineReason is added in an event if a deletion of a VMI Succeeds
+	// SuccessfulEvictVirtualMachineInstanceReason is added in an event if a deletion of a VMI Succeeds
 	SuccessfulEvictVirtualMachineInstanceReason = "SuccessfulEvict"
 )
 
 var (
 	outdatedVirtualMachineInstanceWorkloads = prometheus.NewGauge(
 		prometheus.GaugeOpts{
-			Name: "kubevirt_vmi_outdated_count",
+			Name: "kubevirt_vmi_number_of_outdated",
 			Help: "Indication for the total number of VirtualMachineInstance workloads that are not running within the most up-to-date version of the virt-launcher environment.",
 		},
 	)
@@ -57,7 +58,7 @@ var (
 const periodicReEnqueueIntervalSeconds = 30
 
 // ensures we don't execute more than once every 5 seconds
-const defaultThrottleIntervalSeconds = 5 * time.Second
+const defaultThrottleInterval = 5 * time.Second
 
 const defaultBatchDeletionIntervalSeconds = 60
 const defaultBatchDeletionCount = 10
@@ -99,11 +100,11 @@ func NewWorkloadUpdateController(
 	recorder record.EventRecorder,
 	clientset kubecli.KubevirtClient,
 	clusterConfig *virtconfig.ClusterConfig,
-) *WorkloadUpdateController {
+) (*WorkloadUpdateController, error) {
 
 	rl := workqueue.NewMaxOfRateLimiter(
-		workqueue.NewItemExponentialFailureRateLimiter(time.Duration(defaultThrottleIntervalSeconds)*time.Second, 300*time.Second),
-		&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Every(time.Duration(defaultThrottleIntervalSeconds)*time.Second), 1)},
+		workqueue.NewItemExponentialFailureRateLimiter(defaultThrottleInterval, 300*time.Second),
+		&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Every(defaultThrottleInterval), 1)},
 	)
 
 	c := &WorkloadUpdateController{
@@ -120,19 +121,32 @@ func NewWorkloadUpdateController(
 		clusterConfig:         clusterConfig,
 	}
 
-	c.kubeVirtInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err := c.vmiInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: c.updateVmi,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = c.kubeVirtInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addKubeVirt,
 		DeleteFunc: c.deleteKubeVirt,
 		UpdateFunc: c.updateKubeVirt,
 	})
+	if err != nil {
+		return nil, err
+	}
 
-	c.migrationInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err = c.migrationInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addMigration,
 		DeleteFunc: c.deleteMigration,
 		UpdateFunc: c.updateMigration,
 	})
+	if err != nil {
+		return nil, err
+	}
 
-	return c
+	return c, nil
 }
 
 func (c *WorkloadUpdateController) getKubeVirtKey() (string, error) {
@@ -168,7 +182,7 @@ func (c *WorkloadUpdateController) addMigration(obj interface{}) {
 		}
 	}
 
-	c.queue.AddAfter(key, defaultThrottleIntervalSeconds)
+	c.queue.AddAfter(key, defaultThrottleInterval)
 }
 
 func (c *WorkloadUpdateController) deleteMigration(_ interface{}) {
@@ -177,7 +191,7 @@ func (c *WorkloadUpdateController) deleteMigration(_ interface{}) {
 		return
 	}
 
-	c.queue.AddAfter(key, defaultThrottleIntervalSeconds)
+	c.queue.AddAfter(key, defaultThrottleInterval)
 }
 
 func (c *WorkloadUpdateController) updateMigration(_, _ interface{}) {
@@ -186,7 +200,29 @@ func (c *WorkloadUpdateController) updateMigration(_, _ interface{}) {
 		return
 	}
 
-	c.queue.AddAfter(key, defaultThrottleIntervalSeconds)
+	c.queue.AddAfter(key, defaultThrottleInterval)
+}
+
+func (c *WorkloadUpdateController) updateVmi(_, obj interface{}) {
+	vmi, ok := obj.(*virtv1.VirtualMachineInstance)
+	if !ok {
+		return
+	}
+
+	key, err := c.getKubeVirtKey()
+	if key == "" || err != nil {
+		return
+	}
+
+	if vmi.IsFinal() {
+		return
+	}
+
+	if !isHotplugInProgress(vmi) || migrationutils.IsMigrating(vmi) {
+		return
+	}
+
+	c.queue.AddAfter(key, defaultThrottleInterval)
 }
 
 func (c *WorkloadUpdateController) addKubeVirt(obj interface{}) {
@@ -212,7 +248,7 @@ func (c *WorkloadUpdateController) enqueueKubeVirt(obj interface{}) {
 		logger.Object(kv).Reason(err).Error("Failed to extract key from KubeVirt.")
 		return
 	}
-	c.queue.AddAfter(key, defaultThrottleIntervalSeconds)
+	c.queue.AddAfter(key, defaultThrottleInterval)
 }
 
 // Run runs the passed in NodeController.
@@ -280,6 +316,24 @@ func (c *WorkloadUpdateController) isOutdated(vmi *virtv1.VirtualMachineInstance
 	return false
 }
 
+func isHotplugInProgress(vmi *virtv1.VirtualMachineInstance) bool {
+	condManager := controller.NewVirtualMachineInstanceConditionManager()
+	return condManager.HasCondition(vmi, virtv1.VirtualMachineInstanceVCPUChange) ||
+		condManager.HasCondition(vmi, virtv1.VirtualMachineInstanceMemoryChange)
+}
+
+func (c *WorkloadUpdateController) doesRequireMigration(vmi *virtv1.VirtualMachineInstance) bool {
+	if vmi.IsFinal() || migrationutils.IsMigrating(vmi) {
+		return false
+	}
+
+	if isHotplugInProgress(vmi) {
+		return true
+	}
+
+	return false
+}
+
 func (c *WorkloadUpdateController) getUpdateData(kv *virtv1.KubeVirt) *updateData {
 	data := &updateData{}
 
@@ -302,7 +356,8 @@ func (c *WorkloadUpdateController) getUpdateData(kv *virtv1.KubeVirt) *updateDat
 		}
 	}
 
-	data.numActiveMigrations = len(migrations)
+	runningMigrations := migrationutils.FilterRunningMigrations(migrations)
+	data.numActiveMigrations = len(runningMigrations)
 
 	objs := c.vmiInformer.GetStore().List()
 	for _, obj := range objs {
@@ -310,7 +365,7 @@ func (c *WorkloadUpdateController) getUpdateData(kv *virtv1.KubeVirt) *updateDat
 		if !vmi.IsRunning() || vmi.IsFinal() || vmi.DeletionTimestamp != nil {
 			// only consider running VMIs that aren't being shutdown
 			continue
-		} else if !c.isOutdated(vmi) {
+		} else if !c.isOutdated(vmi) && !c.doesRequireMigration(vmi) {
 			continue
 		}
 
@@ -455,16 +510,14 @@ func (c *WorkloadUpdateController) sync(kv *virtv1.KubeVirt) error {
 	}
 
 	migrateCount := int(math.Min(float64(maxNewMigrations), float64(len(data.migratableOutdatedVMIs))))
-	migrationCandidates := []*virtv1.VirtualMachineInstance{}
+	var migrationCandidates []*virtv1.VirtualMachineInstance
 	if migrateCount > 0 {
 		migrationCandidates = data.migratableOutdatedVMIs[0:migrateCount]
-		log.Log.Infof("workload updated is migrating %d VMIs", migrateCount)
 	}
 
-	evictionCandidates := []*virtv1.VirtualMachineInstance{}
+	var evictionCandidates []*virtv1.VirtualMachineInstance
 	if batchDeletionCount > 0 {
 		evictionCandidates = data.evictOutdatedVMIs[0:batchDeletionCount]
-		log.Log.Infof("workload updated is force shutting down %d VMIs", batchDeletionCount)
 	}
 
 	wgLen := len(migrationCandidates) + len(evictionCandidates)

@@ -185,13 +185,13 @@ func AdjustQemuProcessMemoryLimits(podIsoDetector PodIsolationDetector, vmi *v1.
 	return nil
 }
 
-var qemuProcessExecutables = []string{"qemu-system", "qemu-kvm"}
+var qemuProcessExecutablePrefixes = []string{"qemu-system", "qemu-kvm"}
 
 // findIsolatedQemuProcess Returns the first occurrence of the QEMU process whose parent is PID"
 func findIsolatedQemuProcess(processes []ps.Process, pid int) (ps.Process, error) {
 	processes = childProcesses(processes, pid)
-	for _, exec := range qemuProcessExecutables {
-		if qemuProcess := lookupProcessByExecutable(processes, exec); qemuProcess != nil {
+	for _, execPrefix := range qemuProcessExecutablePrefixes {
+		if qemuProcess := lookupProcessByExecutablePrefix(processes, execPrefix); qemuProcess != nil {
 			return qemuProcess, nil
 		}
 	}
@@ -231,6 +231,8 @@ func (s *socketBasedIsolationDetector) getPid(socket string) (int, error) {
 	if err != nil {
 		return -1, err
 	}
+	defer ufile.Close()
+
 	// This is the tricky part, which will give us the PID of the owning socket
 	ucreds, err := syscall.GetsockoptUcred(int(ufile.Fd()), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
 	if err != nil {

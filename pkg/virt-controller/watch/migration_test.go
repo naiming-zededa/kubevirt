@@ -35,10 +35,9 @@ import (
 
 	migrationsv1 "kubevirt.io/api/migrations/v1alpha1"
 
-	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
-	"kubevirt.io/kubevirt/tests"
-
 	kubevirtfake "kubevirt.io/client-go/generated/kubevirt/clientset/versioned/fake"
+
+	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo/v2"
@@ -82,7 +81,8 @@ var _ = Describe("Migration watcher", func() {
 	var nodeInformer cache.SharedIndexInformer
 	var pdbInformer cache.SharedIndexInformer
 	var migrationPolicyInformer cache.SharedIndexInformer
-	var namespaceStore cache.Store
+	var resourceQuotaInformer cache.SharedIndexInformer
+	var namespaceInformer cache.SharedIndexInformer
 	var stop chan struct{}
 	var controller *MigrationController
 	var recorder *record.FakeRecorder
@@ -276,6 +276,8 @@ var _ = Describe("Migration watcher", func() {
 		go nodeInformer.Run(stop)
 		go pdbInformer.Run(stop)
 		go migrationPolicyInformer.Run(stop)
+		go resourceQuotaInformer.Run(stop)
+		go namespaceInformer.Run(stop)
 
 		Expect(cache.WaitForCacheSync(stop,
 			vmiInformer.HasSynced,
@@ -283,14 +285,17 @@ var _ = Describe("Migration watcher", func() {
 			migrationInformer.HasSynced,
 			nodeInformer.HasSynced,
 			pdbInformer.HasSynced,
+			resourceQuotaInformer.HasSynced,
+			namespaceInformer.HasSynced,
 			migrationPolicyInformer.HasSynced)).To(BeTrue())
+
 	}
 
 	initController := func(kvConfig *virtv1.KubeVirtConfiguration) {
 		config, _, _ := testutils.NewFakeClusterConfigUsingKVConfig(kvConfig)
 
-		controller = NewMigrationController(
-			services.NewTemplateService("a", 240, "b", "c", "d", "e", "f", "g", pvcInformer.GetStore(), virtClient, config, qemuGid, "h"),
+		controller, _ = NewMigrationController(
+			services.NewTemplateService("a", 240, "b", "c", "d", "e", "f", "g", pvcInformer.GetStore(), virtClient, config, qemuGid, "h", resourceQuotaInformer.GetStore(), namespaceInformer.GetStore()),
 			vmiInformer,
 			podInformer,
 			migrationInformer,
@@ -298,11 +303,10 @@ var _ = Describe("Migration watcher", func() {
 			pvcInformer,
 			pdbInformer,
 			migrationPolicyInformer,
+			resourceQuotaInformer,
 			recorder,
 			virtClient,
 			config,
-			namespaceStore,
-			false,
 		)
 		// Wrap our workqueue to have a way to detect when we are done processing updates
 		mockQueue = testutils.NewMockWorkQueue(controller.Queue)
@@ -321,8 +325,9 @@ var _ = Describe("Migration watcher", func() {
 		migrationInformer, migrationSource = testutils.NewFakeInformerFor(&virtv1.VirtualMachineInstanceMigration{})
 		podInformer, podSource = testutils.NewFakeInformerFor(&k8sv1.Pod{})
 		pdbInformer, _ = testutils.NewFakeInformerFor(&policyv1.PodDisruptionBudget{})
+		resourceQuotaInformer, _ = testutils.NewFakeInformerFor(&k8sv1.ResourceQuota{})
+		namespaceInformer, _ = testutils.NewFakeInformerFor(&k8sv1.Namespace{})
 		migrationPolicyInformer, _ = testutils.NewFakeInformerFor(&migrationsv1.MigrationPolicy{})
-		namespaceStore = cache.NewStore(cache.DeletionHandlingMetaNamespaceKeyFunc)
 		recorder = record.NewFakeRecorder(100)
 		recorder.IncludeObject = true
 		nodeInformer, _ = testutils.NewFakeInformerFor(&k8sv1.Node{})
@@ -493,6 +498,115 @@ var _ = Describe("Migration watcher", func() {
 		})
 	})
 
+	Context("Migration with hotplug", func() {
+		var (
+			vmi       *virtv1.VirtualMachineInstance
+			migration *virtv1.VirtualMachineInstanceMigration
+			targetPod *k8sv1.Pod
+		)
+
+		BeforeEach(func() {
+			vmi = newVirtualMachine("testvmi", virtv1.Running)
+			migration = newMigration("testmigration", vmi.Name, virtv1.MigrationScheduled)
+			targetPod = newTargetPodForVirtualMachine(vmi, migration, k8sv1.PodRunning)
+			targetPod.Spec.NodeName = "node01"
+			vmi.Status.NodeName = "node02"
+		})
+
+		Context("CPU", func() {
+			It("should annotate VMI with dedicated CPU limits", func() {
+
+				vmi.Spec.Domain = virtv1.DomainSpec{
+					CPU: &v1.CPU{
+						DedicatedCPUPlacement: true,
+						Cores:                 2,
+						Sockets:               1,
+						Threads:               1,
+					},
+				}
+				vmi.Status.Conditions = append(vmi.Status.Conditions,
+					virtv1.VirtualMachineInstanceCondition{
+						Type:   virtv1.VirtualMachineInstanceVCPUChange,
+						Status: k8sv1.ConditionTrue,
+					})
+
+				targetPod.Spec.Containers = append(targetPod.Spec.Containers, k8sv1.Container{
+					Name: "compute",
+					Resources: k8sv1.ResourceRequirements{
+						Requests: k8sv1.ResourceList{
+							k8sv1.ResourceCPU: resource.MustParse("4"),
+						},
+						Limits: k8sv1.ResourceList{
+							k8sv1.ResourceCPU: resource.MustParse("4"),
+						},
+					},
+				})
+				targetPod.Status.ContainerStatuses = []k8sv1.ContainerStatus{{
+					Name: "compute", State: k8sv1.ContainerState{Running: &k8sv1.ContainerStateRunning{}},
+				}}
+
+				addMigration(migration)
+				addVirtualMachineInstance(vmi)
+				podFeeder.Add(targetPod)
+
+				patchCPULimitsLabelValue := fmt.Sprintf(`"%s":"4"`, v1.VirtualMachinePodCPULimitsLabel)
+				patch := fmt.Sprintf(`[{ "op": "add", "path": "/status/migrationState", `+
+					`"value": {"targetNode":"node01","targetPod":"%s","sourceNode":"node02","migrationUid":"testmigration",%s} }, `+
+					`{ "op": "test", "path": "/metadata/labels", "value": {} }, `+
+					`{ "op": "replace", "path": "/metadata/labels", "value": {"kubevirt.io/migrationTargetNodeName":"node01",%s} }]`,
+					targetPod.Name, getMigrationConfigPatch(), patchCPULimitsLabelValue)
+
+				shouldExpectVirtualMachineInstancePatch(vmi, patch)
+				controller.Execute()
+				testutils.ExpectEvent(recorder, SuccessfulHandOverPodReason)
+			})
+		})
+
+		Context("Memory", func() {
+			It("should label VMI with target pod memory requests", func() {
+				guestMemory := resource.MustParse("128Mi")
+				vmi.Spec.Domain = virtv1.DomainSpec{
+					Memory: &v1.Memory{
+						Guest: &guestMemory,
+					},
+				}
+
+				vmi.Status.Conditions = append(vmi.Status.Conditions,
+					virtv1.VirtualMachineInstanceCondition{
+						Type:   virtv1.VirtualMachineInstanceMemoryChange,
+						Status: k8sv1.ConditionTrue,
+					})
+
+				targetPod.Spec.Containers = append(targetPod.Spec.Containers, k8sv1.Container{
+					Name: "compute",
+					Resources: k8sv1.ResourceRequirements{
+						Requests: k8sv1.ResourceList{
+							k8sv1.ResourceMemory: resource.MustParse("150Mi"),
+						},
+					},
+				})
+				targetPod.Status.ContainerStatuses = []k8sv1.ContainerStatus{{
+					Name: "compute", State: k8sv1.ContainerState{Running: &k8sv1.ContainerStateRunning{}},
+				}}
+
+				addMigration(migration)
+				addVirtualMachineInstance(vmi)
+				podFeeder.Add(targetPod)
+
+				patchMemoryRequestLabelValue := fmt.Sprintf(`"%s":"150Mi"`, v1.VirtualMachinePodMemoryRequestsLabel)
+				patch := fmt.Sprintf(`[{ "op": "add", "path": "/status/migrationState", `+
+					`"value": {"targetNode":"node01","targetPod":"%s","sourceNode":"node02","migrationUid":"testmigration",%s} }, `+
+					`{ "op": "test", "path": "/metadata/labels", "value": {} }, `+
+					`{ "op": "replace", "path": "/metadata/labels", "value": {"kubevirt.io/migrationTargetNodeName":"node01",%s} }]`,
+					targetPod.Name, getMigrationConfigPatch(), patchMemoryRequestLabelValue)
+
+				shouldExpectVirtualMachineInstancePatch(vmi, patch)
+				controller.Execute()
+				testutils.ExpectEvent(recorder, SuccessfulHandOverPodReason)
+			})
+		})
+	})
+
 	Context("Migration object in pending state", func() {
 
 		It("should patch VMI with nonroot user", func() {
@@ -522,7 +636,6 @@ var _ = Describe("Migration watcher", func() {
 			shouldExpectPodCreation(vmi.UID, migration.UID, 1, 0, 0)
 			controller.Execute()
 			testutils.ExpectEvents(recorder, SuccessfulCreatePodReason)
-
 		})
 		It("should create target pod", func() {
 			vmi := newVirtualMachine("testvmi", virtv1.Running)
@@ -1237,6 +1350,46 @@ var _ = Describe("Migration watcher", func() {
 			controller.Execute()
 			testutils.ExpectEvent(recorder, SuccessfulMigrationReason)
 		})
+
+		DescribeTable("should not transit to succeeded phase when VMI status has", func(conditions []virtv1.VirtualMachineInstanceConditionType) {
+			vmi := newVirtualMachine("testvmi", virtv1.Running)
+			vmi.Status.NodeName = "node02"
+			migration := newMigration("testmigration", vmi.Name, virtv1.MigrationRunning)
+			pod := newTargetPodForVirtualMachine(vmi, migration, k8sv1.PodPending)
+			pod.Spec.NodeName = "node01"
+
+			for _, c := range conditions {
+				vmi.Status.Conditions = append(vmi.Status.Conditions,
+					virtv1.VirtualMachineInstanceCondition{
+						Type:          c,
+						Status:        k8sv1.ConditionTrue,
+						LastProbeTime: *now(),
+					})
+			}
+
+			vmi.Status.MigrationState = &virtv1.VirtualMachineInstanceMigrationState{
+				MigrationUID:                   migration.UID,
+				TargetNode:                     "node01",
+				SourceNode:                     "node02",
+				TargetNodeAddress:              "10.10.10.10:1234",
+				StartTimestamp:                 now(),
+				EndTimestamp:                   now(),
+				TargetNodeDomainReadyTimestamp: now(),
+				Failed:                         false,
+				Completed:                      true,
+			}
+			addMigration(migration)
+			addVirtualMachineInstance(vmi)
+			podFeeder.Add(pod)
+
+			shouldExpectPodAnnotationTimestamp(vmi)
+			controller.Execute()
+		},
+			Entry("CPU change condition", []virtv1.VirtualMachineInstanceConditionType{virtv1.VirtualMachineInstanceVCPUChange}),
+			Entry("Memory change condition", []virtv1.VirtualMachineInstanceConditionType{virtv1.VirtualMachineInstanceMemoryChange}),
+			Entry("CPU and Memory change condition", []virtv1.VirtualMachineInstanceConditionType{virtv1.VirtualMachineInstanceMemoryChange, virtv1.VirtualMachineInstanceVCPUChange}),
+		)
+
 		It("should expect MigrationState to be updated on a completed migration", func() {
 			vmi := newVirtualMachine("testvmi", virtv1.Running)
 			vmi.Status.NodeName = "node02"
@@ -1335,7 +1488,7 @@ var _ = Describe("Migration watcher", func() {
 			if initializeMigrationState {
 				patch := `[{ "op": "test", "path": "/status/migrationState", "value": {"targetNode":"node01","sourceNode":"node02","migrationUid":"testmigration"} }, { "op": "replace", "path": "/status/migrationState", "value": {"startTimestamp":"%s","endTimestamp":"%s","targetNode":"node01","sourceNode":"node02","completed":true,"failed":true,"migrationUid":"testmigration"} }]`
 
-				vmiInterface.EXPECT().Patch(context.Background(), vmi.Name, types.JSONPatchType, gomock.Any(), &metav1.PatchOptions{}).DoAndReturn(func(ctx context.Context, name interface{}, ptype interface{}, vmiStatusPatch []byte, options interface{}) (*virtv1.VirtualMachineInstance, error) {
+				vmiInterface.EXPECT().Patch(context.Background(), vmi.Name, types.JSONPatchType, gomock.Any(), &metav1.PatchOptions{}).DoAndReturn(func(ctx context.Context, name interface{}, ptype interface{}, vmiStatusPatch []byte, options interface{}, _ ...string) (*virtv1.VirtualMachineInstance, error) {
 
 					vmiSP, err := apimachpatch.UnmarshalPatch(vmiStatusPatch)
 					Expect(err).ToNot(HaveOccurred())
@@ -1546,7 +1699,7 @@ var _ = Describe("Migration watcher", func() {
 				policies := make([]migrationsv1.MigrationPolicy, 0)
 
 				for _, info := range policiesToDefine {
-					policy := tests.PreparePolicyAndVMIWithNsAndVmiLabels(vmi, &namespace, info.vmiMatchingLabels, info.namespaceMatchingLabels)
+					policy := preparePolicyAndVMIWithNSAndVMILabels(vmi, &namespace, info.vmiMatchingLabels, info.namespaceMatchingLabels)
 					policy.Name = info.name
 					policies = append(policies, *policy)
 				}
@@ -1569,7 +1722,7 @@ var _ = Describe("Migration watcher", func() {
 			It("policy with one non-fitting label should not match", func() {
 				const labelKeyFmt = "%s-key-0"
 
-				policy := tests.PreparePolicyAndVMIWithNsAndVmiLabels(vmi, &namespace, 4, 3)
+				policy := preparePolicyAndVMIWithNSAndVMILabels(vmi, &namespace, 4, 3)
 				_, exists := policy.Spec.Selectors.VirtualMachineInstanceSelector[fmt.Sprintf(labelKeyFmt, policy.Name)]
 				Expect(exists).To(BeTrue())
 
@@ -1591,8 +1744,8 @@ var _ = Describe("Migration watcher", func() {
 				numberOfLabels := rand.Intn(5) + 1
 
 				By(fmt.Sprintf("Defining two policies with %d labels, one with VMI labels and one with NS labels", numberOfLabels))
-				policyWithNSLabels := tests.PreparePolicyAndVMIWithNsAndVmiLabels(vmi, &namespace, 0, numberOfLabels)
-				policyWithVmiLabels := tests.PreparePolicyAndVMIWithNsAndVmiLabels(vmi, &namespace, numberOfLabels, 0)
+				policyWithNSLabels := preparePolicyAndVMIWithNSAndVMILabels(vmi, &namespace, 0, numberOfLabels)
+				policyWithVmiLabels := preparePolicyAndVMIWithNSAndVMILabels(vmi, &namespace, numberOfLabels, 0)
 
 				policyList := kubecli.NewMinimalMigrationPolicyList(*policyWithNSLabels, *policyWithVmiLabels)
 
@@ -1604,7 +1757,7 @@ var _ = Describe("Migration watcher", func() {
 
 		DescribeTable("should override cluster-wide migration configurations when", func(defineMigrationPolicy func(*migrationsv1.MigrationPolicySpec), testMigrationConfigs func(configuration *virtv1.MigrationConfiguration), expectConfigUpdate bool) {
 			By("Defining migration policy, matching it to vmi to posting it into the cluster")
-			migrationPolicy := tests.PreparePolicyAndVMI(vmi)
+			migrationPolicy := generatePolicyAndAlignVMI(vmi)
 			defineMigrationPolicy(&migrationPolicy.Spec)
 			addMigrationPolicies(*migrationPolicy)
 
@@ -1836,6 +1989,57 @@ var _ = Describe("Migration watcher", func() {
 			shouldExpectPodCreation(vmi.UID, pendingMigration.UID, 1, 0, 0)
 		})
 	})
+
+	Context("Migration target SELinux level", func() {
+		shouldExpectTargetPodWithSELinuxLevel := func(level string) {
+			// Expect pod creation
+			kubeClient.Fake.PrependReactor("create", "pods", func(action testing.Action) (handled bool, obj k8sruntime.Object, err error) {
+				update, ok := action.(testing.CreateAction)
+				Expect(ok).To(BeTrue())
+				pod := update.GetObject().(*k8sv1.Pod)
+				if level != "" {
+					Expect(pod.Spec.SecurityContext.SELinuxOptions.Level).To(Equal(level))
+				} else {
+					if pod.Spec.SecurityContext != nil && pod.Spec.SecurityContext.SELinuxOptions != nil {
+						Expect(pod.Spec.SecurityContext.SELinuxOptions.Level).To(BeEmpty())
+					}
+				}
+
+				return true, update.GetObject(), nil
+			})
+		}
+
+		It("should be forced to the SELinux level of the source by default", func() {
+			vmi := newVirtualMachine("testvmi", virtv1.Running)
+			vmi.Status.SelinuxContext = "system_u:system_r:container_file_t:s0:c1,c2"
+			migration := newMigration("testmigration", vmi.Name, virtv1.MigrationPending)
+
+			addMigration(migration)
+			addVirtualMachineInstance(vmi)
+			shouldExpectTargetPodWithSELinuxLevel("s0:c1,c2")
+
+			controller.Execute()
+			testutils.ExpectEvents(recorder, SuccessfulCreatePodReason)
+		})
+
+		It("should not be forced to the SELinux level of the source if the CR option is set to false", func() {
+			initController(&virtv1.KubeVirtConfiguration{
+				MigrationConfiguration: &virtv1.MigrationConfiguration{
+					MatchSELinuxLevelOnMigration: pointer.BoolPtr(false),
+				},
+			})
+			vmi := newVirtualMachine("testvmi", virtv1.Running)
+			vmi.Status.SelinuxContext = "system_u:system_r:container_file_t:s0:c1,c2"
+			migration := newMigration("testmigration", vmi.Name, virtv1.MigrationPending)
+
+			addMigration(migration)
+			addVirtualMachineInstance(vmi)
+			shouldExpectTargetPodWithSELinuxLevel("")
+
+			controller.Execute()
+			testutils.ExpectEvents(recorder, SuccessfulCreatePodReason)
+		})
+	})
 })
 
 func newPDB(name string, vmi *virtv1.VirtualMachineInstance, pods int) *policyv1.PodDisruptionBudget {
@@ -1890,6 +2094,7 @@ func newVirtualMachine(name string, phase virtv1.VirtualMachineInstancePhase) *v
 	vmi.UID = types.UID(name)
 	vmi.Status.Phase = phase
 	vmi.Status.NodeName = "tefwegwrerg"
+	vmi.Status.SelinuxContext = "system_u:object_r:container_file_t:s0:c1,c2"
 	vmi.ObjectMeta.Labels = make(map[string]string)
 	// This would be set by mutation webhook
 	vmi.Status.RuntimeUser = 107
@@ -2010,7 +2215,7 @@ func getDefaultMigrationConfiguration() *virtv1.MigrationConfiguration {
 	parallelOutboundMigrationsPerNode := virtconfig.ParallelOutboundMigrationsPerNodeDefault
 	parallelMigrationsPerCluster := virtconfig.ParallelMigrationsPerClusterDefault
 	allowAutoConverge := virtconfig.MigrationAllowAutoConverge
-	bandwidthPerMigration := resource.MustParse(virtconfig.BandwithPerMigrationDefault)
+	bandwidthPerMigration := resource.MustParse(virtconfig.BandwidthPerMigrationDefault)
 	completionTimeoutPerGiB := virtconfig.MigrationCompletionTimeoutPerGiB
 	progressTimeout := virtconfig.MigrationProgressTimeout
 	unsafeMigrationOverride := virtconfig.DefaultUnsafeMigrationOverride
@@ -2027,4 +2232,69 @@ func getDefaultMigrationConfiguration() *virtv1.MigrationConfiguration {
 		UnsafeMigrationOverride:           &unsafeMigrationOverride,
 		AllowPostCopy:                     &allowPostCopy,
 	}
+}
+
+func preparePolicyAndVMIWithNSAndVMILabels(vmi *v1.VirtualMachineInstance, namespace *k8sv1.Namespace, matchingVmiLabels, matchingNSLabels int) *migrationsv1.MigrationPolicy {
+	ExpectWithOffset(1, vmi).ToNot(BeNil())
+	if matchingNSLabels > 0 {
+		ExpectWithOffset(1, namespace).ToNot(BeNil())
+	}
+
+	var policyName string
+	policyName = fmt.Sprintf("testpolicy-%s", rand.String(5))
+	policy := kubecli.NewMinimalMigrationPolicy(policyName)
+
+	if policy.Labels == nil {
+		policy.Labels = map[string]string{}
+	}
+
+	var namespaceLabels map[string]string
+	if namespace != nil {
+		if namespace.Labels == nil {
+			namespace.Labels = make(map[string]string)
+		}
+
+		namespaceLabels = namespace.Labels
+	}
+
+	if vmi.Labels == nil {
+		vmi.Labels = make(map[string]string)
+	}
+
+	if policy.Spec.Selectors == nil {
+		policy.Spec.Selectors = &migrationsv1.Selectors{
+			VirtualMachineInstanceSelector: migrationsv1.LabelSelector{},
+			NamespaceSelector:              migrationsv1.LabelSelector{},
+		}
+	} else if policy.Spec.Selectors.VirtualMachineInstanceSelector == nil {
+		policy.Spec.Selectors.VirtualMachineInstanceSelector = migrationsv1.LabelSelector{}
+	} else if policy.Spec.Selectors.NamespaceSelector == nil {
+		policy.Spec.Selectors.NamespaceSelector = migrationsv1.LabelSelector{}
+	}
+
+	labelKeyPattern := policyName + "-key-%d"
+	labelValuePattern := policyName + "-value-%d"
+
+	applyLabels := func(policyLabels, vmiOrNSLabels map[string]string, labelCount int) {
+		for i := 0; i < labelCount; i++ {
+			labelKey := fmt.Sprintf(labelKeyPattern, i)
+			labelValue := fmt.Sprintf(labelValuePattern, i)
+
+			vmiOrNSLabels[labelKey] = labelValue
+			policyLabels[labelKey] = labelValue
+		}
+	}
+
+	applyLabels(policy.Spec.Selectors.VirtualMachineInstanceSelector, vmi.Labels, matchingVmiLabels)
+
+	if namespace != nil {
+		applyLabels(policy.Spec.Selectors.NamespaceSelector, namespaceLabels, matchingNSLabels)
+		namespace.Labels = namespaceLabels
+	}
+
+	return policy
+}
+
+func generatePolicyAndAlignVMI(vmi *v1.VirtualMachineInstance) *migrationsv1.MigrationPolicy {
+	return preparePolicyAndVMIWithNSAndVMILabels(vmi, nil, 1, 0)
 }

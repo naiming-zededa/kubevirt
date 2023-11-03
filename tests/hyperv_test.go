@@ -6,6 +6,10 @@ import (
 	"strings"
 	"time"
 
+	"kubevirt.io/kubevirt/tests/libmigration"
+
+	"kubevirt.io/kubevirt/tests/libinfra"
+
 	"kubevirt.io/kubevirt/tests/decorators"
 	"kubevirt.io/kubevirt/tests/framework/kubevirt"
 
@@ -81,14 +85,14 @@ var _ = Describe("[Serial][sig-compute] Hyper-V enlightenments", Serial, decorat
 				By("Creating a windows VM")
 				reEnlightenmentVMI, err = virtClient.VirtualMachineInstance(util.NamespaceTestDefault).Create(context.Background(), reEnlightenmentVMI)
 				Expect(err).ToNot(HaveOccurred())
-				reEnlightenmentVMI = libwait.WaitForSuccessfulVMIStartWithTimeout(reEnlightenmentVMI, 360)
+				reEnlightenmentVMI = libwait.WaitForSuccessfulVMIStart(reEnlightenmentVMI)
 
 				By("Migrating the VM")
 				migration := tests.NewRandomMigration(reEnlightenmentVMI.Name, reEnlightenmentVMI.Namespace)
-				migrationUID := tests.RunMigrationAndExpectCompletion(virtClient, migration, tests.MigrationWaitTime)
+				migrationUID := libmigration.RunMigrationAndExpectToCompleteWithDefaultTimeout(virtClient, migration)
 
 				By("Checking VMI, confirm migration state")
-				tests.ConfirmVMIPostMigration(virtClient, reEnlightenmentVMI, migrationUID)
+				libmigration.ConfirmVMIPostMigration(virtClient, reEnlightenmentVMI, migrationUID)
 			})
 
 			It("should have TSC frequency set up in label and domain", func() {
@@ -96,7 +100,7 @@ var _ = Describe("[Serial][sig-compute] Hyper-V enlightenments", Serial, decorat
 				By("Creating a windows VM")
 				reEnlightenmentVMI, err = virtClient.VirtualMachineInstance(util.NamespaceTestDefault).Create(context.Background(), reEnlightenmentVMI)
 				Expect(err).ToNot(HaveOccurred())
-				reEnlightenmentVMI = libwait.WaitForSuccessfulVMIStartWithTimeout(reEnlightenmentVMI, 360)
+				reEnlightenmentVMI = libwait.WaitForSuccessfulVMIStart(reEnlightenmentVMI)
 
 				virtLauncherPod := tests.GetPodByVirtualMachineInstance(reEnlightenmentVMI)
 
@@ -128,7 +132,7 @@ var _ = Describe("[Serial][sig-compute] Hyper-V enlightenments", Serial, decorat
 			BeforeEach(func() {
 				if isTSCFrequencyExposed(virtClient) {
 					for _, node := range libnode.GetAllSchedulableNodes(virtClient).Items {
-						stopNodeLabeller(node.Name, virtClient)
+						libinfra.ExpectStoppingNodeLabellerToSucceed(node.Name, virtClient)
 						removeTSCFrequencyFromNode(node)
 					}
 				}
@@ -136,7 +140,7 @@ var _ = Describe("[Serial][sig-compute] Hyper-V enlightenments", Serial, decorat
 
 			AfterEach(func() {
 				for _, node := range libnode.GetAllSchedulableNodes(virtClient).Items {
-					_ = resumeNodeLabeller(node.Name, virtClient)
+					_ = libinfra.ExpectResumingNodeLabellerToSucceed(node.Name, virtClient)
 				}
 			})
 
@@ -145,7 +149,7 @@ var _ = Describe("[Serial][sig-compute] Hyper-V enlightenments", Serial, decorat
 				By("Creating a windows VM")
 				reEnlightenmentVMI, err = virtClient.VirtualMachineInstance(util.NamespaceTestDefault).Create(context.Background(), reEnlightenmentVMI)
 				Expect(err).ToNot(HaveOccurred())
-				libwait.WaitForSuccessfulVMIStartWithTimeout(reEnlightenmentVMI, 360)
+				libwait.WaitForSuccessfulVMIStart(reEnlightenmentVMI)
 				Expect(console.LoginToAlpine(reEnlightenmentVMI)).To(Succeed())
 			})
 
@@ -154,7 +158,7 @@ var _ = Describe("[Serial][sig-compute] Hyper-V enlightenments", Serial, decorat
 				By("Creating a windows VM")
 				reEnlightenmentVMI, err = virtClient.VirtualMachineInstance(util.NamespaceTestDefault).Create(context.Background(), reEnlightenmentVMI)
 				Expect(err).ToNot(HaveOccurred())
-				libwait.WaitForSuccessfulVMIStartWithTimeout(reEnlightenmentVMI, 360)
+				libwait.WaitForSuccessfulVMIStart(reEnlightenmentVMI)
 
 				conditionManager := controller.NewVirtualMachineInstanceConditionManager()
 				isNonMigratable := func() error {

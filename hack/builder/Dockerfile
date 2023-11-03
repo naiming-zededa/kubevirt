@@ -4,11 +4,11 @@ ARG SONOBUOY_ARCH
 ARG BAZEL_ARCH
 
 ENV BAZEL_VERSION=5.3.1
-ENV GIMME_GO_VERSION=1.19.2
+ENV GIMME_GO_VERSION=1.19.9
 ENV GRADLE_VERSION=6.6
 ENV OPERATOR_COURIER_VERSION=2.1.11
 ENV SONOBUOY_VERSION=0.56.9
-ENV GOLANGCI_LINT_VERSION=v1.46.2
+ENV GOLANGCI_LINT_VERSION=v1.53.3
 
 ENV KUBEVIRT_CREATE_BAZELRCS=false
 
@@ -82,7 +82,7 @@ RUN set -x && \
     go install -v k8s.io/code-generator/cmd/conversion-gen@v0.20.2  && \
     go install -v k8s.io/code-generator/cmd/deepcopy-gen@v0.20.2 && \
     go install -v k8s.io/code-generator/cmd/defaulter-gen@v0.20.2  && \
-    go install -v k8s.io/kube-openapi/cmd/openapi-gen@30be4d1 && \
+    go install -v k8s.io/kube-openapi/cmd/openapi-gen@f5883ff && \
     go install -v github.com/golang/protobuf/protoc-gen-go@1643683 && \
     go install -v k8s.io/code-generator/cmd/client-gen@v0.20.2 && \
     go install -v github.com/securego/gosec/v2/cmd/gosec@0ce48a5 && \
@@ -132,5 +132,8 @@ COPY create_bazel_cache_rcs.sh /create_bazel_cache_rcs.sh
 
 RUN curl -L -o /usr/bin/bazel https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-linux-${BAZEL_ARCH} && \
     chmod u+x /usr/bin/bazel
+
+# Add /root/go/src/kubevirt.io/kubevirt and mark it as a safe directory for git
+RUN mkdir -p /root/go/src/kubevirt.io/kubevirt && git config --global --add safe.directory /root/go/src/kubevirt.io/kubevirt
 
 ENTRYPOINT [ "/entrypoint.sh" ]

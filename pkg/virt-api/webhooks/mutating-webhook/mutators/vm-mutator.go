@@ -30,7 +30,7 @@ import (
 
 	v1 "kubevirt.io/api/core/v1"
 	apiinstancetype "kubevirt.io/api/instancetype"
-	"kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 	"kubevirt.io/client-go/log"
 
 	"kubevirt.io/kubevirt/pkg/apimachinery/patch"
@@ -97,7 +97,7 @@ func (mutator *VMsMutator) Mutate(ar *admissionv1.AdmissionReview) *admissionv1.
 	// Set VM defaults
 	log.Log.Object(&vm).V(4).Info("Apply defaults")
 
-	if err = mutator.inferDefaultInstancetype(&vm); err != nil {
+	if err = mutator.InstancetypeMethods.InferDefaultInstancetype(&vm); err != nil {
 		log.Log.Reason(err).Error("admission failed, unable to set default instancetype")
 		return &admissionv1.AdmissionResponse{
 			Result: &metav1.Status{
@@ -107,7 +107,7 @@ func (mutator *VMsMutator) Mutate(ar *admissionv1.AdmissionReview) *admissionv1.
 		}
 	}
 
-	if err = mutator.inferDefaultPreference(&vm); err != nil {
+	if err = mutator.InstancetypeMethods.InferDefaultPreference(&vm); err != nil {
 		log.Log.Reason(err).Error("admission failed, unable to set default preference")
 		return &admissionv1.AdmissionResponse{
 			Result: &metav1.Status{
@@ -120,6 +120,7 @@ func (mutator *VMsMutator) Mutate(ar *admissionv1.AdmissionReview) *admissionv1.
 	mutator.setDefaultInstancetypeKind(&vm)
 	mutator.setDefaultPreferenceKind(&vm)
 	preferenceSpec := mutator.getPreferenceSpec(&vm)
+	mutator.setDefaultArchitecture(&vm)
 	mutator.setDefaultMachineType(&vm, preferenceSpec)
 	mutator.setPreferenceStorageClassName(&vm, preferenceSpec)
 
@@ -154,7 +155,7 @@ func (mutator *VMsMutator) Mutate(ar *admissionv1.AdmissionReview) *admissionv1.
 	}
 }
 
-func (mutator *VMsMutator) getPreferenceSpec(vm *v1.VirtualMachine) *v1alpha2.VirtualMachinePreferenceSpec {
+func (mutator *VMsMutator) getPreferenceSpec(vm *v1.VirtualMachine) *instancetypev1beta1.VirtualMachinePreferenceSpec {
 	preferenceSpec, err := mutator.InstancetypeMethods.FindPreferenceSpec(vm)
 	if err != nil {
 		// Log but ultimately swallow any preference lookup errors here and let the validating webhook handle them
@@ -165,7 +166,7 @@ func (mutator *VMsMutator) getPreferenceSpec(vm *v1.VirtualMachine) *v1alpha2.Vi
 	return preferenceSpec
 }
 
-func (mutator *VMsMutator) setDefaultMachineType(vm *v1.VirtualMachine, preferenceSpec *v1alpha2.VirtualMachinePreferenceSpec) {
+func (mutator *VMsMutator) setDefaultMachineType(vm *v1.VirtualMachine, preferenceSpec *instancetypev1beta1.VirtualMachinePreferenceSpec) {
 	// Nothing to do, let's the validating webhook fail later
 	if vm.Spec.Template == nil {
 		return
@@ -185,46 +186,26 @@ func (mutator *VMsMutator) setDefaultMachineType(vm *v1.VirtualMachine, preferen
 
 	// Only use the cluster default if the user hasn't provided a machine type or referenced a preference with PreferredMachineType
 	if vm.Spec.Template.Spec.Domain.Machine.Type == "" {
-		vm.Spec.Template.Spec.Domain.Machine.Type = mutator.ClusterConfig.GetMachineType()
+		vm.Spec.Template.Spec.Domain.Machine.Type = mutator.ClusterConfig.GetMachineType(vm.Spec.Template.Spec.Architecture)
 	}
 }
 
-func (mutator *VMsMutator) setPreferenceStorageClassName(vm *v1.VirtualMachine, preferenceSpec *v1alpha2.VirtualMachinePreferenceSpec) {
+func (mutator *VMsMutator) setPreferenceStorageClassName(vm *v1.VirtualMachine, preferenceSpec *instancetypev1beta1.VirtualMachinePreferenceSpec) {
 	// Nothing to do, let's the validating webhook fail later
 	if vm.Spec.Template == nil {
 		return
 	}
 
-	if preferenceSpec != nil && preferenceSpec.Volumes != nil {
-		datavolumes := vm.Spec.DataVolumeTemplates
-		for _, dv := range datavolumes {
-			if dv.Spec.PVC.StorageClassName == nil {
+	if preferenceSpec != nil && preferenceSpec.Volumes != nil && preferenceSpec.Volumes.PreferredStorageClassName != "" {
+		for _, dv := range vm.Spec.DataVolumeTemplates {
+			if dv.Spec.PVC != nil && dv.Spec.PVC.StorageClassName == nil {
 				dv.Spec.PVC.StorageClassName = &preferenceSpec.Volumes.PreferredStorageClassName
+			}
+			if dv.Spec.Storage != nil && dv.Spec.Storage.StorageClassName == nil {
+				dv.Spec.Storage.StorageClassName = &preferenceSpec.Volumes.PreferredStorageClassName
 			}
 		}
 	}
-}
-
-func (mutator *VMsMutator) inferDefaultInstancetype(vm *v1.VirtualMachine) error {
-	instancetypeMatcher, err := mutator.InstancetypeMethods.InferDefaultInstancetype(vm)
-	if err != nil {
-		return err
-	}
-	if instancetypeMatcher != nil {
-		vm.Spec.Instancetype = instancetypeMatcher
-	}
-	return nil
-}
-
-func (mutator *VMsMutator) inferDefaultPreference(vm *v1.VirtualMachine) error {
-	preferenceMatcher, err := mutator.InstancetypeMethods.InferDefaultPreference(vm)
-	if err != nil {
-		return err
-	}
-	if preferenceMatcher != nil {
-		vm.Spec.Preference = preferenceMatcher
-	}
-	return nil
 }
 
 func (mutator *VMsMutator) setDefaultInstancetypeKind(vm *v1.VirtualMachine) {
@@ -291,19 +272,26 @@ func validateMatcherUpdate(oldMatcher, newMatcher v1.Matcher) error {
 	return nil
 }
 
+func (mutator *VMsMutator) setDefaultArchitecture(vm *v1.VirtualMachine) {
+	if vm.Spec.Template.Spec.Architecture == "" {
+		vm.Spec.Template.Spec.Architecture = mutator.ClusterConfig.GetDefaultArchitecture()
+	}
+}
+
 func validateInstancetypeMatcher(vm *v1.VirtualMachine) []metav1.StatusCause {
 	if vm.Spec.Instancetype == nil {
 		return nil
 	}
+
+	var causes []metav1.StatusCause
 	if vm.Spec.Instancetype.Name == "" && vm.Spec.Instancetype.InferFromVolume == "" {
-		return []metav1.StatusCause{{
+		causes = append(causes, metav1.StatusCause{
 			Type:    metav1.CauseTypeFieldValueNotFound,
 			Message: fmt.Sprintf("Either Name or InferFromVolume should be provided within the InstancetypeMatcher"),
 			Field:   k8sfield.NewPath("spec", "instancetype").String(),
-		}}
+		})
 	}
 	if vm.Spec.Instancetype.InferFromVolume != "" {
-		var causes []metav1.StatusCause
 		if vm.Spec.Instancetype.Name != "" {
 			causes = append(causes, metav1.StatusCause{
 				Type:    metav1.CauseTypeFieldValueNotFound,
@@ -318,24 +306,34 @@ func validateInstancetypeMatcher(vm *v1.VirtualMachine) []metav1.StatusCause {
 				Field:   k8sfield.NewPath("spec", "instancetype", "kind").String(),
 			})
 		}
-		return causes
 	}
-	return nil
+	if vm.Spec.Instancetype.InferFromVolumeFailurePolicy != nil {
+		failurePolicy := *vm.Spec.Instancetype.InferFromVolumeFailurePolicy
+		if failurePolicy != v1.IgnoreInferFromVolumeFailure && failurePolicy != v1.RejectInferFromVolumeFailure {
+			causes = append(causes, metav1.StatusCause{
+				Type:    metav1.CauseTypeFieldValueInvalid,
+				Message: fmt.Sprintf("Invalid value '%s' for InferFromVolumeFailurePolicy", failurePolicy),
+				Field:   k8sfield.NewPath("spec", "instancetype", "inferFromVolumeFailurePolicy").String(),
+			})
+		}
+	}
+	return causes
 }
 
 func validatePreferenceMatcher(vm *v1.VirtualMachine) []metav1.StatusCause {
 	if vm.Spec.Preference == nil {
 		return nil
 	}
+
+	var causes []metav1.StatusCause
 	if vm.Spec.Preference.Name == "" && vm.Spec.Preference.InferFromVolume == "" {
-		return []metav1.StatusCause{{
+		causes = append(causes, metav1.StatusCause{
 			Type:    metav1.CauseTypeFieldValueNotFound,
 			Message: fmt.Sprintf("Either Name or InferFromVolume should be provided within the PreferenceMatcher"),
 			Field:   k8sfield.NewPath("spec", "preference").String(),
-		}}
+		})
 	}
 	if vm.Spec.Preference.InferFromVolume != "" {
-		var causes []metav1.StatusCause
 		if vm.Spec.Preference.Name != "" {
 			causes = append(causes, metav1.StatusCause{
 				Type:    metav1.CauseTypeFieldValueNotFound,
@@ -350,7 +348,16 @@ func validatePreferenceMatcher(vm *v1.VirtualMachine) []metav1.StatusCause {
 				Field:   k8sfield.NewPath("spec", "preference", "kind").String(),
 			})
 		}
-		return causes
 	}
-	return nil
+	if vm.Spec.Preference.InferFromVolumeFailurePolicy != nil {
+		failurePolicy := *vm.Spec.Preference.InferFromVolumeFailurePolicy
+		if failurePolicy != v1.IgnoreInferFromVolumeFailure && failurePolicy != v1.RejectInferFromVolumeFailure {
+			causes = append(causes, metav1.StatusCause{
+				Type:    metav1.CauseTypeFieldValueInvalid,
+				Message: fmt.Sprintf("Invalid value '%s' for InferFromVolumeFailurePolicy", failurePolicy),
+				Field:   k8sfield.NewPath("spec", "preference", "inferFromVolumeFailurePolicy").String(),
+			})
+		}
+	}
+	return causes
 }

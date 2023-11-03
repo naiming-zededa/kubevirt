@@ -1,15 +1,24 @@
 # KubeVirt
 
-[![Build Status](https://prow.ci.kubevirt.io/badge.svg?jobs=push-kubevirt-main)](https://prow.ci.kubevirt.io/?job=push-kubevirt-main)
-[![Go Report Card](https://goreportcard.com/badge/github.com/kubevirt/kubevirt)](https://goreportcard.com/report/github.com/kubevirt/kubevirt)
-[![Licensed under Apache License version 2.0](https://img.shields.io/github/license/kubevirt/kubevirt.svg)](https://www.apache.org/licenses/LICENSE-2.0)
-[![Coverage Status](https://img.shields.io/coveralls/kubevirt/kubevirt/main.svg)](https://coveralls.io/github/kubevirt/kubevirt?branch=main)
-[![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/3203/badge)](https://bestpractices.coreinfrastructure.org/projects/3203)
-[![Visit our Slack channel](https://img.shields.io/badge/slack-@kubernetes/kubevirt--dev-40abb8.svg?logo=slack)](https://kubernetes.slack.com/?redir=%2Farchives%2FC0163DT0R8X)
-[![FOSSA Status](https://app.fossa.com/api/projects/custom%2B13072%2Fgit%40github.com%3Akubevirt%2Fkubevirt.git.svg?type=shield)](https://app.fossa.com/projects/custom%2B13072%2Fgit%40github.com%3Akubevirt%2Fkubevirt.git?ref=badge_shield)
-[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=kubevirt_kubevirt&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=kubevirt_kubevirt)
+<p align="center">
+<img src="https://github.com/kubevirt/community/blob/main/logo/KubeVirt_icon.png" width="100">
+</p>
 
-<img src="https://cncf-branding.netlify.app/img/projects/kubevirt/icon/color/kubevirt-icon-color.png" width="100">
+
+<div align="center">
+    
+  [![Build Status](https://prow.ci.kubevirt.io/badge.svg?jobs=push-kubevirt-main)](https://prow.ci.kubevirt.io/?job=push-kubevirt-main)
+  [![Go Report Card](https://goreportcard.com/badge/github.com/kubevirt/kubevirt)](https://goreportcard.com/report/github.com/kubevirt/kubevirt)
+  [![Licensed under Apache License version 2.0](https://img.shields.io/github/license/kubevirt/kubevirt.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+  [![Coverage Status](https://img.shields.io/coveralls/kubevirt/kubevirt/main.svg)](https://coveralls.io/github/kubevirt/kubevirt?branch=main)
+  [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/3203/badge)](https://bestpractices.coreinfrastructure.org/projects/3203)
+  [![Visit our Slack channel](https://img.shields.io/badge/slack-@kubernetes/kubevirt--dev-40abb8.svg?logo=slack)](https://kubernetes.slack.com/?redir=%2Farchives%2FC0163DT0R8X)
+  [![FOSSA Status](https://app.fossa.com/api/projects/custom%2B13072%2Fgit%40github.com%3Akubevirt%2Fkubevirt.git.svg?type=shield)](https://app.fossa.com/projects/custom%2B13072%2Fgit%40github.com%3Akubevirt%2Fkubevirt.git?ref=badge_shield)
+  [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=kubevirt_kubevirt&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=kubevirt_kubevirt)
+    
+</div>
+
+
 
 **KubeVirt** is a virtual machine management add-on for Kubernetes.
 The aim is to provide a common ground for virtualization solutions on top of
@@ -45,9 +54,9 @@ As of today KubeVirt can be used to declaratively
 
 ## To start using KubeVirt
 
-Try our quickstart at [kubevirt.io](http://kubevirt.io/get_kubevirt/).
+Try our quickstart at [kubevirt.io](https://kubevirt.io/get_kubevirt/).
 
-See our user documentation at [kubevirt.io/docs](http://kubevirt.io/user-guide).
+See our user documentation at [kubevirt.io/docs](https://kubevirt.io/user-guide).
 
 Once you have the basics, you can learn more about how to run KubeVirt and its newest features by taking a look at:
 

@@ -54,7 +54,7 @@ func (admitter *VMIUpdateAdmitter) Admit(ar *admissionv1.AdmissionReview) *admis
 	if !equality.Semantic.DeepEqual(newVMI.Spec, oldVMI.Spec) {
 		// Only allow the KubeVirt SA to modify the VMI spec, since that means it went through the sub resource.
 		if webhooks.IsKubeVirtServiceAccount(ar.Request.UserInfo.Username) {
-			hotplugResponse := admitHotplug(newVMI.Spec.Volumes, oldVMI.Spec.Volumes, newVMI.Spec.Domain.Devices.Disks, oldVMI.Spec.Domain.Devices.Disks, oldVMI.Status.VolumeStatus, newVMI, admitter.ClusterConfig)
+			hotplugResponse := admitHotplug(oldVMI, newVMI, admitter.ClusterConfig)
 			if hotplugResponse != nil {
 				return hotplugResponse
 			}
@@ -87,8 +87,8 @@ func getExpectedDisks(newVolumes []v1.Volume) int {
 	return len(newVolumes) - numMemoryDumpVolumes
 }
 
-// admitHotplug compares the old and new volumes and disks, and ensures that they match and are valid.
-func admitHotplug(newVolumes, oldVolumes []v1.Volume, newDisks, oldDisks []v1.Disk, volumeStatuses []v1.VolumeStatus, newVMI *v1.VirtualMachineInstance, config *virtconfig.ClusterConfig) *admissionv1.AdmissionResponse {
+// admitHotplugStorage compares the old and new volumes and disks, and ensures that they match and are valid.
+func admitHotplugStorage(newVolumes, oldVolumes []v1.Volume, newDisks, oldDisks []v1.Disk, volumeStatuses []v1.VolumeStatus, newVMI *v1.VirtualMachineInstance, config *virtconfig.ClusterConfig) *admissionv1.AdmissionResponse {
 	expectedDisks := getExpectedDisks(newVolumes)
 	if expectedDisks != len(newDisks) {
 		return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
@@ -175,7 +175,15 @@ func verifyHotplugVolumes(newHotplugVolumeMap, oldHotplugVolumeMap map[string]v1
 					})
 				}
 				disk := newDisks[k]
-				if disk.Disk == nil || disk.Disk.Bus != "scsi" {
+				if disk.Disk == nil && disk.LUN == nil {
+					return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
+						{
+							Type:    metav1.CauseTypeFieldValueInvalid,
+							Message: fmt.Sprintf("Disk %s requires diskDevice of type 'disk' or 'lun' to be hotplugged.", k),
+						},
+					})
+				}
+				if (disk.Disk == nil || disk.Disk.Bus != "scsi") && (disk.LUN == nil || disk.LUN.Bus != "scsi") {
 					return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
 						{
 							Type:    metav1.CauseTypeFieldValueInvalid,
@@ -311,4 +319,62 @@ func filterKubevirtLabels(labels map[string]string) map[string]string {
 	}
 
 	return m
+}
+
+func admitHotplug(
+	oldVMI, newVMI *v1.VirtualMachineInstance,
+	clusterConfig *virtconfig.ClusterConfig,
+) *admissionv1.AdmissionResponse {
+
+	if response := admitHotplugCPU(oldVMI.Spec.Domain.CPU, newVMI.Spec.Domain.CPU); response != nil {
+		return response
+	}
+
+	if response := admitHotplugMemory(oldVMI.Spec.Domain.Memory, newVMI.Spec.Domain.Memory); response != nil {
+		return response
+	}
+
+	return admitHotplugStorage(
+		newVMI.Spec.Volumes,
+		oldVMI.Spec.Volumes,
+		newVMI.Spec.Domain.Devices.Disks,
+		oldVMI.Spec.Domain.Devices.Disks,
+		oldVMI.Status.VolumeStatus,
+		newVMI,
+		clusterConfig)
+
+}
+
+func admitHotplugCPU(oldCPUTopology, newCPUTopology *v1.CPU) *admissionv1.AdmissionResponse {
+
+	if oldCPUTopology.MaxSockets != newCPUTopology.MaxSockets {
+		return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
+			{
+				Type:    metav1.CauseTypeFieldValueInvalid,
+				Message: fmt.Sprintf("CPU topology maxSockets changed"),
+			},
+		})
+	}
+
+	return nil
+}
+
+func admitHotplugMemory(oldMemory, newMemory *v1.Memory) *admissionv1.AdmissionResponse {
+	if oldMemory == nil ||
+		oldMemory.MaxGuest == nil ||
+		newMemory == nil ||
+		newMemory.MaxGuest == nil {
+		return nil
+	}
+
+	if !oldMemory.MaxGuest.Equal(*newMemory.MaxGuest) {
+		return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
+			{
+				Type:    metav1.CauseTypeFieldValueInvalid,
+				Message: fmt.Sprintf("Memory maxGuest changed"),
+			},
+		})
+	}
+
+	return nil
 }

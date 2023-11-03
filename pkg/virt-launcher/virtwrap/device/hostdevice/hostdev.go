@@ -21,6 +21,7 @@ package hostdevice
 
 import (
 	"fmt"
+	"strings"
 
 	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/log"
@@ -58,8 +59,15 @@ func CreateMDEVHostDevices(hostDevicesData []HostDeviceMetaData, mdevAddrPool Ad
 	return createHostDevices(hostDevicesData, mdevAddrPool, createMDEVHostDevice)
 }
 
+func CreateUSBHostDevices(hostDevicesData []HostDeviceMetaData, usbAddrPool AddressPooler) ([]api.HostDevice, error) {
+	return createHostDevices(hostDevicesData, usbAddrPool, createUSBHostDevice)
+}
+
 func createHostDevices(hostDevicesData []HostDeviceMetaData, addrPool AddressPooler, createHostDev createHostDevice) ([]api.HostDevice, error) {
-	var hostDevices []api.HostDevice
+	var (
+		hostDevices          []api.HostDevice
+		hostDevicesAddresses []string
+	)
 
 	for _, hostDeviceData := range hostDevicesData {
 		address, err := addrPool.Pop(hostDeviceData.ResourceName)
@@ -83,8 +91,13 @@ func createHostDevices(hostDevicesData []HostDeviceMetaData, addrPool AddressPoo
 			}
 		}
 		hostDevices = append(hostDevices, *hostDevice)
-		log.Log.Infof("host-device created: %s", address)
+		hostDevicesAddresses = append(hostDevicesAddresses, address)
 	}
+
+	if len(hostDevices) > 0 {
+		log.Log.Infof("host-devices created: [%s]", strings.Join(hostDevicesAddresses, ", "))
+	}
+
 	return hostDevices, nil
 }
 
@@ -137,4 +150,24 @@ func createMDEVHostDevice(hostDeviceData HostDeviceMetaData, mdevUUID string) (*
 		Model: "vfio-pci",
 	}
 	return domainHostDevice, nil
+}
+
+func createUSBHostDevice(device HostDeviceMetaData, usbAddress string) (*api.HostDevice, error) {
+	strs := strings.Split(usbAddress, ":")
+	if len(strs) != 2 {
+		return nil, fmt.Errorf("Bad value: %s", usbAddress)
+	}
+	bus, deviceNumber := strs[0], strs[1]
+
+	return &api.HostDevice{
+		Type:  "usb",
+		Mode:  "subsystem",
+		Alias: api.NewUserDefinedAlias("usb-host-" + device.Name),
+		Source: api.HostDeviceSource{
+			Address: &api.Address{
+				Bus:    bus,
+				Device: deviceNumber,
+			},
+		},
+	}, nil
 }

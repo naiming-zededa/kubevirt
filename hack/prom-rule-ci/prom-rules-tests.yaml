@@ -9,18 +9,18 @@ tests:
   # Pod is using more CPU than expected
   - interval: 1m
     input_series:
-      - series: 'node_namespace_pod_container:container_cpu_usage_seconds_total:sum_rate{namespace="ci",pod="virt-controller-8546c99968-x9jgg",node="node1"}'
-        values: '2+0x10'
+      - series: 'container_cpu_usage_seconds_total{namespace="ci",pod="virt-controller-8546c99968-x9jgg",node="node1"}'
+        values: '1+1x6'
       - series: 'kube_pod_container_resource_requests{namespace="ci",container="virt-controller",resource="cpu",pod="virt-controller-8546c99968-x9jgg",node="node1"}'
         values: '0+0x6'
 
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 6m
         alertname: KubeVirtComponentExceedsRequestedCPU
         exp_alerts:
           - exp_annotations:
-              description: "Container virt-controller in pod virt-controller-8546c99968-x9jgg cpu usage exceeds the CPU requested"
-              summary: "The container is using more CPU than what is defined in the containers resource requests"
+              description: "Pod virt-controller-8546c99968-x9jgg cpu usage exceeds the CPU requested"
+              summary: "The containers in the pod are using more CPU than what is defined in the containers resource requests"
               runbook_url: "https://kubevirt.io/monitoring/runbooks/KubeVirtComponentExceedsRequestedCPU"
             exp_labels:
               severity: "warning"
@@ -28,18 +28,14 @@ tests:
               kubernetes_operator_part_of: "kubevirt"
               kubernetes_operator_component: "kubevirt"
               pod: "virt-controller-8546c99968-x9jgg"
-              container: "virt-controller"
-              namespace: ci
-              node: node1
-              resource: cpu
 
   # Pod is using more memory than expected
   - interval: 1m
     input_series:
       - series: 'container_memory_working_set_bytes{namespace="ci",container="",pod="virt-controller-8546c99968-x9jgg",node="node1"}'
-        values: "157286400 157286400 157286400 157286400 157286400 157286400 157286400 157286400"
+        values: "157286400+0x5"
       - series: 'kube_pod_container_resource_requests{namespace="ci",container="virt-controller",resource="memory",pod="virt-controller-8546c99968-x9jgg",node="node1"}'
-        values: "118325248 118325248 118325248 118325248 118325248 118325248 118325248 118325248"
+        values: "118325248+0x5"
 
     alert_rule_test:
       - eval_time: 5m
@@ -246,9 +242,9 @@ tests:
   # Some virt controllers are not ready
   - interval: 1m
     input_series:
-      - series: 'kubevirt_virt_controller_ready{namespace="ci", pod="virt-controller-1"}'
+      - series: 'kubevirt_virt_controller_ready_status{namespace="ci", pod="virt-controller-1"}'
         values: '1+0x11'
-      - series: 'kubevirt_virt_controller_ready{namespace="ci", pod="virt-controller-2"}'
+      - series: 'kubevirt_virt_controller_ready_status{namespace="ci", pod="virt-controller-2"}'
         values: '0+0x11'
       - series: 'up{namespace="ci", pod="virt-controller-1"}'
         values: '1+0x11'
@@ -271,7 +267,7 @@ tests:
   # All virt controllers are not ready
   - interval: 1m
     input_series:
-      - series: 'kubevirt_virt_controller_ready{namespace="ci", pod="virt-controller-1"}'
+      - series: 'kubevirt_virt_controller_ready_status{namespace="ci", pod="virt-controller-1"}'
         values: "0 0 0 0 0 0 0 0 0 0 0"
 
     alert_rule_test:
@@ -293,7 +289,7 @@ tests:
   # All virt controllers are not ready (ImagePullBackOff)
   - interval: 1m
     input_series:
-      - series: 'kubevirt_virt_controller_ready{namespace="ci", pod="virt-controller-1"}'
+      - series: 'kubevirt_virt_controller_ready_status{namespace="ci", pod="virt-controller-1"}'
         values: "stale stale stale stale stale stale stale stale stale stale"
 
     alert_rule_test:
@@ -316,7 +312,7 @@ tests:
   # All virt operators are not ready (ImagePullBackOff)
   - interval: 1m
     input_series:
-      - series: 'kubevirt_virt_operator_ready{namespace="ci", pod="virt-operator-1"}'
+      - series: 'kubevirt_virt_operator_ready_status{namespace="ci", pod="virt-operator-1"}'
         values: "stale stale stale stale stale stale stale stale stale stale"
 
     alert_rule_test:
@@ -339,7 +335,7 @@ tests:
   # All virt operators are not ready
   - interval: 1m
     input_series:
-      - series: 'kubevirt_virt_operator_ready{namespace="ci", pod="virt-operator-1"}'
+      - series: 'kubevirt_virt_operator_ready_status{namespace="ci", pod="virt-operator-1"}'
         values: "0 0 0 0 0 0 0 0 0 0 0"
 
     alert_rule_test:
@@ -578,7 +574,7 @@ tests:
         alertname: KubevirtVmHighMemoryUsage
         exp_alerts:
           - exp_annotations:
-              description: "Container compute in pod virt-launcher-testvm-123 in namespace ns-test free memory is less than 20 MB and it is close to requested memory"
+              description: "Container compute in pod virt-launcher-testvm-123 in namespace ns-test free memory is less than 50Mi and it is close to requested memory"
               summary: "VM is at risk of being evicted and in serious cases of memory exhaustion being terminated by the runtime."
               runbook_url: "https://kubevirt.io/monitoring/runbooks/KubevirtVmHighMemoryUsage"
             exp_labels:
@@ -605,7 +601,7 @@ tests:
         alertname: KubevirtVmHighMemoryUsage
         exp_alerts:
           - exp_annotations:
-              description: "Container compute in pod virt-launcher-testvm-123 in namespace ns-test free memory is less than 20 MB and it is close to requested memory"
+              description: "Container compute in pod virt-launcher-testvm-123 in namespace ns-test free memory is less than 50Mi and it is close to requested memory"
               summary: "VM is at risk of being evicted and in serious cases of memory exhaustion being terminated by the runtime."
               runbook_url: "https://kubevirt.io/monitoring/runbooks/KubevirtVmHighMemoryUsage"
             exp_labels:
@@ -632,7 +628,7 @@ tests:
         alertname: KubevirtVmHighMemoryUsage
         exp_alerts:
           - exp_annotations:
-              description: "Container compute in pod virt-launcher-testvm-123 in namespace ns-test free memory is less than 20 MB and it is close to requested memory"
+              description: "Container compute in pod virt-launcher-testvm-123 in namespace ns-test free memory is less than 50Mi and it is close to requested memory"
               summary: "VM is at risk of being evicted and in serious cases of memory exhaustion being terminated by the runtime."
               runbook_url: "https://kubevirt.io/monitoring/runbooks/KubevirtVmHighMemoryUsage"
             exp_labels:
@@ -729,7 +725,7 @@ tests:
   # Excessive VMI Migrations in a period of time
   - interval: 1h
     input_series:
-      - series: 'kubevirt_migrate_vmi_succeeded{vmi="vmi-example-1"}'
+      - series: 'kubevirt_vmi_migration_succeeded{vmi="vmi-example-1"}'
         # time:  0 1 2 3 4 5
         values: "_ _ _ 1 7 13"
 
@@ -852,3 +848,49 @@ tests:
               kubernetes_operator_component: "kubevirt"
               kubernetes_operator_part_of: "kubevirt"
               operator_health_impact: "critical"
+
+  # Deprecated APIs being requested.
+  - interval: 1m
+    input_series:
+      - series: 'apiserver_requested_deprecated_apis{resource="virtualmachines", group="kubevirt.io", version="v1alpha3"}'
+        values: '0 0 1'
+      - series: 'apiserver_request_total{resource="virtualmachines", group="kubevirt.io", version="v1alpha3"}'
+        values: '0 0 1 2'
+
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: KubeVirtDeprecatedAPIRequested
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: KubeVirtDeprecatedAPIRequested
+        exp_alerts:
+          - exp_annotations:
+              description: "Detected requests to the deprecated virtualmachines.kubevirt.io/v1alpha3 API."
+              summary: "Detected 1 requests in the last 10 minutes."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/KubeVirtDeprecatedAPIRequested"
+            exp_labels:
+              severity: "info"
+              operator_health_impact: "none"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+              resource: "virtualmachines"
+              group: "kubevirt.io"
+              version: "v1alpha3"
+      - eval_time: 3m
+        alertname: KubeVirtDeprecatedAPIRequested
+        exp_alerts:
+          - exp_annotations:
+              description: "Detected requests to the deprecated virtualmachines.kubevirt.io/v1alpha3 API."
+              summary: "Detected 2 requests in the last 10 minutes."
+              runbook_url: "https://kubevirt.io/monitoring/runbooks/KubeVirtDeprecatedAPIRequested"
+            exp_labels:
+              severity: "info"
+              operator_health_impact: "none"
+              kubernetes_operator_part_of: "kubevirt"
+              kubernetes_operator_component: "kubevirt"
+              resource: "virtualmachines"
+              group: "kubevirt.io"
+              version: "v1alpha3"
+      - eval_time: 13m
+        alertname: KubeVirtDeprecatedAPIRequested
+        exp_alerts: []

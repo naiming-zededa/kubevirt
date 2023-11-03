@@ -64,7 +64,7 @@ func NewDisruptionBudgetController(
 	recorder record.EventRecorder,
 	clientset kubecli.KubevirtClient,
 	clusterConfig *virtconfig.ClusterConfig,
-) *DisruptionBudgetController {
+) (*DisruptionBudgetController, error) {
 
 	c := &DisruptionBudgetController{
 		Queue:                           workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "virt-controller-disruption-budget"),
@@ -78,27 +78,38 @@ func NewDisruptionBudgetController(
 		podDisruptionBudgetExpectations: controller.NewUIDTrackingControllerExpectations(controller.NewControllerExpectations()),
 	}
 
-	c.vmiInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err := c.vmiInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addVirtualMachineInstance,
 		DeleteFunc: c.deleteVirtualMachineInstance,
 		UpdateFunc: c.updateVirtualMachineInstance,
 	})
+	if err != nil {
+		return nil, err
+	}
 
-	c.pdbInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err = c.pdbInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addPodDisruptionBudget,
 		DeleteFunc: c.deletePodDisruptionBudget,
 		UpdateFunc: c.updatePodDisruptionBudget,
 	})
+	if err != nil {
+		return nil, err
+	}
 
-	c.podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err = c.podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		UpdateFunc: c.updatePod,
 	})
+	if err != nil {
+		return nil, err
+	}
 
-	c.migrationInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err = c.migrationInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		UpdateFunc: c.updateMigration,
 	})
-
-	return c
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 func (c *DisruptionBudgetController) updateMigration(_, curr interface{}) {
@@ -558,6 +569,8 @@ func (c *DisruptionBudgetController) vmiNeedsEvictionPDB(vmiExists bool, vmi *vi
 	switch *evictionStrategy {
 	case virtv1.EvictionStrategyLiveMigrate, virtv1.EvictionStrategyExternal:
 		return true
+	case virtv1.EvictionStrategyLiveMigrateIfPossible:
+		return vmi.IsMigratable()
 	default:
 		return false
 	}

@@ -41,7 +41,7 @@ import (
 	"k8s.io/client-go/testing"
 	"k8s.io/utils/pointer"
 
-	"github.com/emicklei/go-restful"
+	"github.com/emicklei/go-restful/v3"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/ghttp"
@@ -337,23 +337,24 @@ var _ = Describe("VirtualMachineInstance Subresources", func() {
 				ExpectStatusErrorWithCode(recorder, http.StatusInternalServerError)
 			})
 
-			It("should fail with no graphics device at VNC connections", func() {
-
+			DescribeTable("request validation", func(autoattachGraphicsDevice bool, phase v1.VirtualMachineInstancePhase) {
 				request.PathParameters()["name"] = testVMIName
 				request.PathParameters()["namespace"] = k8smetav1.NamespaceDefault
 
-				flag := false
 				vmi := api.NewMinimalVMI(testVMIName)
-				vmi.Status.Phase = v1.Running
+				vmi.Status.Phase = phase
 				vmi.ObjectMeta.SetUID(uuid.NewUUID())
-				vmi.Spec.Domain.Devices.AutoattachGraphicsDevice = &flag
+				vmi.Spec.Domain.Devices.AutoattachGraphicsDevice = &autoattachGraphicsDevice
 
 				vmiClient.EXPECT().Get(context.Background(), testVMIName, &k8smetav1.GetOptions{}).Return(vmi, nil)
 
 				app.VNCRequestHandler(request, response)
-				ExpectStatusErrorWithCode(recorder, http.StatusBadRequest)
-			})
 
+				ExpectStatusErrorWithCode(recorder, http.StatusBadRequest)
+			},
+				Entry("should fail if there is no graphics device", false, v1.Running),
+				Entry("should fail if vmi is not running", true, v1.Scheduling),
+			)
 		})
 
 		Context("PortForward", func() {
@@ -400,22 +401,23 @@ var _ = Describe("VirtualMachineInstance Subresources", func() {
 		})
 
 		Context("console", func() {
-			It("should fail with no serial console at console connections", func() {
-
+			DescribeTable("request validation", func(autoattachSerialConsole bool, phase v1.VirtualMachineInstancePhase) {
 				request.PathParameters()["name"] = testVMIName
 				request.PathParameters()["namespace"] = k8smetav1.NamespaceDefault
 
-				flag := false
 				vmi := api.NewMinimalVMI(testVMIName)
-				vmi.Status.Phase = v1.Running
+				vmi.Status.Phase = phase
 				vmi.ObjectMeta.SetUID(uuid.NewUUID())
-				vmi.Spec.Domain.Devices.AutoattachSerialConsole = &flag
+				vmi.Spec.Domain.Devices.AutoattachSerialConsole = &autoattachSerialConsole
 
 				vmiClient.EXPECT().Get(context.Background(), vmi.Name, &k8smetav1.GetOptions{}).Return(vmi, nil)
 
 				app.ConsoleRequestHandler(request, response)
 				ExpectStatusErrorWithCode(recorder, http.StatusBadRequest)
-			})
+			},
+				Entry("should fail if there is no serial console", false, v1.Running),
+				Entry("should fail if vmi is not running", true, v1.Scheduling),
+			)
 
 			It("should fail to connect to the serial console if the VMI is Failed", func() {
 
@@ -613,13 +615,13 @@ var _ = Describe("VirtualMachineInstance Subresources", func() {
 				vmClient.EXPECT().Get(context.Background(), vm.Name, &k8smetav1.GetOptions{}).Return(vm, nil)
 				vmiClient.EXPECT().Get(context.Background(), vmi.Name, &k8smetav1.GetOptions{}).Return(&vmi, nil)
 				vmiClient.EXPECT().Patch(context.Background(), vmi.Name, types.MergePatchType, gomock.Any(), gomock.Any()).DoAndReturn(
-					func(ctx context.Context, name string, patchType types.PatchType, body interface{}, opts *k8smetav1.PatchOptions) (interface{}, interface{}) {
+					func(ctx context.Context, name string, patchType types.PatchType, body interface{}, opts *k8smetav1.PatchOptions, _ ...string) (interface{}, interface{}) {
 						//check that dryRun option has been propagated to patch request
 						Expect(opts.DryRun).To(BeEquivalentTo(stopOptions.DryRun))
 						return &vmi, nil
 					}).AnyTimes()
 				vmClient.EXPECT().Patch(context.Background(), vm.Name, types.MergePatchType, gomock.Any(), gomock.Any()).DoAndReturn(
-					func(ctx context.Context, name string, patchType types.PatchType, body interface{}, opts *k8smetav1.PatchOptions) (interface{}, interface{}) {
+					func(ctx context.Context, name string, patchType types.PatchType, body interface{}, opts *k8smetav1.PatchOptions, _ ...string) (interface{}, interface{}) {
 						//check that dryRun option has been propagated to patch request
 						Expect(opts.DryRun).To(BeEquivalentTo(stopOptions.DryRun))
 						return vm, nil
@@ -791,7 +793,7 @@ var _ = Describe("VirtualMachineInstance Subresources", func() {
 
 				if addOpts != nil {
 					vmiClient.EXPECT().Patch(context.Background(), vmi.Name, types.JSONPatchType, gomock.Any(), gomock.Any()).DoAndReturn(
-						func(ctx context.Context, name string, patchType types.PatchType, body interface{}, opts *k8smetav1.PatchOptions) (interface{}, interface{}) {
+						func(ctx context.Context, name string, patchType types.PatchType, body interface{}, opts *k8smetav1.PatchOptions, _ ...string) (interface{}, interface{}) {
 							//check that dryRun option has been propagated to patch request
 							Expect(opts.DryRun).To(BeEquivalentTo(addOpts.DryRun))
 							return vmi, nil
@@ -799,7 +801,7 @@ var _ = Describe("VirtualMachineInstance Subresources", func() {
 					app.VMIAddVolumeRequestHandler(request, response)
 				} else {
 					vmiClient.EXPECT().Patch(context.Background(), vmi.Name, types.JSONPatchType, gomock.Any(), gomock.Any()).DoAndReturn(
-						func(ctx context.Context, name string, patchType types.PatchType, body interface{}, opts *k8smetav1.PatchOptions) (interface{}, interface{}) {
+						func(ctx context.Context, name string, patchType types.PatchType, body interface{}, opts *k8smetav1.PatchOptions, _ ...string) (interface{}, interface{}) {
 							//check that dryRun option has been propagated to patch request
 							Expect(opts.DryRun).To(BeEquivalentTo(removeOpts.DryRun))
 							return vmi, nil
@@ -1554,7 +1556,7 @@ var _ = Describe("VirtualMachineInstance Subresources", func() {
 			vmiClient.EXPECT().Get(context.Background(), vm.Name, &k8smetav1.GetOptions{}).Return(nil, errors.NewNotFound(v1.Resource("virtualmachineinstance"), testVMName))
 			if !expectError {
 				vmClient.EXPECT().Patch(context.Background(), vm.Name, types.MergePatchType, gomock.Any(), gomock.Any()).DoAndReturn(
-					func(ctx context.Context, name string, patchType types.PatchType, body interface{}, opts *k8smetav1.PatchOptions) (interface{}, interface{}) {
+					func(ctx context.Context, name string, patchType types.PatchType, body interface{}, opts *k8smetav1.PatchOptions, _ ...string) (interface{}, interface{}) {
 						//check that dryRun option has been propagated to patch request
 						Expect(opts.DryRun).To(BeEquivalentTo(stopOptions.DryRun))
 						return vm, nil
@@ -1617,7 +1619,7 @@ var _ = Describe("VirtualMachineInstance Subresources", func() {
 
 			if graceperiod != nil {
 				vmiClient.EXPECT().Patch(context.Background(), vmi.Name, types.MergePatchType, gomock.Any(), gomock.Any()).DoAndReturn(
-					func(ctx context.Context, name string, patchType types.PatchType, body interface{}, opts *k8smetav1.PatchOptions) (interface{}, interface{}) {
+					func(ctx context.Context, name string, patchType types.PatchType, body interface{}, opts *k8smetav1.PatchOptions, _ ...string) (interface{}, interface{}) {
 						//check that dryRun option has been propagated to patch request
 						Expect(opts.DryRun).To(BeEquivalentTo(stopOptions.DryRun))
 						return vm, nil
@@ -2223,6 +2225,123 @@ var _ = Describe("VirtualMachineInstance Subresources", func() {
 			Entry("Manual RunStrategy", v1.RunStrategyManual),
 			Entry("RerunOnFailure RunStrategy", v1.RunStrategyRerunOnFailure),
 		)
+	})
+
+	Context("Subresource api - AMD SEV attestation", func() {
+		withSEVAttestation := func(vmi *v1.VirtualMachineInstance) {
+			vmi.Spec.Domain.LaunchSecurity = &v1.LaunchSecurity{
+				SEV: &v1.SEV{
+					Attestation: &v1.SEVAttestation{},
+				},
+			}
+		}
+
+		withScheduledPhase := func(vmi *v1.VirtualMachineInstance) {
+			vmi.Status.Phase = v1.Scheduled
+		}
+
+		BeforeEach(func() {
+			enableFeatureGate(virtconfig.WorkloadEncryptionSEV)
+		})
+
+		It("Should allow to fetch certificates chain when VMI is running", func() {
+			backend.AppendHandlers(
+				ghttp.CombineHandlers(
+					ghttp.VerifyRequest("GET", "/v1/namespaces/default/virtualmachineinstances/testvmi/sev/fetchcertchain"),
+					ghttp.RespondWithJSONEncoded(http.StatusOK, v1.SEVPlatformInfo{}),
+				),
+			)
+			response.SetRequestAccepts(restful.MIME_JSON)
+
+			expectVMI(Running, UnPaused, withSEVAttestation)
+			app.SEVFetchCertChainRequestHandler(request, response)
+			Expect(response.Error()).ToNot(HaveOccurred())
+			Expect(response.StatusCode()).To(Equal(http.StatusOK))
+		})
+
+		It("Should fail to fetch certificates chain when attestation is not requested", func() {
+			expectVMI(Running, UnPaused)
+			app.SEVFetchCertChainRequestHandler(request, response)
+			Expect(response.Error()).To(HaveOccurred())
+			Expect(response.StatusCode()).To(Equal(http.StatusInternalServerError))
+		})
+
+		It("Should fail to fetch certificates chain when VMI is not running", func() {
+			expectVMI(NotRunning, UnPaused)
+			app.SEVFetchCertChainRequestHandler(request, response)
+			Expect(response.Error()).To(HaveOccurred())
+			Expect(response.StatusCode()).To(Equal(http.StatusInternalServerError))
+		})
+
+		It("Should allow to query launch measurement when VMI is paused", func() {
+			backend.AppendHandlers(
+				ghttp.CombineHandlers(
+					ghttp.VerifyRequest("GET", "/v1/namespaces/default/virtualmachineinstances/testvmi/sev/querylaunchmeasurement"),
+					ghttp.RespondWithJSONEncoded(http.StatusOK, v1.SEVMeasurementInfo{}),
+				),
+			)
+			response.SetRequestAccepts(restful.MIME_JSON)
+
+			expectVMI(Running, Paused, withSEVAttestation)
+			app.SEVQueryLaunchMeasurementHandler(request, response)
+			Expect(response.Error()).ToNot(HaveOccurred())
+			Expect(response.StatusCode()).To(Equal(http.StatusOK))
+		})
+
+		DescribeTable("Should fail to query launch measurement",
+			func(running, paused bool, vmiWarpFunctions ...func(vmi *v1.VirtualMachineInstance)) {
+				expectVMI(running, paused, vmiWarpFunctions...)
+				app.SEVQueryLaunchMeasurementHandler(request, response)
+				Expect(response.Error()).To(HaveOccurred())
+				Expect(response.StatusCode()).To(Equal(http.StatusInternalServerError))
+			},
+			Entry("when VMI is not running", NotRunning, Paused, withSEVAttestation),
+			Entry("when VMI is not paused", Running, UnPaused, withSEVAttestation),
+			Entry("when attestation is not requested ", Running, Paused),
+		)
+
+		It("Should allow to setup SEV session parameters for a paused VMI", func() {
+			sevSessionOptions := &v1.SEVSessionOptions{
+				Session: "AAABBB",
+				DHCert:  "CCCDDD",
+			}
+			body, err := json.Marshal(sevSessionOptions)
+			Expect(err).ToNot(HaveOccurred())
+			request.Request.Body = &readCloserWrapper{bytes.NewReader(body)}
+
+			expectVMI(NotRunning, UnPaused, withSEVAttestation, withScheduledPhase)
+			vmiClient.EXPECT().Patch(context.Background(), testVMIName, types.JSONPatchType, gomock.Any(), gomock.Any()).DoAndReturn(
+				func(ctx context.Context, name string, patchType types.PatchType, body interface{}, opts *k8smetav1.PatchOptions, _ ...string) (interface{}, interface{}) {
+					patch := []byte(`[{"op":"test","path":"/spec/domain/launchSecurity/sev","value":{"attestation":{}}},{"op":"replace","path":"/spec/domain/launchSecurity/sev","value":{"attestation":{},"session":"AAABBB","dhCert":"CCCDDD"}}]`)
+					Expect(body).To(Equal(patch))
+					return nil, nil
+				},
+			)
+
+			app.SEVSetupSessionHandler(request, response)
+			Expect(response.Error()).ToNot(HaveOccurred())
+			Expect(response.StatusCode()).To(Equal(http.StatusAccepted))
+		})
+
+		It("Should allow to inject SEV launch secret into a paused VMI", func() {
+			backend.AppendHandlers(
+				ghttp.CombineHandlers(
+					ghttp.VerifyRequest("PUT", "/v1/namespaces/default/virtualmachineinstances/testvmi/sev/injectlaunchsecret"),
+					ghttp.RespondWithJSONEncoded(http.StatusOK, ""),
+				),
+			)
+
+			sevSecretOptions := &v1.SEVSecretOptions{}
+			body, err := json.Marshal(sevSecretOptions)
+			Expect(err).ToNot(HaveOccurred())
+			request.Request.Body = &readCloserWrapper{bytes.NewReader(body)}
+
+			expectVMI(Running, Paused, withSEVAttestation)
+
+			app.SEVInjectLaunchSecretHandler(request, response)
+			Expect(response.Error()).ToNot(HaveOccurred())
+			Expect(response.StatusCode()).To(Equal(http.StatusOK))
+		})
 	})
 
 	AfterEach(func() {

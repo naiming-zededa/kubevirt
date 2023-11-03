@@ -27,6 +27,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"k8s.io/utils/pointer"
 
 	"kubevirt.io/kubevirt/pkg/safepath"
+	"kubevirt.io/kubevirt/pkg/virt-controller/services"
 
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/testing"
@@ -205,7 +207,9 @@ var _ = Describe("VirtualMachineInstance", func() {
 		mockHotplugVolumeMounter = hotplug_volume.NewMockVolumeMounter(ctrl)
 
 		migrationProxy := migrationproxy.NewMigrationProxyManager(tlsConfig, tlsConfig, config)
-		controller = NewController(recorder,
+		fakeDownwardMetricsManager := newFakeManager()
+
+		controller, _ = NewController(recorder,
 			virtClient,
 			host,
 			podIpAddress,
@@ -221,6 +225,7 @@ var _ = Describe("VirtualMachineInstance", func() {
 			config,
 			mockIsolationDetector,
 			migrationProxy,
+			fakeDownwardMetricsManager,
 			nil,
 			"",
 		)
@@ -558,8 +563,6 @@ var _ = Describe("VirtualMachineInstance", func() {
 			Expect(mockQueue.GetRateLimitedEnqueueCount()).To(Equal(0))
 			_, err := os.Stat(mockWatchdog.File(oldVMI))
 			Expect(errors.Is(err, os.ErrNotExist)).To(BeTrue())
-			Expect(controller.netConf.SetupCompleted(vmi)).To(BeFalse())
-			Expect(controller.netConf.SetupCompleted(oldVMI)).To(BeFalse())
 		})
 
 		It("should cleanup if vmi is finalized and domain does not exist", func() {
@@ -577,7 +580,6 @@ var _ = Describe("VirtualMachineInstance", func() {
 			Expect(mockQueue.GetRateLimitedEnqueueCount()).To(Equal(0))
 			_, err := os.Stat(mockWatchdog.File(vmi))
 			Expect(errors.Is(err, os.ErrNotExist)).To(BeTrue())
-			Expect(controller.netConf.SetupCompleted(vmi)).To(BeFalse())
 		})
 
 		It("should do final cleanup if vmi is being deleted and not finalized", func() {
@@ -678,6 +680,48 @@ var _ = Describe("VirtualMachineInstance", func() {
 			mockHotplugVolumeMounter.EXPECT().Mount(gomock.Any()).Return(nil)
 			controller.Execute()
 			testutils.ExpectEvent(recorder, VMIDefined)
+		})
+
+		It("should update the qemu machine type on the VMI status", func() {
+			vmi := api2.NewMinimalVMI("testvmi")
+			vmi.UID = vmiTestUUID
+			vmi.ObjectMeta.ResourceVersion = "1"
+			vmi.Status.Phase = v1.Running
+			vmi = addActivePods(vmi, podTestUUID, host)
+			vmi.Status.Conditions = []v1.VirtualMachineInstanceCondition{
+				{
+					Type:   v1.VirtualMachineInstanceIsMigratable,
+					Status: k8sv1.ConditionTrue,
+				},
+			}
+
+			mockWatchdog.CreateFile(vmi)
+
+			domain := api.NewMinimalDomainWithUUID("testvmi", vmiTestUUID)
+			domain.Status.Status = api.Running
+			domain.Spec.OS.Type.Machine = "q35-123"
+
+			updatedVMI := vmi.DeepCopy()
+			updatedVMI.Status.Machine = &v1.Machine{Type: "q35-123"}
+
+			vmiFeeder.Add(vmi)
+			domainFeeder.Add(domain)
+
+			client.EXPECT().SyncVirtualMachine(vmi, gomock.Any()).Do(func(vmi *v1.VirtualMachineInstance, options *cmdv1.VirtualMachineOptions) {
+				Expect(options.VirtualMachineSMBios.Family).To(Equal(virtconfig.SmbiosConfigDefaultFamily))
+				Expect(options.VirtualMachineSMBios.Product).To(Equal(virtconfig.SmbiosConfigDefaultProduct))
+				Expect(options.VirtualMachineSMBios.Manufacturer).To(Equal(virtconfig.SmbiosConfigDefaultManufacturer))
+			})
+
+			vmiInterface.EXPECT().Update(context.Background(), gomock.Any()).DoAndReturn(func(_ context.Context, obj interface{}) (*v1.VirtualMachineInstance, error) {
+				vmi := obj.(*v1.VirtualMachineInstance)
+				Expect(vmi.Status.Machine).To(Equal(updatedVMI.Status.Machine))
+				return vmi, nil
+			})
+			mockHotplugVolumeMounter.EXPECT().Unmount(gomock.Any()).Return(nil)
+			mockHotplugVolumeMounter.EXPECT().Mount(gomock.Any()).Return(nil)
+
+			controller.Execute()
 		})
 
 		It("should update from Scheduled to Running, if it sees a running Domain", func() {
@@ -1137,6 +1181,7 @@ var _ = Describe("VirtualMachineInstance", func() {
 			vmi.Status.Phase = v1.Scheduled
 			vmi.Status.ActivePods = map[types.UID]string{podTestUUID: ""}
 			vmi.Spec.Networks = []v1.Network{{Name: "foo"}}
+			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{{Name: "foo"}}
 
 			mockWatchdog.CreateFile(vmi)
 			vmiFeeder.Add(vmi)
@@ -1147,7 +1192,6 @@ var _ = Describe("VirtualMachineInstance", func() {
 			})
 			mockHotplugVolumeMounter.EXPECT().Mount(gomock.Any()).Return(nil)
 			controller.Execute()
-			Expect(controller.netConf.SetupCompleted(vmi)).To(BeFalse())
 			testutils.ExpectEvent(recorder, "failed to configure vmi network:")
 			testutils.ExpectEvent(recorder, VMICrashed)
 		})
@@ -2015,11 +2059,11 @@ var _ = Describe("VirtualMachineInstance", func() {
 			vmiUpdated := vmi.DeepCopy()
 			vmiUpdated.Status.MigrationState.TargetNodeDomainDetected = true
 			client.EXPECT().Ping().AnyTimes()
-			client.EXPECT().FinalizeVirtualMachineMigration(vmi)
-
+			client.EXPECT().FinalizeVirtualMachineMigration(gomock.Any())
 			vmiInterface.EXPECT().Update(context.Background(), gomock.Any()).Do(func(ctx context.Context, vmiObj *v1.VirtualMachineInstance) {
 
 				Expect(vmiObj.Status.MigrationState.TargetNodeDomainReadyTimestamp).ToNot(BeNil())
+				Expect(vmiObj.Status.CurrentCPUTopology).To(BeNil())
 				vmiUpdated.Status.MigrationState.TargetNodeDomainReadyTimestamp = vmiObj.Status.MigrationState.TargetNodeDomainReadyTimestamp
 
 				Expect(vmiObj).To(Equal(vmiUpdated))
@@ -2027,6 +2071,211 @@ var _ = Describe("VirtualMachineInstance", func() {
 
 			controller.Execute()
 		})
+
+		It("should hotplug CPU in post-migration when target pod has the required conditions", func() {
+			vmi := api2.NewMinimalVMI("testvmi")
+			vmi.UID = vmiTestUUID
+			vmi.ObjectMeta.ResourceVersion = "1"
+			vmi.Status.Phase = v1.Running
+			vmi.Labels = make(map[string]string)
+			vmi.Status.NodeName = "othernode"
+			vmi.Labels[v1.MigrationTargetNodeNameLabel] = host
+			pastTime := metav1.NewTime(metav1.Now().Add(time.Duration(-10) * time.Second))
+			vmi.Status.MigrationState = &v1.VirtualMachineInstanceMigrationState{
+				TargetNode:               host,
+				TargetNodeAddress:        "127.0.0.1:12345",
+				SourceNode:               "othernode",
+				MigrationUID:             "123",
+				TargetNodeDomainDetected: false,
+				StartTimestamp:           &pastTime,
+			}
+			cpuTopology := &v1.CPU{
+				Sockets: 1,
+				Cores:   1,
+				Threads: 1,
+			}
+
+			vmiConditions := virtcontroller.NewVirtualMachineInstanceConditionManager()
+			vmi.Spec.Domain.CPU = cpuTopology
+
+			vmi.Status.Conditions = append(vmi.Status.Conditions, v1.VirtualMachineInstanceCondition{
+				Type:   v1.VirtualMachineInstanceVCPUChange,
+				Status: k8sv1.ConditionTrue,
+			})
+
+			mockWatchdog.CreateFile(vmi)
+			domain := api.NewMinimalDomainWithUUID("testvmi", vmiTestUUID)
+			domain.Status.Status = api.Running
+
+			domain.Spec.Metadata.KubeVirt.Migration = &api.MigrationMetadata{
+				UID:            "123",
+				StartTimestamp: &pastTime,
+			}
+
+			domainFeeder.Add(domain)
+			vmiFeeder.Add(vmi)
+
+			vmiUpdated := vmi.DeepCopy()
+			vmiUpdated.Status.MigrationState.TargetNodeDomainDetected = true
+
+			client.EXPECT().Ping().AnyTimes()
+			client.EXPECT().FinalizeVirtualMachineMigration(gomock.Any())
+			client.EXPECT().SyncVirtualMachineCPUs(gomock.Any(), gomock.Any())
+			vmiInterface.EXPECT().Update(context.Background(), gomock.Any()).Do(func(ctx context.Context, vmiObj *v1.VirtualMachineInstance) {
+
+				Expect(vmiObj.Status.MigrationState.TargetNodeDomainReadyTimestamp).ToNot(BeNil())
+				Expect(vmiObj.Status.CurrentCPUTopology).NotTo(BeNil())
+				Expect(vmiConditions.HasCondition(vmiObj, v1.VirtualMachineInstanceVCPUChange)).To(BeFalse())
+				vmiUpdated.Status.MigrationState.TargetNodeDomainReadyTimestamp = vmiObj.Status.MigrationState.TargetNodeDomainReadyTimestamp
+				vmiUpdated.Status.CurrentCPUTopology = vmiObj.Status.CurrentCPUTopology
+				vmiConditions.RemoveCondition(vmiUpdated, v1.VirtualMachineInstanceVCPUChange)
+
+				Expect(vmiObj).To(Equal(vmiUpdated))
+			})
+
+			controller.Execute()
+		})
+
+		It("should hotplug memory in post-migration when target pod has the required conditions", func() {
+			conditionManager := virtcontroller.NewVirtualMachineInstanceConditionManager()
+
+			initialMemory := resource.MustParse("512Mi")
+			requestedMemory := resource.MustParse("1Gi")
+
+			vmi := api2.NewMinimalVMI("testvmi")
+			vmi.Spec.Domain.Memory = &v1.Memory{
+				Guest: &requestedMemory,
+			}
+			vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory] = requestedMemory
+			vmi.Status.Memory = &v1.MemoryStatus{
+				GuestAtBoot:    &initialMemory,
+				GuestCurrent:   &initialMemory,
+				GuestRequested: &initialMemory,
+			}
+
+			targetPodMemory := services.GetMemoryOverhead(vmi, runtime.GOARCH, nil)
+			targetPodMemory.Add(requestedMemory)
+			vmi.Labels = map[string]string{
+				v1.VirtualMachinePodMemoryRequestsLabel: targetPodMemory.String(),
+			}
+
+			condition := &v1.VirtualMachineInstanceCondition{
+				Type:   v1.VirtualMachineInstanceMemoryChange,
+				Status: k8sv1.ConditionTrue,
+			}
+			conditionManager.UpdateCondition(vmi, condition)
+
+			client.EXPECT().SyncVirtualMachineMemory(vmi, gomock.Any())
+
+			Expect(controller.hotplugMemory(vmi, client)).To(Succeed())
+
+			Expect(conditionManager.HasCondition(vmi, v1.VirtualMachineInstanceMemoryChange)).To(BeFalse())
+			Expect(v1.VirtualMachinePodMemoryRequestsLabel).ToNot(BeKeyOf(vmi.Labels))
+			Expect(vmi.Status.Memory.GuestRequested).To(Equal(vmi.Spec.Domain.Memory.Guest))
+		})
+
+		It("should not hotplug memory if target pod does not have enough memory", func() {
+			conditionManager := virtcontroller.NewVirtualMachineInstanceConditionManager()
+
+			initialMemory := resource.MustParse("512Mi")
+			requestedMemory := resource.MustParse("1Gi")
+
+			vmi := api2.NewMinimalVMI("testvmi")
+			vmi.Spec.Domain.Memory = &v1.Memory{
+				Guest: &requestedMemory,
+			}
+			vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory] = requestedMemory
+
+			vmi.Status.Memory = &v1.MemoryStatus{
+				GuestAtBoot:    &initialMemory,
+				GuestCurrent:   &initialMemory,
+				GuestRequested: &initialMemory,
+			}
+			vmi.Labels = map[string]string{
+				v1.VirtualMachinePodMemoryRequestsLabel: initialMemory.String(),
+			}
+
+			condition := &v1.VirtualMachineInstanceCondition{
+				Type:   v1.VirtualMachineInstanceMemoryChange,
+				Status: k8sv1.ConditionTrue,
+			}
+			conditionManager.UpdateCondition(vmi, condition)
+
+			Expect(controller.hotplugMemory(vmi, client)).ToNot(Succeed())
+
+			Expect(conditionManager.HasCondition(vmi, v1.VirtualMachineInstanceMemoryChange)).To(BeFalse())
+			Expect(v1.VirtualMachinePodMemoryRequestsLabel).ToNot(BeKeyOf(vmi.Labels))
+			Expect(vmi.Status.Memory.GuestRequested).ToNot(Equal(vmi.Spec.Domain.Memory.Guest))
+		})
+	})
+
+	It("should always remove the VirtualMachineInstanceVCPUChange condition even if hotplug CPU has failed", func() {
+		vmi := api2.NewMinimalVMI("testvmi")
+		vmi.UID = vmiTestUUID
+		vmi.ObjectMeta.ResourceVersion = "1"
+		vmi.Status.Phase = v1.Running
+		vmi.Labels = make(map[string]string)
+		vmi.Status.NodeName = "othernode"
+		vmi.Labels[v1.MigrationTargetNodeNameLabel] = host
+		pastTime := metav1.NewTime(metav1.Now().Add(time.Duration(-10) * time.Second))
+		vmi.Status.MigrationState = &v1.VirtualMachineInstanceMigrationState{
+			TargetNode:               host,
+			TargetNodeAddress:        "127.0.0.1:12345",
+			SourceNode:               "othernode",
+			MigrationUID:             "123",
+			TargetNodeDomainDetected: false,
+			StartTimestamp:           &pastTime,
+		}
+
+		cpuTopology := &v1.CPU{
+			Sockets: 1,
+			Cores:   1,
+			Threads: 1,
+		}
+
+		vmiConditions := virtcontroller.NewVirtualMachineInstanceConditionManager()
+		vmi.Spec.Domain.CPU = cpuTopology
+
+		vmi.Status.Conditions = append(vmi.Status.Conditions, v1.VirtualMachineInstanceCondition{
+			Type:   v1.VirtualMachineInstanceVCPUChange,
+			Status: k8sv1.ConditionTrue,
+		})
+
+		vmi.Status.CurrentCPUTopology = &v1.CPUTopology{
+			Cores:   cpuTopology.Cores,
+			Sockets: cpuTopology.Sockets,
+			Threads: cpuTopology.Threads,
+		}
+
+		mockWatchdog.CreateFile(vmi)
+		domain := api.NewMinimalDomainWithUUID("testvmi", vmiTestUUID)
+		domain.Status.Status = api.Running
+
+		domain.Spec.Metadata.KubeVirt.Migration = &api.MigrationMetadata{
+			UID:            "123",
+			StartTimestamp: &pastTime,
+		}
+		domainFeeder.Add(domain)
+		vmiFeeder.Add(vmi)
+
+		vmiUpdated := vmi.DeepCopy()
+		vmiUpdated.Status.MigrationState.TargetNodeDomainDetected = true
+
+		client.EXPECT().Ping().AnyTimes()
+		client.EXPECT().FinalizeVirtualMachineMigration(gomock.Any())
+		client.EXPECT().SyncVirtualMachineCPUs(gomock.Any(), gomock.Any()).Return(fmt.Errorf("some error"))
+		vmiInterface.EXPECT().Update(context.Background(), gomock.Any()).Do(func(ctx context.Context, vmiObj *v1.VirtualMachineInstance) {
+
+			Expect(vmiObj.Status.MigrationState.TargetNodeDomainReadyTimestamp).ToNot(BeNil())
+			Expect(vmiObj.Status.CurrentCPUTopology).NotTo(BeNil())
+			vmiUpdated.Status.MigrationState.TargetNodeDomainReadyTimestamp = vmiObj.Status.MigrationState.TargetNodeDomainReadyTimestamp
+			vmiConditions.RemoveCondition(vmiUpdated, v1.VirtualMachineInstanceVCPUChange)
+
+			Expect(vmiObj).To(Equal(vmiUpdated))
+		})
+
+		controller.Execute()
+		testutils.ExpectEvent(recorder, "failed to change vCPUs")
 	})
 
 	Context("check if migratable", func() {
@@ -2782,6 +3031,40 @@ var _ = Describe("VirtualMachineInstance", func() {
 			controller.Execute()
 			testutils.ExpectEvent(recorder, VMIStarted)
 		})
+
+		It("should update Memory information in VMI status", func() {
+			initialMemory := resource.MustParse("128Ki")
+			vmi := api2.NewMinimalVMI("testvmi")
+			vmi.UID = vmiTestUUID
+			vmi.ObjectMeta.ResourceVersion = "1"
+			vmi.Status.Phase = v1.Running
+			vmi.Status.Memory = &v1.MemoryStatus{
+				GuestAtBoot:  &initialMemory,
+				GuestCurrent: &initialMemory,
+			}
+
+			mockWatchdog.CreateFile(vmi)
+			domain := api.NewMinimalDomainWithUUID("testvmi", vmiTestUUID)
+			domain.Status.Status = api.Running
+			domain.Spec.CurrentMemory = &api.Memory{
+				Value: 512,
+				Unit:  "KiB",
+			}
+
+			vmiFeeder.Add(vmi)
+			domainFeeder.Add(domain)
+
+			client.EXPECT().SyncVirtualMachine(vmi, gomock.Any())
+			mockHotplugVolumeMounter.EXPECT().Unmount(gomock.Any()).Return(nil)
+			mockHotplugVolumeMounter.EXPECT().Mount(gomock.Any()).Return(nil)
+
+			expectedMemory := resource.MustParse("512Ki")
+			vmiInterface.EXPECT().Update(context.Background(), gomock.Any()).Do(func(ctx context.Context, arg interface{}) {
+				Expect(*(arg.(*v1.VirtualMachineInstance).Status.Memory.GuestCurrent)).To(Equal(expectedMemory))
+			}).Return(vmi, nil)
+
+			controller.Execute()
+		})
 	})
 
 	Context("VirtualMachineInstance controller gets informed about disk information", func() {
@@ -3013,6 +3296,7 @@ var _ = Describe("VirtualMachineInstance", func() {
 			testutils.ExpectEvent(recorder, VMIMigrating)
 		})
 	})
+
 })
 
 var _ = Describe("DomainNotifyServerRestarts", func() {
@@ -3194,6 +3478,28 @@ var _ = Describe("DomainNotifyServerRestarts", func() {
 	})
 })
 
+var _ = Describe("CurrentMemory in Libvirt Domain", func() {
+	DescribeTable("should be correctly parsed", func(inputMemory *api.Memory, outputQuantity resource.Quantity) {
+		result := parseLibvirtQuantity(int64(inputMemory.Value), inputMemory.Unit)
+		Expect(result.Equal(outputQuantity)).To(BeTrue())
+	},
+		Entry("bytes", &api.Memory{Value: 512, Unit: "bytes"}, *resource.NewQuantity(512, resource.BinarySI)),
+		Entry("b (bytes)", &api.Memory{Value: 512, Unit: "bytes"}, *resource.NewQuantity(512, resource.BinarySI)),
+		Entry("KB", &api.Memory{Value: 512, Unit: "KB"}, resource.MustParse("512k")),
+		Entry("MB", &api.Memory{Value: 512, Unit: "MB"}, resource.MustParse("512M")),
+		Entry("GB", &api.Memory{Value: 512, Unit: "GB"}, resource.MustParse("512G")),
+		Entry("TB", &api.Memory{Value: 512, Unit: "TB"}, resource.MustParse("512T")),
+		Entry("Ki", &api.Memory{Value: 512, Unit: "KiB"}, resource.MustParse("512Ki")),
+		Entry("Mi", &api.Memory{Value: 512, Unit: "MiB"}, resource.MustParse("512Mi")),
+		Entry("Gi", &api.Memory{Value: 512, Unit: "GiB"}, resource.MustParse("512Gi")),
+		Entry("Ti", &api.Memory{Value: 512, Unit: "TiB"}, resource.MustParse("512Ti")),
+		Entry("Ki (k)", &api.Memory{Value: 512, Unit: "k"}, resource.MustParse("512Ki")),
+		Entry("Mi (M)", &api.Memory{Value: 512, Unit: "M"}, resource.MustParse("512Mi")),
+		Entry("Gi (G)", &api.Memory{Value: 512, Unit: "G"}, resource.MustParse("512Gi")),
+		Entry("Ti (T)", &api.Memory{Value: 512, Unit: "T"}, resource.MustParse("512Ti")),
+	)
+})
+
 type MockGracefulShutdown struct {
 	baseDir string
 }
@@ -3318,16 +3624,8 @@ func (nc *netConfStub) Teardown(vmi *v1.VirtualMachineInstance) error {
 	return nil
 }
 
-func (nc *netConfStub) WithCompletionCache(id any, f func() error) error {
-	if err := f(); err != nil {
-		return err
-	}
-	nc.vmiUID = id.(types.UID)
+func (nc *netConfStub) HotUnplugInterfaces(vmi *v1.VirtualMachineInstance) error {
 	return nil
-}
-
-func (nc *netConfStub) SetupCompleted(vmi *v1.VirtualMachineInstance) bool {
-	return nc.vmiUID == vmi.UID
 }
 
 type netStatStub struct{}
@@ -3358,3 +3656,15 @@ func (ns *netStatStub) PodInterfaceVolatileDataIsCached(vmi *v1.VirtualMachineIn
 }
 func (ns *netStatStub) CachePodInterfaceVolatileData(vmi *v1.VirtualMachineInstance, ifaceName string, data *netcache.PodIfaceCacheData) {
 }
+
+func newFakeManager() *fakeManager {
+	return &fakeManager{}
+}
+
+type fakeManager struct{}
+
+func (*fakeManager) Run(_ chan struct{}) {}
+func (*fakeManager) StartServer(_ *v1.VirtualMachineInstance, _ int) error {
+	return nil
+}
+func (*fakeManager) StopServer(_ *v1.VirtualMachineInstance) {}

@@ -20,24 +20,21 @@
 package services
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"strconv"
 	"strings"
 
-	"kubevirt.io/kubevirt/pkg/virt-controller/watch/topology"
-
-	"k8s.io/kubectl/pkg/cmd/util/podcmd"
-	"k8s.io/utils/pointer"
-
+	networkv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	k8sv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/cache"
-
-	networkv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
-
+	"k8s.io/kubectl/pkg/cmd/util/podcmd"
+	"k8s.io/utils/pointer"
 	v1 "kubevirt.io/api/core/v1"
 	exportv1 "kubevirt.io/api/export/v1alpha1"
 	"kubevirt.io/client-go/kubecli"
@@ -47,12 +44,14 @@ import (
 	containerdisk "kubevirt.io/kubevirt/pkg/container-disk"
 	"kubevirt.io/kubevirt/pkg/hooks"
 	"kubevirt.io/kubevirt/pkg/network/istio"
+	"kubevirt.io/kubevirt/pkg/network/namescheme"
 	"kubevirt.io/kubevirt/pkg/network/vmispec"
 	"kubevirt.io/kubevirt/pkg/storage/reservation"
 	"kubevirt.io/kubevirt/pkg/storage/types"
 	"kubevirt.io/kubevirt/pkg/util"
 	"kubevirt.io/kubevirt/pkg/util/net/dns"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
+	"kubevirt.io/kubevirt/pkg/virt-controller/watch/topology"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 )
 
@@ -126,6 +125,8 @@ const (
 	VirtlogdOverhead            = "20Mi"  // The `ps` RSS for virtlogd
 	VirtqemudOverhead           = "35Mi"  // The `ps` RSS for virtqemud
 	QemuOverhead                = "30Mi"  // The `ps` RSS for qemu, minus the RAM of its (stressed) guest, minus the virtual page table
+	// Default: limits.memory = 2*requests.memory
+	DefaultMemoryLimitOverheadRatio = float64(2.0)
 )
 
 const customSELinuxType = "virt_launcher.process"
@@ -156,6 +157,10 @@ type templateService struct {
 	virtClient                 kubecli.KubevirtClient
 	clusterConfig              *virtconfig.ClusterConfig
 	launcherSubGid             int64
+	resourceQuotaStore         cache.Store
+	namespaceStore             cache.Store
+
+	sidecarCreators []SidecarCreatorFunc
 }
 
 func isFeatureStateEnabled(fs *v1.FeatureState) bool {
@@ -263,6 +268,17 @@ func (t *templateService) RenderMigrationManifest(vmi *v1.VirtualMachineInstance
 	if err != nil {
 		return nil, err
 	}
+
+	if namescheme.PodHasOrdinalInterfaceName(NonDefaultMultusNetworksIndexedByIfaceName(pod)) {
+		ordinalNameScheme := namescheme.CreateOrdinalNetworkNameScheme(vmi.Spec.Networks)
+		multusNetworksAnnotation, err := GenerateMultusCNIAnnotationFromNameScheme(
+			vmi.Namespace, vmi.Spec.Domain.Devices.Interfaces, vmi.Spec.Networks, ordinalNameScheme, t.clusterConfig)
+		if err != nil {
+			return nil, err
+		}
+		podManifest.Annotations[networkv1.NetworkAttachmentAnnot] = multusNetworksAnnotation
+	}
+
 	return podManifest, err
 }
 
@@ -340,10 +356,15 @@ func (t *templateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, i
 	}
 	resources := resourceRenderer.ResourceRequirements()
 
-	// Read requested hookSidecars from VMI meta
-	requestedHookSidecarList, err := hooks.UnmarshalHookSidecarList(vmi)
-	if err != nil {
-		return nil, err
+	ovmfPath := t.clusterConfig.GetOVMFPath(vmi.Spec.Architecture)
+
+	var requestedHookSidecarList hooks.HookSidecarList
+	for _, sidecarCreator := range t.sidecarCreators {
+		sidecars, err := sidecarCreator(vmi, t.clusterConfig.GetConfig())
+		if err != nil {
+			return nil, err
+		}
+		requestedHookSidecarList = append(requestedHookSidecarList, sidecars...)
 	}
 
 	var command []string
@@ -364,7 +385,7 @@ func (t *templateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, i
 			"--container-disk-dir", t.containerDiskDir,
 			"--grace-period-seconds", strconv.Itoa(int(gracePeriodSeconds)),
 			"--hook-sidecars", strconv.Itoa(len(requestedHookSidecarList)),
-			"--ovmf-path", t.clusterConfig.GetOVMFPath(),
+			"--ovmf-path", ovmfPath,
 		}
 		if nonRoot {
 			command = append(command, "--run-as-nonroot")
@@ -451,14 +472,37 @@ func (t *templateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, i
 		containers = append(containers, virtiofsContainers...)
 	}
 
-	for i, requestedHookSidecar := range requestedHookSidecarList {
-		containers = append(
-			containers,
-			newSidecarContainerRenderer(
-				sidecarContainerName(i), vmi, sidecarResources(vmi, t.clusterConfig), requestedHookSidecar, userId).Render(requestedHookSidecar.Command))
+	sconsolelogContainer := generateSerialConsoleLogContainer(vmi, t.launcherImage, t.clusterConfig, virtLauncherLogVerbosity)
+	if sconsolelogContainer != nil {
+		containers = append(containers, *sconsolelogContainer)
 	}
 
-	podAnnotations, err := generatePodAnnotations(vmi)
+	var sidecarVolumes []k8sv1.Volume
+	for i, requestedHookSidecar := range requestedHookSidecarList {
+		sidecarContainer := newSidecarContainerRenderer(
+			sidecarContainerName(i), vmi, sidecarResources(vmi, t.clusterConfig), requestedHookSidecar, userId).Render(requestedHookSidecar.Command)
+
+		if requestedHookSidecar.ConfigMap != nil {
+			cm, err := t.virtClient.CoreV1().ConfigMaps(vmi.Namespace).Get(context.TODO(), requestedHookSidecar.ConfigMap.Name, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			volumeSource := k8sv1.VolumeSource{
+				ConfigMap: &k8sv1.ConfigMapVolumeSource{
+					LocalObjectReference: k8sv1.LocalObjectReference{Name: cm.Name},
+					DefaultMode:          pointer.Int32(0755),
+				},
+			}
+			vol := k8sv1.Volume{
+				Name:         cm.Name,
+				VolumeSource: volumeSource,
+			}
+			sidecarVolumes = append(sidecarVolumes, vol)
+		}
+		containers = append(containers, sidecarContainer)
+	}
+
+	podAnnotations, err := generatePodAnnotations(vmi, t.clusterConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -572,6 +616,8 @@ func (t *templateService) renderLaunchManifest(vmi *v1.VirtualMachineInstance, i
 		pod.Spec.AutomountServiceAccountToken = &automount
 	}
 
+	pod.Spec.Volumes = append(pod.Spec.Volumes, sidecarVolumes...)
+
 	return &pod, nil
 }
 
@@ -598,6 +644,7 @@ func (t *templateService) newNodeSelectorRenderer(vmi *v1.VirtualMachineInstance
 	return NewNodeSelectorRenderer(
 		vmi.Spec.NodeSelector,
 		t.clusterConfig.GetNodeSelectors(),
+		vmi.Spec.Architecture,
 		opts...,
 	)
 }
@@ -612,8 +659,13 @@ func initContainerVolumeMount() k8sv1.VolumeMount {
 func newSidecarContainerRenderer(sidecarName string, vmiSpec *v1.VirtualMachineInstance, resources k8sv1.ResourceRequirements, requestedHookSidecar hooks.HookSidecar, userId int64) *ContainerSpecRenderer {
 	sidecarOpts := []Option{
 		WithResourceRequirements(resources),
-		WithVolumeMounts(sidecarVolumeMount()),
 		WithArgs(requestedHookSidecar.Args),
+	}
+
+	if requestedHookSidecar.ConfigMap != nil {
+		sidecarOpts = append(sidecarOpts, WithVolumeMounts(sidecarVolumeMount(), configMapVolumeMount(*requestedHookSidecar.ConfigMap)))
+	} else {
+		sidecarOpts = append(sidecarOpts, WithVolumeMounts(sidecarVolumeMount()))
 	}
 
 	if util.IsNonRootVMI(vmiSpec) {
@@ -679,7 +731,7 @@ func (t *templateService) newVolumeRenderer(vmi *v1.VirtualMachineInstance, name
 		withVMIConfigVolumes(vmi.Spec.Domain.Devices.Disks, vmi.Spec.Volumes),
 		withVMIVolumes(t.persistentVolumeClaimStore, vmi.Spec.Volumes, vmi.Status.VolumeStatus),
 		withAccessCredentials(vmi.Spec.AccessCredentials),
-		withTPM(vmi),
+		withBackendStorage(vmi),
 	}
 	if len(requestedHookSidecarList) != 0 {
 		volumeOpts = append(volumeOpts, withSidecarVolumes(requestedHookSidecarList))
@@ -733,6 +785,14 @@ func sidecarVolumeMount() k8sv1.VolumeMount {
 	return k8sv1.VolumeMount{
 		Name:      hookSidecarSocks,
 		MountPath: hooks.HookSocketsSharedDirectory,
+	}
+}
+
+func configMapVolumeMount(v hooks.ConfigMap) k8sv1.VolumeMount {
+	return k8sv1.VolumeMount{
+		Name:      v.Name,
+		MountPath: v.HookPath,
+		SubPath:   v.Key,
 	}
 }
 
@@ -850,20 +910,21 @@ func (t *templateService) RenderHotplugAttachmentPodTemplate(volumes []*v1.Volum
 				},
 			},
 		})
-		if !skipMount {
-			pvc := claimMap[volume.Name]
-			if pvc != nil {
-				if types.IsPVCBlock(pvc.Spec.VolumeMode) {
-					pod.Spec.Containers[0].VolumeDevices = append(pod.Spec.Containers[0].VolumeDevices, k8sv1.VolumeDevice{
-						Name:       volume.Name,
-						DevicePath: fmt.Sprintf("/path/%s/%s", volume.Name, pvc.GetUID()),
-					})
-				} else {
-					pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, k8sv1.VolumeMount{
-						Name:      volume.Name,
-						MountPath: fmt.Sprintf("/%s", volume.Name),
-					})
-				}
+		pvc := claimMap[volume.Name]
+		if pvc == nil {
+			continue
+		}
+		if types.IsPVCBlock(pvc.Spec.VolumeMode) {
+			pod.Spec.Containers[0].VolumeDevices = append(pod.Spec.Containers[0].VolumeDevices, k8sv1.VolumeDevice{
+				Name:       volume.Name,
+				DevicePath: fmt.Sprintf("/path/%s/%s", volume.Name, pvc.GetUID()),
+			})
+		} else {
+			if !skipMount {
+				pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, k8sv1.VolumeMount{
+					Name:      volume.Name,
+					MountPath: fmt.Sprintf("/%s", volume.Name),
+				})
 			}
 		}
 	}
@@ -1024,6 +1085,7 @@ func (t *templateService) RenderExporterManifest(vmExport *exportv1.VirtualMachi
 						AllowPrivilegeEscalation: pointer.Bool(false),
 						Capabilities:             &k8sv1.Capabilities{Drop: []k8sv1.Capability{"ALL"}},
 					},
+					Resources: vmExportContainerResourceRequirements(t.clusterConfig),
 				},
 			},
 		},
@@ -1093,16 +1155,15 @@ func getResourceNameForNetwork(network *networkv1.NetworkAttachmentDefinition) s
 	return "" // meaning the network is not served by resources
 }
 
-func getNamespaceAndNetworkName(vmi *v1.VirtualMachineInstance, fullNetworkName string) (namespace string, networkName string) {
+func getNamespaceAndNetworkName(namespace string, fullNetworkName string) (string, string) {
 	if strings.Contains(fullNetworkName, "/") {
 		res := strings.SplitN(fullNetworkName, "/", 2)
-		namespace, networkName = res[0], res[1]
-	} else {
-		namespace = precond.MustNotBeEmpty(vmi.GetObjectMeta().GetNamespace())
-		networkName = fullNetworkName
+		return res[0], res[1]
 	}
-	return
+	return precond.MustNotBeEmpty(namespace), fullNetworkName
 }
+
+type templateServiceOption func(*templateService)
 
 func NewTemplateService(launcherImage string,
 	launcherQemuTimeout int,
@@ -1116,7 +1177,11 @@ func NewTemplateService(launcherImage string,
 	virtClient kubecli.KubevirtClient,
 	clusterConfig *virtconfig.ClusterConfig,
 	launcherSubGid int64,
-	exporterImage string) TemplateService {
+	exporterImage string,
+	resourceQuotaStore cache.Store,
+	namespaceStore cache.Store,
+	opts ...templateServiceOption,
+) TemplateService {
 
 	precond.MustNotBeEmpty(launcherImage)
 	log.Log.V(1).Infof("Exporter Image: %s", exporterImage)
@@ -1134,6 +1199,12 @@ func NewTemplateService(launcherImage string,
 		clusterConfig:              clusterConfig,
 		launcherSubGid:             launcherSubGid,
 		exporterImage:              exporterImage,
+		resourceQuotaStore:         resourceQuotaStore,
+		namespaceStore:             namespaceStore,
+	}
+
+	for _, opt := range opts {
+		opt(&svc)
 	}
 
 	return &svc
@@ -1231,7 +1302,7 @@ func generateContainerSecurityContext(selinuxType string, container *k8sv1.Conta
 	container.SecurityContext.SELinuxOptions.Level = "s0"
 }
 
-func generatePodAnnotations(vmi *v1.VirtualMachineInstance) (map[string]string, error) {
+func generatePodAnnotations(vmi *v1.VirtualMachineInstance, config *virtconfig.ClusterConfig) (map[string]string, error) {
 	annotationsSet := map[string]string{
 		v1.DomainAnnotation: vmi.GetObjectMeta().GetName(),
 	}
@@ -1241,7 +1312,11 @@ func generatePodAnnotations(vmi *v1.VirtualMachineInstance) (map[string]string, 
 
 	annotationsSet[podcmd.DefaultContainerAnnotationName] = "compute"
 
-	multusAnnotation, err := GenerateMultusCNIAnnotation(vmi)
+	nonAbsentIfaces := vmispec.FilterInterfacesSpec(vmi.Spec.Domain.Devices.Interfaces, func(iface v1.Interface) bool {
+		return iface.State != v1.InterfaceStateAbsent
+	})
+	nonAbsentNets := vmispec.FilterNetworksByInterfaces(vmi.Spec.Networks, nonAbsentIfaces)
+	multusAnnotation, err := GenerateMultusCNIAnnotation(vmi.Namespace, nonAbsentIfaces, nonAbsentNets, config)
 	if err != nil {
 		return nil, err
 	}
@@ -1308,15 +1383,60 @@ func checkForKeepLauncherAfterFailure(vmi *v1.VirtualMachineInstance) bool {
 	return keepLauncherAfterFailure
 }
 
+func (t *templateService) doesVMIRequireAutoCPULimits(vmi *v1.VirtualMachineInstance) bool {
+	if t.doesVMIRequireAutoResourceLimits(vmi, k8sv1.ResourceCPU) {
+		return true
+	}
+
+	labelSelector := t.clusterConfig.GetConfig().AutoCPULimitNamespaceLabelSelector
+	_, limitSet := vmi.Spec.Domain.Resources.Limits[k8sv1.ResourceCPU]
+	if labelSelector == nil || limitSet {
+		return false
+	}
+	selector, err := metav1.LabelSelectorAsSelector(labelSelector)
+	if err != nil {
+		log.DefaultLogger().Reason(err).Warning("invalid CPULimitNamespaceLabelSelector set, assuming none")
+		return false
+	}
+
+	if t.namespaceStore == nil {
+		log.DefaultLogger().Reason(err).Warning("empty namespace informer")
+		return false
+	}
+
+	obj, exists, err := t.namespaceStore.GetByKey(vmi.Namespace)
+	if err != nil {
+		log.Log.Warning("Error retrieving namespace from informer")
+		return false
+	} else if !exists {
+		log.Log.Warningf("namespace %s does not exist.", vmi.Namespace)
+		return false
+	}
+
+	ns, ok := obj.(*k8sv1.Namespace)
+	if !ok {
+		log.Log.Errorf("couldn't cast object to Namespace: %+v", obj)
+		return false
+	}
+
+	if selector.Matches(labels.Set(ns.Labels)) {
+		return true
+	}
+
+	return false
+}
+
 func (t *templateService) VMIResourcePredicates(vmi *v1.VirtualMachineInstance, networkToResourceMap map[string]string) VMIResourcePredicates {
 	memoryOverhead := GetMemoryOverhead(vmi, t.clusterConfig.GetClusterCPUArch(), t.clusterConfig.GetConfig().AdditionalGuestMemoryOverheadRatio)
+	withCPULimits := t.doesVMIRequireAutoCPULimits(vmi)
 	return VMIResourcePredicates{
 		vmi: vmi,
 		resourceRules: []VMIResourceRule{
 			NewVMIResourceRule(doesVMIRequireDedicatedCPU, WithCPUPinning(vmi.Spec.Domain.CPU)),
-			NewVMIResourceRule(not(doesVMIRequireDedicatedCPU), WithoutDedicatedCPU(vmi.Spec.Domain.CPU, t.clusterConfig.GetCPUAllocationRatio())),
+			NewVMIResourceRule(not(doesVMIRequireDedicatedCPU), WithoutDedicatedCPU(vmi.Spec.Domain.CPU, t.clusterConfig.GetCPUAllocationRatio(), withCPULimits)),
 			NewVMIResourceRule(util.HasHugePages, WithHugePages(vmi.Spec.Domain.Memory, memoryOverhead)),
 			NewVMIResourceRule(not(util.HasHugePages), WithMemoryOverhead(vmi.Spec.Domain.Resources, memoryOverhead)),
+			NewVMIResourceRule(t.doesVMIRequireAutoMemoryLimits, WithAutoMemoryLimits(vmi.Namespace, t.namespaceStore)),
 			NewVMIResourceRule(func(*v1.VirtualMachineInstance) bool {
 				return len(networkToResourceMap) > 0
 			}, WithNetworkResources(networkToResourceMap)),
@@ -1326,6 +1446,29 @@ func (t *templateService) VMIResourcePredicates(vmi *v1.VirtualMachineInstance, 
 			NewVMIResourceRule(reservation.HasVMIPersistentReservation, WithPersistentReservation()),
 		},
 	}
+}
+
+func (t *templateService) doesVMIRequireAutoMemoryLimits(vmi *v1.VirtualMachineInstance) bool {
+	return t.doesVMIRequireAutoResourceLimits(vmi, k8sv1.ResourceMemory)
+}
+
+func (t *templateService) doesVMIRequireAutoResourceLimits(vmi *v1.VirtualMachineInstance, resource k8sv1.ResourceName) bool {
+	if !t.clusterConfig.AutoResourceLimitsEnabled() {
+		return false
+	}
+	if _, resourceLimitsExists := vmi.Spec.Domain.Resources.Limits[resource]; resourceLimitsExists {
+		return false
+	}
+
+	for _, obj := range t.resourceQuotaStore.List() {
+		if resourceQuota, ok := obj.(*k8sv1.ResourceQuota); ok {
+			if _, exists := resourceQuota.Spec.Hard["limits."+resource]; exists && resourceQuota.Namespace == vmi.Namespace {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func (p VMIResourcePredicates) Apply() []ResourceRendererOption {

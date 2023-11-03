@@ -27,8 +27,7 @@ import (
 	"time"
 
 	"kubevirt.io/kubevirt/pkg/network/vmispec"
-
-	"kubevirt.io/kubevirt/tests/decorators"
+	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 
 	"k8s.io/utils/pointer"
 
@@ -74,6 +73,7 @@ type PodVmIfaceStatus struct {
 }
 
 var _ = Describe("VirtualMachineInstance watcher", func() {
+	var config *virtconfig.ClusterConfig
 
 	var ctrl *gomock.Controller
 	var vmiInterface *kubecli.MockVirtualMachineInstanceInterface
@@ -92,7 +92,9 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 	var kubeClient *fake.Clientset
 	var networkClient *fakenetworkclient.Clientset
 	var pvcInformer cache.SharedIndexInformer
-	var namespaceStore cache.Store
+	var rqInformer cache.SharedIndexInformer
+	var nsInformer cache.SharedIndexInformer
+	var kvInformer cache.SharedIndexInformer
 
 	var dataVolumeSource *framework.FakeControllerSource
 	var dataVolumeInformer cache.SharedIndexInformer
@@ -260,13 +262,15 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 				MinimumClusterTSCFrequency: pointer.Int64(12345),
 			},
 		}
-		config, _, _ := testutils.NewFakeClusterConfigUsingKVConfig(kubevirtFakeConfig)
+
+		config, _, kvInformer = testutils.NewFakeClusterConfigUsingKVConfig(kubevirtFakeConfig)
 		pvcInformer, _ = testutils.NewFakeInformerFor(&k8sv1.PersistentVolumeClaim{})
 		cdiInformer, _ = testutils.NewFakeInformerFor(&cdiv1.CDIConfig{})
 		cdiConfigInformer, _ = testutils.NewFakeInformerFor(&cdiv1.CDIConfig{})
-		namespaceStore = cache.NewStore(cache.DeletionHandlingMetaNamespaceKeyFunc)
-		controller = NewVMIController(
-			services.NewTemplateService("a", 240, "b", "c", "d", "e", "f", "g", pvcInformer.GetStore(), virtClient, config, qemuGid, "h"),
+		rqInformer, _ = testutils.NewFakeInformerFor(&k8sv1.ResourceQuota{})
+		nsInformer, _ = testutils.NewFakeInformerFor(&k8sv1.Namespace{})
+		controller, _ = NewVMIController(
+			services.NewTemplateService("a", 240, "b", "c", "d", "e", "f", "g", pvcInformer.GetStore(), virtClient, config, qemuGid, "h", rqInformer.GetStore(), nsInformer.GetStore()),
 			vmiInformer,
 			vmInformer,
 			podInformer,
@@ -277,9 +281,7 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 			cdiInformer,
 			cdiConfigInformer,
 			config,
-			topology.NewTopologyHinter(&cache.FakeCustomStore{}, &cache.FakeCustomStore{}, "amd64", config),
-			namespaceStore,
-			false,
+			topology.NewTopologyHinter(&cache.FakeCustomStore{}, &cache.FakeCustomStore{}, config),
 		)
 		// Wrap our workqueue to have a way to detect when we are done processing updates
 		mockQueue = testutils.NewMockWorkQueue(controller.Queue)
@@ -796,7 +798,7 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 			},
 			{
 			"name": "` + netAttachDefName + `",
-			"interface": "net1",
+			"interface": "poda7662f44d65",
 			"dns": {},
 			"device-info": {
 			  "type": "pci",
@@ -1708,7 +1710,7 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 			addActivePods(vmi, pod.UID, "")
 			podFeeder.Add(pod)
 
-			vmiInterface.EXPECT().Patch(context.Background(), vmi.Name, types.JSONPatchType, gomock.Any(), &metav1.PatchOptions{}).DoAndReturn(func(ctx context.Context, _ string, _ interface{}, patchBytes []byte, options interface{}) (*virtv1.VirtualMachineInstance, error) {
+			vmiInterface.EXPECT().Patch(context.Background(), vmi.Name, types.JSONPatchType, gomock.Any(), &metav1.PatchOptions{}).DoAndReturn(func(ctx context.Context, _ string, _ interface{}, patchBytes []byte, options interface{}, _ ...string) (*virtv1.VirtualMachineInstance, error) {
 				patch, err := jsonpatch.DecodePatch(patchBytes)
 				Expect(err).ToNot(HaveOccurred())
 				vmiBytes, err := json.Marshal(vmi)
@@ -2035,6 +2037,75 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 			Entry("when VirtualMachineUnpaused=True", k8sv1.ConditionTrue),
 			Entry("when VirtualMachineUnpaused condition is unset", k8sv1.ConditionUnknown),
 		)
+
+		Context("with memory hotplug enabled", func() {
+			It("should add MemoryChange conditon when guest memory changes", func() {
+				currentGuestMemory := resource.MustParse("128Mi")
+				requestedGuestMemory := resource.MustParse("512Mi")
+
+				vmi := NewPendingVirtualMachine("testvmi")
+				vmi.Status.Phase = virtv1.Running
+				vmi.Status.Memory = &virtv1.MemoryStatus{
+					GuestAtBoot:    &currentGuestMemory,
+					GuestCurrent:   &currentGuestMemory,
+					GuestRequested: &currentGuestMemory,
+				}
+				vmi.Spec.Domain.Memory = &virtv1.Memory{
+					Guest:    &requestedGuestMemory,
+					MaxGuest: &requestedGuestMemory,
+				}
+
+				pod := NewPodForVirtualMachine(vmi, k8sv1.PodRunning)
+
+				addVirtualMachine(vmi)
+				podFeeder.Add(pod)
+				addActivePods(vmi, pod.UID, "")
+
+				vmiInterface.EXPECT().Patch(context.Background(), vmi.Name, types.JSONPatchType, gomock.Any(), &metav1.PatchOptions{}).Do(func(ctx context.Context, name, patchType, patch, opts interface{}, subs ...interface{}) {
+					originalVMIBytes, err := json.Marshal(vmi)
+					Expect(err).ToNot(HaveOccurred())
+					patchBytes := patch.([]byte)
+
+					patchJSON, err := jsonpatch.DecodePatch(patchBytes)
+					Expect(err).ToNot(HaveOccurred())
+					newVMIBytes, err := patchJSON.Apply(originalVMIBytes)
+					Expect(err).ToNot(HaveOccurred())
+
+					var newVMI *virtv1.VirtualMachineInstance
+					err = json.Unmarshal(newVMIBytes, &newVMI)
+					Expect(err).ToNot(HaveOccurred())
+
+					memoryChange := kvcontroller.NewVirtualMachineInstanceConditionManager().HasConditionWithStatus(newVMI, virtv1.VirtualMachineInstanceMemoryChange, k8sv1.ConditionTrue)
+					Expect(memoryChange).To(BeTrue())
+
+				})
+
+				controller.Execute()
+			})
+
+			It("should store guestMemoryOverheadRatio if used during memory hotplug", func() {
+				currentGuestMemory := resource.MustParse("128Mi")
+				requestedGuestMemory := resource.MustParse("512Mi")
+
+				vmi := NewPendingVirtualMachine("testvmi")
+				vmi.Status.Phase = virtv1.Running
+				vmi.Status.Memory = &virtv1.MemoryStatus{
+					GuestCurrent: &currentGuestMemory,
+				}
+				vmi.Spec.Domain.Memory = &virtv1.Memory{
+					Guest:    &requestedGuestMemory,
+					MaxGuest: &requestedGuestMemory,
+				}
+				kvCR := testutils.GetFakeKubeVirtClusterConfig(kvInformer)
+				overheadRatio := "2"
+				kvCR.Spec.Configuration.AdditionalGuestMemoryOverheadRatio = &overheadRatio
+				testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, kvCR)
+
+				controller.syncMemoryHotplug(vmi)
+
+				Expect(vmi.Labels).To(HaveKeyWithValue(virtv1.MemoryHotplugOverheadRatioLabel, overheadRatio))
+			})
+		})
 	})
 
 	Context("hotplug volume", func() {
@@ -2704,6 +2775,58 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 				[]string{SuccessfulCreatePodReason}),
 		)
 
+		DescribeTable("Should properly calculate if it needs to handle hotplug volumes", func(hotplugVolumes []*virtv1.Volume, attachmentPods []*k8sv1.Pod, match gomegaTypes.GomegaMatcher) {
+			Expect(controller.needsHandleHotplug(hotplugVolumes, attachmentPods)).To(match)
+		},
+			Entry("nil volumes, nil attachmentPods", nil, nil, BeFalse()),
+			Entry("empty volumes, empty attachmentPods", []*virtv1.Volume{}, []*k8sv1.Pod{}, BeFalse()),
+			Entry("single volume, empty attachmentPods", []*virtv1.Volume{
+				{
+					Name: "test",
+				},
+			}, []*k8sv1.Pod{}, BeTrue()),
+			Entry("no volume, single attachmentPod", []*virtv1.Volume{}, makePods(0), BeTrue()),
+			Entry("matching volume, single attachmentPod", []*virtv1.Volume{
+				{
+					Name: "volume0",
+				},
+			}, makePods(0), BeFalse()),
+			Entry("mismatched volume, single attachmentPod", []*virtv1.Volume{
+				{
+					Name: "invalid",
+				},
+			}, makePods(0), BeTrue()),
+			Entry("matching volume, multiple attachmentPods", []*virtv1.Volume{
+				{
+					Name: "volume0",
+				},
+			}, []*k8sv1.Pod{makePods(0)[0], makePods(1)[0]}, BeTrue()),
+		)
+
+		DescribeTable("Should find active and old pods", func(hotplugVolumes []*virtv1.Volume, attachmentPods []*k8sv1.Pod, expectedActive *k8sv1.Pod, expectedOld []*k8sv1.Pod) {
+			active, old := controller.getActiveAndOldAttachmentPods(hotplugVolumes, attachmentPods)
+			Expect(active).To(Equal(expectedActive))
+			Expect(old).To(ContainElements(expectedOld))
+		},
+			Entry("nil volumes, nil attachmentPods", nil, nil, nil, nil),
+			Entry("empty volumes, empty attachmentPods", []*virtv1.Volume{}, []*k8sv1.Pod{}, nil, []*k8sv1.Pod{}),
+			Entry("matching volume, single attachmentPod", []*virtv1.Volume{
+				{
+					Name: "volume0",
+				},
+			}, makePods(0), makePods(0)[0], []*k8sv1.Pod{}),
+			Entry("matching volume, multiple attachmentPods, first pod matches", []*virtv1.Volume{
+				{
+					Name: "volume0",
+				},
+			}, []*k8sv1.Pod{makePods(0)[0], makePods(1)[0]}, makePods(0)[0], makePods(1)),
+			Entry("matching volume, multiple attachmentPods, second pod matches", []*virtv1.Volume{
+				{
+					Name: "volume1",
+				},
+			}, []*k8sv1.Pod{makePods(0)[0], makePods(1)[0]}, makePods(1)[0], makePods(0)),
+		)
+
 		It("Should get default filesystem overhead if there are multiple CDI instances", func() {
 			cdi := cdiv1.CDI{
 				ObjectMeta: metav1.ObjectMeta{
@@ -2976,10 +3099,11 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 		})
 	})
 
-	Context("topology hints", decorators.TscFrequencies, func() {
+	Context("topology hints", func() {
 
 		getVmiWithInvTsc := func() *virtv1.VirtualMachineInstance {
 			vmi := NewPendingVirtualMachine("testvmi")
+			vmi.Spec.Architecture = "amd64"
 			vmi.Spec.Domain.CPU = &v1.CPU{
 				Features: []virtv1.CPUFeature{
 					{
@@ -2994,6 +3118,7 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 
 		getVmiWithReenlightenment := func() *virtv1.VirtualMachineInstance {
 			vmi := NewPendingVirtualMachine("testvmi")
+			vmi.Spec.Architecture = "amd64"
 			vmi.Spec.Domain.Features = &v1.Features{
 				Hyperv: &v1.FeatureHyperv{
 					Reenlightenment: &v1.FeatureState{Enabled: pointer.Bool(true)},
@@ -3146,19 +3271,6 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 			})
 		}
 
-		fakeHotPlugRequest := func(vmi *virtv1.VirtualMachineInstance, addOpts []virtv1.AddInterfaceOptions) {
-			for _, req := range addOpts {
-				vmi.Spec.Networks = append(
-					vmi.Spec.Networks,
-					virtv1.Network{
-						Name: req.Name,
-						NetworkSource: virtv1.NetworkSource{
-							Multus: &virtv1.MultusNetwork{NetworkName: req.NetworkAttachmentDefinitionName},
-						},
-					})
-			}
-		}
-
 		const (
 			firstVMInterface  = "oldIface1"
 			firstVMNetwork    = "oldnet1"
@@ -3166,27 +3278,29 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 			secondVMNetwork   = "oldnet2"
 		)
 
-		Context("k8s API is down - i.e. you cannot update the pod status", func() {
+		Context("k8s API is down", func() {
 			BeforeEach(func() {
 				vmi = appendNetworkToVMI(
 					appendNetworkToVMI(
 						api.NewMinimalVMI(vmName), firstVMNetwork, firstVMInterface),
 					secondVMNetwork, secondVMInterface)
-				pod = NewPodForVirtualMachine(vmi, k8sv1.PodRunning)
-				Expect(pod.Annotations).To(HaveKey(networkv1.NetworkAttachmentAnnot))
+
+				var err error
+				pod, err = NewPodForVirtualMachineWithMultusAnnotations(vmi, k8sv1.PodRunning, config)
+				Expect(err).ToNot(HaveOccurred())
+
 				expectPodStatusUpdateFailed(pod)
 			})
 
-			It("cannot handle dynamic network attachment when adding an interface", func() {
-				fakeHotPlugRequest(vmi, []virtv1.AddInterfaceOptions{{
-					NetworkAttachmentDefinitionName: "net1",
-					Name:                            "iface1",
-				}})
-				Expect(controller.handleDynamicInterfaceRequests(vmi, pod)).To(HaveOccurred())
+			It("pod multus status cannot be updated", func() {
+				Expect(controller.updateMultusAnnotation(
+					vmi.Namespace, vmi.Spec.Domain.Devices.Interfaces, vmi.Spec.Networks, pod)).To(HaveOccurred())
 			})
 		})
 
-		Context("hotplug operation", func() {
+		Context("pod status update", func() {
+			const mac1 = "abc"
+			const mac2 = "bcd"
 			BeforeEach(func() {
 				vmi = api.NewMinimalVMI(vmName)
 				pod = NewPodForVirtualMachine(vmi, k8sv1.PodRunning)
@@ -3194,32 +3308,94 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 				prependInjectPodPatch(pod)
 			})
 
-			DescribeTable("the pods network annotation must be updated", func(addOpts []virtv1.AddInterfaceOptions, matchers ...gomegaTypes.GomegaMatcher) {
-				fakeHotPlugRequest(vmi, addOpts)
-				Expect(controller.handleDynamicInterfaceRequests(vmi, pod)).To(Succeed())
+			DescribeTable("update pods network annotation with", func(networks []v1.Network, interfaces []v1.Interface, matchers ...gomegaTypes.GomegaMatcher) {
+				vmi.Spec.Networks = networks
+				vmi.Spec.Domain.Devices.Interfaces = interfaces
+				Expect(controller.updateMultusAnnotation(
+					vmi.Namespace, vmi.Spec.Domain.Devices.Interfaces, vmi.Spec.Networks, pod)).To(Succeed())
 				for _, matcher := range matchers {
 					Expect(pod.Annotations).To(matcher)
 				}
 			},
-				Entry("hotplug a single interface",
-					[]virtv1.AddInterfaceOptions{{
-						NetworkAttachmentDefinitionName: "net1",
-						Name:                            "iface1",
+				Entry("a single interface",
+					[]v1.Network{{
+						Name:          "iface1",
+						NetworkSource: v1.NetworkSource{Multus: &v1.MultusNetwork{NetworkName: "net1"}},
+					}},
+					[]v1.Interface{{
+						Name: "iface1",
 					}},
 					HaveKeyWithValue(
 						networkv1.NetworkAttachmentAnnot,
-						`[{"interface":"net1","name":"net1","namespace":"default"}]`)),
-				Entry("hotplug multiple interfaces",
-					[]virtv1.AddInterfaceOptions{{
-						NetworkAttachmentDefinitionName: "net1",
-						Name:                            "iface1",
+						`[{"name":"net1","namespace":"default","interface":"pod7e0055a6880"}]`)),
+				Entry("multiple interfaces",
+					[]v1.Network{{
+						Name:          "iface1",
+						NetworkSource: v1.NetworkSource{Multus: &v1.MultusNetwork{NetworkName: "net1"}},
 					}, {
-						NetworkAttachmentDefinitionName: "net1",
-						Name:                            "iface2",
+						Name:          "iface2",
+						NetworkSource: v1.NetworkSource{Multus: &v1.MultusNetwork{NetworkName: "net1"}},
+					}},
+					[]v1.Interface{{
+						Name:       "iface1",
+						MacAddress: "mac1",
+					}, {
+						Name:       "iface2",
+						MacAddress: "mac2",
 					}},
 					HaveKeyWithValue(
 						networkv1.NetworkAttachmentAnnot,
-						`[{"interface":"net1","name":"net1","namespace":"default"},{"interface":"net2","name":"net1","namespace":"default"}]`)),
+						`[{"name":"net1","namespace":"default","mac":"mac1","interface":"pod7e0055a6880"},{"name":"net1","namespace":"default","mac":"mac2","interface":"pod48802102d24"}]`)),
+			)
+			DescribeTable("the subject interface name, in the pod networks annotation, should be in similar form as other interfaces",
+				func(testPodNetworkStatus []networkv1.NetworkStatus, expectedMultusNetworksAnnotation string) {
+					vmi = api.NewMinimalVMI(vmName)
+					vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{{
+						Name:                   "red",
+						InterfaceBindingMethod: v1.InterfaceBindingMethod{Bridge: &v1.InterfaceBridge{}}}, {
+						Name:                   "blue",
+						InterfaceBindingMethod: v1.InterfaceBindingMethod{Bridge: &v1.InterfaceBridge{}}}}
+
+					vmi.Spec.Networks = []v1.Network{{
+						Name:          "red",
+						NetworkSource: v1.NetworkSource{Multus: &virtv1.MultusNetwork{NetworkName: "red-net"}}}, {
+						Name:          "blue",
+						NetworkSource: v1.NetworkSource{Multus: &virtv1.MultusNetwork{NetworkName: "blue-net"}}}}
+
+					pod, err := NewPodForVirtualMachineWithMultusAnnotations(vmi, k8sv1.PodRunning, config, testPodNetworkStatus...)
+					Expect(err).ToNot(HaveOccurred())
+
+					prependInjectPodPatch(pod)
+
+					Expect(controller.updateMultusAnnotation(vmi.Namespace, vmi.Spec.Domain.Devices.Interfaces, vmi.Spec.Networks, pod)).To(Succeed())
+
+					Expect(pod.Annotations).To(HaveKey(networkv1.NetworkAttachmentAnnot))
+					Expect(pod.Annotations[networkv1.NetworkAttachmentAnnot]).To(MatchJSON(expectedMultusNetworksAnnotation))
+				},
+				Entry("when Multus network-status annotation interfaces has ordinal names",
+					[]networkv1.NetworkStatus{
+						{
+							Interface: "net1", Name: "red-net",
+						},
+					},
+					// expected Multus network annotation
+					`[
+							{"interface":"net1", "name":"red-net", "namespace": "default"},
+							{"interface":"net2", "name":"blue-net", "namespace": "default"}
+					]`,
+				),
+				Entry("when Multus network-status annotation interfaces has hashed names",
+					[]networkv1.NetworkStatus{
+						{
+							Interface: "podb1f51a511f1", Name: "red-net",
+						},
+					},
+					// expected Multus network annotation
+					`[
+							{"interface":"podb1f51a511f1", "name":"red-net", "namespace": "default"},
+							{"interface":"pod16477688c0e", "name":"blue-net", "namespace": "default"}
+					]`,
+				),
 			)
 		})
 
@@ -3242,8 +3418,10 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 						vmIfaceStatus = append(vmIfaceStatus, *ifaceStatus[i].vmIfaceStatus)
 					}
 				}
+				pod, err := NewPodForVirtualMachineWithMultusAnnotations(vmi, k8sv1.PodRunning, config, podIfaceStatus...)
+				Expect(err).ToNot(HaveOccurred())
 
-				Expect(controller.updateInterfaceStatus(vmi, NewPodForVirtualMachine(vmi, k8sv1.PodRunning, podIfaceStatus...))).To(Succeed())
+				Expect(controller.updateInterfaceStatus(vmi, pod)).To(Succeed())
 				Expect(vmi.Status.Interfaces).To(ConsistOf(vmIfaceStatus))
 			},
 				Entry("VMI without interfaces on spec does not generate new interface status", api.NewMinimalVMI(vmName)),
@@ -3260,7 +3438,16 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 					PodVmIfaceStatus{
 						vmIfaceStatus: readyHotpluggedIfaceStatus(ifaceName),
 						podIfaceStatus: &networkv1.NetworkStatus{
-							Name:      "meganet",
+							Name:      networkName,
+							Interface: "pod7e0055a6880",
+						},
+					}),
+				Entry("VMI with an interface on spec, (matched on status), with the pod interface ready and ordinal name",
+					newVMIWithOneIface(api.NewMinimalVMI(vmName), networkName, ifaceName),
+					PodVmIfaceStatus{
+						vmIfaceStatus: readyHotpluggedIfaceStatus(ifaceName),
+						podIfaceStatus: &networkv1.NetworkStatus{
+							Name:      networkName,
 							Interface: "net1",
 						},
 					}),
@@ -3274,7 +3461,13 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 							InterfaceName: ifaceName,
 							InfoSource:    vmispec.InfoSourceGuestAgent,
 						},
-					}))
+					}),
+				Entry("VMI with an interface on spec (matched on status) with pod interface *not* ready",
+					newVMIWithOneIfaceStatus(newVMIWithOneIface(api.NewMinimalVMI(vmName), networkName, ifaceName), ifaceName),
+					PodVmIfaceStatus{
+						vmIfaceStatus: simpleIfaceStatus(ifaceName),
+					}),
+			)
 		})
 	})
 })
@@ -3341,19 +3534,10 @@ func setReadyCondition(vmi *virtv1.VirtualMachineInstance, status k8sv1.Conditio
 		Reason: reason,
 	})
 }
-func NewPodForVirtualMachine(vmi *virtv1.VirtualMachineInstance, phase k8sv1.PodPhase, podNetworkStatus ...networkv1.NetworkStatus) *k8sv1.Pod {
-	multusAnnotations, _ := services.GenerateMultusCNIAnnotation(vmi)
+
+func NewPodForVirtualMachine(vmi *virtv1.VirtualMachineInstance, phase k8sv1.PodPhase) *k8sv1.Pod {
 	podAnnotations := map[string]string{
 		virtv1.DomainAnnotation: vmi.Name,
-	}
-	if multusAnnotations != "" {
-		podAnnotations[networkv1.NetworkAttachmentAnnot] = multusAnnotations
-	}
-	if len(podNetworkStatus) > 0 {
-		podCurrentNetworks, err := json.Marshal(podNetworkStatus)
-		if err == nil {
-			podAnnotations[networkv1.NetworkStatusAnnot] = string(podCurrentNetworks)
-		}
 	}
 	return &k8sv1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3379,6 +3563,26 @@ func NewPodForVirtualMachine(vmi *virtv1.VirtualMachineInstance, phase k8sv1.Pod
 			},
 		},
 	}
+}
+
+func NewPodForVirtualMachineWithMultusAnnotations(vmi *virtv1.VirtualMachineInstance, phase k8sv1.PodPhase, config *virtconfig.ClusterConfig, podNetworkStatus ...networkv1.NetworkStatus) (*k8sv1.Pod, error) {
+	pod := NewPodForVirtualMachine(vmi, phase)
+
+	multusAnnotations, err := services.GenerateMultusCNIAnnotation(vmi.Namespace, vmi.Spec.Domain.Devices.Interfaces, vmi.Spec.Networks, config)
+	if err != nil {
+		return nil, err
+	}
+	pod.Annotations[networkv1.NetworkAttachmentAnnot] = multusAnnotations
+
+	if len(podNetworkStatus) > 0 {
+		podCurrentNetworksJSON, err := json.Marshal(podNetworkStatus)
+		if err != nil {
+			return nil, err
+		}
+		pod.Annotations[networkv1.NetworkStatusAnnot] = string(podCurrentNetworksJSON)
+	}
+
+	return pod, nil
 }
 
 func NewHotplugPVC(name, namespace string, phase k8sv1.PersistentVolumeClaimPhase) *k8sv1.PersistentVolumeClaim {

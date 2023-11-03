@@ -52,6 +52,7 @@ type Connection interface {
 	DomainEventDeviceRemovedRegister(callback libvirt.DomainEventDeviceRemovedCallback) error
 	AgentEventLifecycleRegister(callback libvirt.DomainEventAgentLifecycleCallback) error
 	VolatileDomainEventDeviceRemovedRegister(domain VirDomain, callback libvirt.DomainEventDeviceRemovedCallback) (int, error)
+	DomainEventMemoryDeviceSizeChangeRegister(callback libvirt.DomainEventMemoryDeviceSizeChangeCallback) error
 	DomainEventDeregister(registrationID int) error
 	ListAllDomains(flags libvirt.ConnectListAllDomainsFlags) ([]VirDomain, error)
 	NewStream(flags libvirt.StreamFlags) (Stream, error)
@@ -64,6 +65,7 @@ type Connection interface {
 	// 2. transparently handling the addition of the memory stats, currently (libvirt 4.9) not handled by the bulk stats API
 	GetDomainStats(statsTypes libvirt.DomainStatsTypes, l *stats.DomainJobInfo, flags libvirt.ConnectGetAllDomainStatsFlags) ([]*stats.DomainStats, error)
 	GetQemuVersion() (string, error)
+	GetSEVInfo() (*api.SEVNodeParameters, error)
 }
 
 type Stream interface {
@@ -85,11 +87,12 @@ type LibvirtConnection struct {
 	reconnect     chan bool
 	reconnectLock *sync.Mutex
 
-	domainEventCallbacks                   []libvirt.DomainEventLifecycleCallback
-	domainDeviceAddedEventCallbacks        []libvirt.DomainEventDeviceAddedCallback
-	domainDeviceRemovedEventCallbacks      []libvirt.DomainEventDeviceRemovedCallback
-	domainEventMigrationIterationCallbacks []libvirt.DomainEventMigrationIterationCallback
-	agentEventCallbacks                    []libvirt.DomainEventAgentLifecycleCallback
+	domainEventCallbacks                        []libvirt.DomainEventLifecycleCallback
+	domainDeviceAddedEventCallbacks             []libvirt.DomainEventDeviceAddedCallback
+	domainDeviceRemovedEventCallbacks           []libvirt.DomainEventDeviceRemovedCallback
+	domainEventMigrationIterationCallbacks      []libvirt.DomainEventMigrationIterationCallback
+	agentEventCallbacks                         []libvirt.DomainEventAgentLifecycleCallback
+	domainDeviceMemoryDeviceSizeChangeCallbacks []libvirt.DomainEventMemoryDeviceSizeChangeCallback
 }
 
 func (s *VirStream) Write(p []byte) (n int, err error) {
@@ -193,6 +196,17 @@ func (l *LibvirtConnection) VolatileDomainEventDeviceRemovedRegister(domain VirD
 		dom = domain.(*libvirt.Domain)
 	}
 	return l.Connect.DomainEventDeviceRemovedRegister(dom, callback)
+}
+
+func (l *LibvirtConnection) DomainEventMemoryDeviceSizeChangeRegister(callback libvirt.DomainEventMemoryDeviceSizeChangeCallback) (err error) {
+	if err = l.reconnectIfNecessary(); err != nil {
+		return
+	}
+
+	l.domainDeviceMemoryDeviceSizeChangeCallbacks = append(l.domainDeviceMemoryDeviceSizeChangeCallbacks, callback)
+	_, err = l.Connect.DomainEventMemoryDeviceSizeChangeRegister(nil, callback)
+	l.checkConnectionLost(err)
+	return
 }
 
 func (l *LibvirtConnection) DomainEventDeregister(registrationID int) error {
@@ -342,6 +356,24 @@ func (l *LibvirtConnection) GetDomainStats(statsTypes libvirt.DomainStatsTypes, 
 	return list, nil
 }
 
+func (l *LibvirtConnection) GetSEVInfo() (*api.SEVNodeParameters, error) {
+	const flags = uint32(0)
+	params, err := l.Connect.GetSEVInfo(flags)
+	if err != nil {
+		return nil, err
+	}
+
+	sevNodeParameters := &api.SEVNodeParameters{}
+	if params.PDHSet {
+		sevNodeParameters.PDH = params.PDH
+	}
+	if params.CertChainSet {
+		sevNodeParameters.CertChain = params.CertChain
+	}
+
+	return sevNodeParameters, nil
+}
+
 func (l *LibvirtConnection) GetDeviceAliasMap(domain *libvirt.Domain) (map[string]string, error) {
 	devAliasMap := make(map[string]string)
 
@@ -437,6 +469,10 @@ func (l *LibvirtConnection) reconnectIfNecessary() (err error) {
 			log.Log.Info("Re-registered domain device removed callback")
 			_, err = l.Connect.DomainEventDeviceRemovedRegister(nil, callback)
 		}
+		for _, callback := range l.domainDeviceMemoryDeviceSizeChangeCallbacks {
+			log.Log.Info("Re-registered domain memory device size change callback")
+			_, err = l.Connect.DomainEventMemoryDeviceSizeChangeRegister(nil, callback)
+		}
 
 		log.Log.Error("Re-registered domain and agent callbacks for new connection")
 
@@ -487,6 +523,7 @@ type VirDomain interface {
 	GetBlockInfo(disk string, flags uint32) (*libvirt.DomainBlockInfo, error)
 	AttachDevice(xml string) error
 	AttachDeviceFlags(xml string, flags libvirt.DomainDeviceModifyFlags) error
+	UpdateDeviceFlags(xml string, flags libvirt.DomainDeviceModifyFlags) error
 	DetachDevice(xml string) error
 	DetachDeviceFlags(xml string, flags libvirt.DomainDeviceModifyFlags) error
 	DestroyFlags(flags libvirt.DomainDestroyFlags) error
@@ -505,9 +542,16 @@ type VirDomain interface {
 	GetJobInfo() (*libvirt.DomainJobInfo, error)
 	GetDiskErrors(flags uint32) ([]libvirt.DomainDiskError, error)
 	SetTime(secs int64, nsecs uint, flags libvirt.DomainSetTimeFlags) error
+	AuthorizedSSHKeysGet(user string, flags libvirt.DomainAuthorizedSSHKeysFlags) ([]string, error)
+	AuthorizedSSHKeysSet(user string, keys []string, flags libvirt.DomainAuthorizedSSHKeysFlags) error
 	AbortJob() error
 	Free() error
 	CoreDumpWithFormat(to string, format libvirt.DomainCoreDumpFormat, flags libvirt.DomainCoreDumpFlags) error
+	PinVcpuFlags(vcpu uint, cpuMap []bool, flags libvirt.DomainModificationImpact) error
+	PinEmulator(cpumap []bool, flags libvirt.DomainModificationImpact) error
+	SetVcpusFlags(vcpu uint, flags libvirt.DomainVcpuFlags) error
+	GetLaunchSecurityInfo(flags uint32) (*libvirt.DomainLaunchSecurityParameters, error)
+	SetLaunchSecurityState(params *libvirt.DomainLaunchSecurityStateParameters, flags uint32) error
 }
 
 func NewConnection(uri string, user string, pass string, checkInterval time.Duration) (Connection, error) {

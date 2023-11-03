@@ -29,6 +29,7 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	authv1 "k8s.io/api/authentication/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
@@ -358,11 +359,55 @@ var _ = Describe("Validating VMIUpdate Admitter", func() {
 		return res
 	}
 
+	makeLUNDisks := func(indexes ...int) []v1.Disk {
+		res := make([]v1.Disk, 0)
+		for _, index := range indexes {
+			bootOrder := uint(index + 1)
+			res = append(res, v1.Disk{
+				Name: fmt.Sprintf("volume-name-%d", index),
+				DiskDevice: v1.DiskDevice{
+					LUN: &v1.LunTarget{
+						Bus: "scsi",
+					},
+				},
+				BootOrder: &bootOrder,
+			})
+		}
+		return res
+	}
+
+	makeCDRomDisks := func(indexes ...int) []v1.Disk {
+		res := make([]v1.Disk, 0)
+		for _, index := range indexes {
+			bootOrder := uint(index + 1)
+			res = append(res, v1.Disk{
+				Name: fmt.Sprintf("volume-name-%d", index),
+				DiskDevice: v1.DiskDevice{
+					CDRom: &v1.CDRomTarget{
+						Bus: "scsi",
+					},
+				},
+				BootOrder: &bootOrder,
+			})
+		}
+		return res
+	}
+
 	makeDisksInvalidBusLastDisk := func(indexes ...int) []v1.Disk {
 		res := makeDisks(indexes...)
 		for i, index := range indexes {
 			if i == len(indexes)-1 {
 				res[index].Disk.Bus = "invalid"
+			}
+		}
+		return res
+	}
+
+	makeLUNDisksInvalidBusLastDisk := func(indexes ...int) []v1.Disk {
+		res := makeLUNDisks(indexes...)
+		for i, index := range indexes {
+			if i == len(indexes)-1 {
+				res[index].LUN.Bus = "invalid"
 			}
 		}
 		return res
@@ -443,7 +488,7 @@ var _ = Describe("Validating VMIUpdate Admitter", func() {
 		newVMI.Spec.Volumes = newVolumes
 		newVMI.Spec.Domain.Devices.Disks = newDisks
 
-		result := admitHotplug(newVolumes, oldVolumes, newDisks, oldDisks, volumeStatuses, newVMI, vmiUpdateAdmitter.ClusterConfig)
+		result := admitHotplugStorage(newVolumes, oldVolumes, newDisks, oldDisks, volumeStatuses, newVMI, vmiUpdateAdmitter.ClusterConfig)
 		Expect(equality.Semantic.DeepEqual(result, expected)).To(BeTrue(), "result: %v and expected: %v do not match", result, expected)
 	},
 		Entry("Should accept if no volumes are there or added",
@@ -502,6 +547,13 @@ var _ = Describe("Validating VMIUpdate Admitter", func() {
 			makeDisks(0, 1),
 			makeStatus(2, 1),
 			nil),
+		Entry("Should accept if we add LUN disk with valid SCSI bus",
+			makeVolumes(0, 1),
+			makeVolumes(0, 1),
+			makeLUNDisks(0, 1),
+			makeLUNDisks(0, 1),
+			makeStatus(2, 1),
+			nil),
 		Entry("Should reject if we add disk with invalid bus",
 			makeVolumes(0, 1),
 			makeVolumes(0),
@@ -509,6 +561,20 @@ var _ = Describe("Validating VMIUpdate Admitter", func() {
 			makeDisks(0),
 			makeStatus(1, 0),
 			makeExpected("hotplugged Disk volume-name-1 does not use a scsi bus", "")),
+		Entry("Should reject if we add LUN disk with invalid bus",
+			makeVolumes(0, 1),
+			makeVolumes(0),
+			makeLUNDisksInvalidBusLastDisk(0, 1),
+			makeLUNDisks(0),
+			makeStatus(1, 0),
+			makeExpected("hotplugged Disk volume-name-1 does not use a scsi bus", "")),
+		Entry("Should reject if we add disk with neither Disk nor LUN type",
+			makeVolumes(0, 1),
+			makeVolumes(0),
+			makeCDRomDisks(0, 1),
+			makeCDRomDisks(0),
+			makeStatus(1, 0),
+			makeExpected("Disk volume-name-1 requires diskDevice of type 'disk' or 'lun' to be hotplugged.", "")),
 		Entry("Should reject if we add disk with invalid boot order",
 			makeVolumes(0, 1),
 			makeVolumes(0),
@@ -534,6 +600,7 @@ var _ = Describe("Validating VMIUpdate Admitter", func() {
 
 	DescribeTable("Admit or deny based on user", func(user string, expected types.GomegaMatcher) {
 		vmi := api.NewMinimalVMI("testvmi")
+		vmi.Spec.Domain.CPU = &v1.CPU{}
 		vmi.Spec.Volumes = makeVolumes(1)
 		vmi.Spec.Domain.Devices.Disks = makeDisks(1)
 		vmi.Status.VolumeStatus = makeStatus(1, 0)
@@ -563,4 +630,70 @@ var _ = Describe("Validating VMIUpdate Admitter", func() {
 		Entry("Should admit internal sa", "system:serviceaccount:kubevirt:"+components.ApiServiceAccountName, BeTrue()),
 		Entry("Should reject regular user", "system:serviceaccount:someNamespace:someUser", BeFalse()),
 	)
+
+	DescribeTable("Updates in CPU topology", func(oldCPUTopology, newCPUTopology *v1.CPU, expected types.GomegaMatcher) {
+		vmi := api.NewMinimalVMI("testvmi")
+		updateVmi := vmi.DeepCopy()
+		vmi.Spec.Domain.CPU = oldCPUTopology
+		updateVmi.Spec.Domain.CPU = newCPUTopology
+
+		newVMIBytes, _ := json.Marshal(&updateVmi)
+		oldVMIBytes, _ := json.Marshal(&vmi)
+		ar := &admissionv1.AdmissionReview{
+			Request: &admissionv1.AdmissionRequest{
+				UserInfo: authv1.UserInfo{Username: "system:serviceaccount:kubevirt:" + components.ControllerServiceAccountName},
+				Resource: webhooks.VirtualMachineInstanceGroupVersionResource,
+				Object: runtime.RawExtension{
+					Raw: newVMIBytes,
+				},
+				OldObject: runtime.RawExtension{
+					Raw: oldVMIBytes,
+				},
+				Operation: admissionv1.Update,
+			},
+		}
+		resp := vmiUpdateAdmitter.Admit(ar)
+		Expect(resp.Allowed).To(expected)
+	},
+		Entry("deny update of maxSockets",
+			&v1.CPU{
+				MaxSockets: 16,
+			},
+			&v1.CPU{
+				MaxSockets: 8,
+			},
+			BeFalse()))
+
+	It("should reject updates to maxGuest", func() {
+		vmi := api.NewMinimalVMI("testvmi")
+		vmi.Spec.Domain.CPU = &v1.CPU{}
+		updateVmi := vmi.DeepCopy()
+
+		maxGuest := resource.MustParse("64Mi")
+		vmi.Spec.Domain.Memory = &v1.Memory{
+			MaxGuest: &maxGuest,
+		}
+		updatedMaxGuest := resource.MustParse("128Mi")
+		updateVmi.Spec.Domain.Memory = &v1.Memory{
+			MaxGuest: &updatedMaxGuest,
+		}
+
+		newVMIBytes, _ := json.Marshal(&updateVmi)
+		oldVMIBytes, _ := json.Marshal(&vmi)
+		ar := &admissionv1.AdmissionReview{
+			Request: &admissionv1.AdmissionRequest{
+				UserInfo: authv1.UserInfo{Username: "system:serviceaccount:kubevirt:" + components.ControllerServiceAccountName},
+				Resource: webhooks.VirtualMachineInstanceGroupVersionResource,
+				Object: runtime.RawExtension{
+					Raw: newVMIBytes,
+				},
+				OldObject: runtime.RawExtension{
+					Raw: oldVMIBytes,
+				},
+				Operation: admissionv1.Update,
+			},
+		}
+		resp := vmiUpdateAdmitter.Admit(ar)
+		Expect(resp.Allowed).To(BeFalse())
+	})
 })

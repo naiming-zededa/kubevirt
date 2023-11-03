@@ -16,11 +16,11 @@ import (
 	"kubevirt.io/kubevirt/pkg/virtctl/configuration"
 	"kubevirt.io/kubevirt/pkg/virtctl/console"
 	"kubevirt.io/kubevirt/pkg/virtctl/create"
+	"kubevirt.io/kubevirt/pkg/virtctl/credentials"
 	"kubevirt.io/kubevirt/pkg/virtctl/expose"
 	"kubevirt.io/kubevirt/pkg/virtctl/guestfs"
 	"kubevirt.io/kubevirt/pkg/virtctl/imageupload"
 	"kubevirt.io/kubevirt/pkg/virtctl/memorydump"
-	"kubevirt.io/kubevirt/pkg/virtctl/network"
 	"kubevirt.io/kubevirt/pkg/virtctl/pause"
 	"kubevirt.io/kubevirt/pkg/virtctl/portforward"
 	"kubevirt.io/kubevirt/pkg/virtctl/scp"
@@ -51,8 +51,7 @@ func NewVirtctlCommand() (*cobra.Command, clientcmd.ClientConfig) {
 	cobra.AddTemplateFunc(
 		"prepare", func(s string) string {
 			// order matters!
-			result := strings.Replace(s, "kubectl", "kubectl virt", -1)
-			result = strings.Replace(result, "{{ProgramName}}", programName, -1)
+			result := strings.Replace(s, "{{ProgramName}}", programName, -1)
 			return result
 		},
 	)
@@ -108,8 +107,8 @@ func NewVirtctlCommand() (*cobra.Command, clientcmd.ClientConfig) {
 		imageupload.NewImageUploadCommand(clientConfig),
 		guestfs.NewGuestfsShellCommand(clientConfig),
 		vmexport.NewVirtualMachineExportCommand(clientConfig),
-		create.NewCommand(),
-		network.NewAddInterfaceCommand(clientConfig),
+		create.NewCommand(clientConfig),
+		credentials.NewCommand(clientConfig),
 		optionsCmd,
 	)
 	return rootCmd, clientConfig

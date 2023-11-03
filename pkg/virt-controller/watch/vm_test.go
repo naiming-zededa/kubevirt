@@ -7,11 +7,13 @@ import (
 	"strings"
 	"time"
 
+	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/pborman/uuid"
 	appsv1 "k8s.io/api/apps/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	k8score "k8s.io/api/core/v1"
 	k8sv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -28,18 +30,21 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 	virtv1 "kubevirt.io/api/core/v1"
 	instancetypeapi "kubevirt.io/api/instancetype"
+	instancetypev1alpha1 "kubevirt.io/api/instancetype/v1alpha1"
 	instancetypev1alpha2 "kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 	"kubevirt.io/client-go/api"
 	cdifake "kubevirt.io/client-go/generated/containerized-data-importer/clientset/versioned/fake"
 	"kubevirt.io/client-go/generated/kubevirt/clientset/versioned/fake"
 	fakeclientset "kubevirt.io/client-go/generated/kubevirt/clientset/versioned/fake"
-	"kubevirt.io/client-go/generated/kubevirt/clientset/versioned/typed/instancetype/v1alpha2"
+	instancetypeclientset "kubevirt.io/client-go/generated/kubevirt/clientset/versioned/typed/instancetype/v1beta1"
 	"kubevirt.io/client-go/kubecli"
 	"kubevirt.io/client-go/log"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
 	virtcontroller "kubevirt.io/kubevirt/pkg/controller"
 	"kubevirt.io/kubevirt/pkg/instancetype"
+	kvpointer "kubevirt.io/kubevirt/pkg/pointer"
 	"kubevirt.io/kubevirt/pkg/testutils"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 	watchutil "kubevirt.io/kubevirt/pkg/virt-controller/watch/util"
@@ -65,6 +70,7 @@ var _ = Describe("VirtualMachine", func() {
 		var dataVolumeSource *framework.FakeControllerSource
 		var pvcInformer cache.SharedIndexInformer
 		var crInformer cache.SharedIndexInformer
+		var podInformer cache.SharedIndexInformer
 		var instancetypeMethods *testutils.MockInstancetypeMethods
 		var stop chan struct{}
 		var controller *VMController
@@ -102,9 +108,23 @@ var _ = Describe("VirtualMachine", func() {
 			generatedInterface := fake.NewSimpleClientset()
 
 			dataVolumeInformer, dataVolumeSource = testutils.NewFakeInformerFor(&cdiv1.DataVolume{})
+			dataSourceInformer, _ := testutils.NewFakeInformerFor(&cdiv1.DataSource{})
 			vmiInformer, vmiSource = testutils.NewFakeInformerWithIndexersFor(&virtv1.VirtualMachineInstance{}, virtcontroller.GetVMIInformerIndexers())
 			vmInformer, vmSource = testutils.NewFakeInformerWithIndexersFor(&virtv1.VirtualMachine{}, virtcontroller.GetVirtualMachineInformerIndexers())
 			pvcInformer, _ = testutils.NewFakeInformerFor(&k8sv1.PersistentVolumeClaim{})
+			namespaceInformer, _ := testutils.NewFakeInformerFor(&k8sv1.Namespace{})
+			ns1 := &k8sv1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "ns1",
+				},
+			}
+			ns2 := &k8sv1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "default",
+				},
+			}
+			Expect(namespaceInformer.GetStore().Add(ns1)).To(Succeed())
+			Expect(namespaceInformer.GetStore().Add(ns2)).To(Succeed())
 			crInformer, _ = testutils.NewFakeInformerWithIndexersFor(&appsv1.ControllerRevision{}, cache.Indexers{
 				"vm": func(obj interface{}) ([]string, error) {
 					cr := obj.(*appsv1.ControllerRevision)
@@ -116,6 +136,7 @@ var _ = Describe("VirtualMachine", func() {
 					return nil, nil
 				},
 			})
+			podInformer, _ = testutils.NewFakeInformerFor(&k8sv1.Pod{})
 
 			instancetypeMethods = testutils.NewMockInstancetypeMethods()
 
@@ -124,11 +145,14 @@ var _ = Describe("VirtualMachine", func() {
 
 			config, _, kvInformer = testutils.NewFakeClusterConfigUsingKVConfig(&v1.KubeVirtConfiguration{})
 
-			controller = NewVMController(vmiInformer,
+			controller, _ = NewVMController(vmiInformer,
 				vmInformer,
 				dataVolumeInformer,
+				dataSourceInformer,
+				namespaceInformer.GetStore(),
 				pvcInformer,
 				crInformer,
+				podInformer,
 				instancetypeMethods,
 				recorder,
 				virtClient,
@@ -156,7 +180,13 @@ var _ = Describe("VirtualMachine", func() {
 			k8sClient = k8sfake.NewSimpleClientset()
 			virtClient.EXPECT().AppsV1().Return(k8sClient.AppsV1()).AnyTimes()
 			virtClient.EXPECT().CoreV1().Return(k8sClient.CoreV1()).AnyTimes()
+			virtClient.EXPECT().AuthorizationV1().Return(k8sClient.AuthorizationV1()).AnyTimes()
 		})
+
+		shouldExpectGracePeriodPatched := func(expectedGracePeriod int64, vmi *virtv1.VirtualMachineInstance) {
+			patch := fmt.Sprintf(`{"spec":{"terminationGracePeriodSeconds": %d }}`, expectedGracePeriod)
+			vmiInterface.EXPECT().Patch(context.Background(), vmi.Name, types.MergePatchType, []byte(patch), &metav1.PatchOptions{}).Return(vmi, nil)
+		}
 
 		shouldExpectVMIFinalizerRemoval := func(vmi *virtv1.VirtualMachineInstance) {
 			patch := fmt.Sprintf(`[{ "op": "test", "path": "/metadata/finalizers", "value": ["%s"] }, { "op": "replace", "path": "/metadata/finalizers", "value": [] }]`, virtv1.VirtualMachineControllerFinalizer)
@@ -319,6 +349,11 @@ var _ = Describe("VirtualMachine", func() {
 
 			createCount := 0
 			shouldExpectDataVolumeCreation(vm.UID, map[string]string{"kubevirt.io/created-by": string(vm.UID), "my": "label"}, map[string]string{"my": "annotation"}, &createCount)
+
+			vmInterface.EXPECT().UpdateStatus(context.Background(), gomock.Any()).Times(1).Do(func(ctx context.Context, obj interface{}) {
+				objVM := obj.(*virtv1.VirtualMachine)
+				Expect(objVM.Status.PrintableStatus).To(Equal(virtv1.VirtualMachineStatusProvisioning))
+			})
 
 			controller.Execute()
 			Expect(createCount).To(Equal(1))
@@ -911,7 +946,7 @@ var _ = Describe("VirtualMachine", func() {
 				vmInterface.EXPECT().UpdateStatus(context.Background(), gomock.Any()).Times(1).Do(func(ctx context.Context, arg interface{}) {
 					Expect(arg.(*virtv1.VirtualMachine).Status.StartFailure).ToNot(BeNil())
 					Expect(arg.(*virtv1.VirtualMachine).Status.StartFailure.RetryAfterTimestamp).ToNot(BeNil())
-					Expect(arg.(*virtv1.VirtualMachine).Status.StartFailure.RetryAfterTimestamp).ToNot(Equal(oldRetry))
+					Expect(arg.(*virtv1.VirtualMachine).Status.StartFailure.RetryAfterTimestamp.Time).ToNot(Equal(oldRetry))
 					Expect(arg.(*virtv1.VirtualMachine).Status.StartFailure.LastFailedVMIUID).To(Equal(vmi.UID))
 					Expect(arg.(*virtv1.VirtualMachine).Status.StartFailure.ConsecutiveFailCount).To(Equal(2))
 				}).Return(nil, nil)
@@ -1199,18 +1234,27 @@ var _ = Describe("VirtualMachine", func() {
 					Expect(pvcInformer.GetStore().Add(&pvc)).To(Succeed())
 				}
 
-				controller.cloneAuthFunc = func(pvcNamespace, pvcName, saNamespace, saName string) (bool, string, error) {
+				controller.cloneAuthFunc = func(dv *cdiv1.DataVolume, requestNamespace, requestName string, proxy cdiv1.AuthorizationHelperProxy, saNamespace, saName string) (bool, string, error) {
+					k8sClient.Fake.PrependReactor("create", "subjectaccessreviews", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
+						return true, &authorizationv1.SubjectAccessReview{
+							Status: authorizationv1.SubjectAccessReviewStatus{
+								Allowed: true,
+							},
+						}, nil
+					})
+					response, err := dv.AuthorizeSA(requestNamespace, requestName, proxy, saNamespace, saName)
+					Expect(err).ToNot(HaveOccurred())
 					if dv.Spec.Source != nil {
 						if dv.Spec.Source.PVC.Namespace != "" {
-							Expect(pvcNamespace).Should(Equal(dv.Spec.Source.PVC.Namespace))
+							Expect(response.Handler.SourceNamespace).Should(Equal(dv.Spec.Source.PVC.Namespace))
 						} else {
-							Expect(pvcNamespace).Should(Equal(vm.Namespace))
+							Expect(response.Handler.SourceNamespace).Should(Equal(vm.Namespace))
 						}
 
-						Expect(pvcName).Should(Equal(dv.Spec.Source.PVC.Name))
+						Expect(response.Handler.SourceName).Should(Equal(dv.Spec.Source.PVC.Name))
 					} else {
-						Expect(pvcNamespace).Should(Equal(ds.Spec.Source.PVC.Namespace))
-						Expect(pvcName).Should(Equal(ds.Spec.Source.PVC.Name))
+						Expect(response.Handler.SourceNamespace).Should(Equal(ds.Spec.Source.PVC.Namespace))
+						Expect(response.Handler.SourceName).Should(Equal(ds.Spec.Source.PVC.Name))
 					}
 
 					Expect(saNamespace).Should(Equal(vm.Namespace))
@@ -1996,6 +2040,7 @@ var _ = Describe("VirtualMachine", func() {
 		It("should delete VirtualMachineInstance when VirtualMachine marked for deletion", func() {
 			vm, vmi := DefaultVirtualMachine(true)
 			vm.DeletionTimestamp = now()
+			vm.DeletionGracePeriodSeconds = kvpointer.P(v1.DefaultGracePeriodSeconds)
 
 			addVirtualMachine(vm)
 			vmiFeeder.Add(vmi)
@@ -2003,6 +2048,7 @@ var _ = Describe("VirtualMachine", func() {
 			vmiInterface.EXPECT().Delete(context.Background(), gomock.Any(), gomock.Any()).Return(nil)
 
 			vmInterface.EXPECT().UpdateStatus(context.Background(), gomock.Any()).Times(1).Return(vm, nil)
+			shouldExpectGracePeriodPatched(v1.DefaultGracePeriodSeconds, vmi)
 
 			controller.Execute()
 
@@ -2974,11 +3020,12 @@ var _ = Describe("VirtualMachine", func() {
 					})
 				})
 
-				DescribeTable("Should set a Stopped/WaitingForVolumeBinding status when DataVolume exists but not bound", func(running bool, status virtv1.VirtualMachinePrintableStatus) {
+				DescribeTable("Should set a appropriate status when DataVolume exists but not bound", func(running bool, phase cdiv1.DataVolumePhase, status virtv1.VirtualMachinePrintableStatus) {
 					vm.Spec.Running = &running
 					addVirtualMachine(vm)
 
 					dv, _ := watchutil.CreateDataVolumeManifest(virtClient, vm.Spec.DataVolumeTemplates[0], vm)
+					dv.Status.Phase = phase
 					dataVolumeFeeder.Add(dv)
 
 					pvc := k8sv1.PersistentVolumeClaim{
@@ -2997,11 +3044,16 @@ var _ = Describe("VirtualMachine", func() {
 						Expect(objVM.Status.PrintableStatus).To(Equal(status))
 					})
 
+					if running {
+						vmiInterface.EXPECT().Create(context.Background(), gomock.Any()).Return(vmi, nil)
+					}
+
 					controller.Execute()
 				},
-
-					Entry("Started VM", true, virtv1.VirtualMachineStatusWaitingForVolumeBinding),
-					Entry("Stopped VM", false, virtv1.VirtualMachineStatusStopped),
+					Entry("Started VM PendingPopulation", true, cdiv1.PendingPopulation, virtv1.VirtualMachineStatusWaitingForVolumeBinding),
+					Entry("Started VM WFFC", true, cdiv1.WaitForFirstConsumer, virtv1.VirtualMachineStatusWaitingForVolumeBinding),
+					Entry("Stopped VM PendingPopulation", false, cdiv1.PendingPopulation, virtv1.VirtualMachineStatusStopped),
+					Entry("Stopped VM", false, cdiv1.WaitForFirstConsumer, virtv1.VirtualMachineStatusStopped),
 				)
 
 				DescribeTable("Should set a Provisioning status when DataVolume bound but not ready",
@@ -3247,6 +3299,7 @@ var _ = Describe("VirtualMachine", func() {
 					vm, vmi := DefaultVirtualMachine(true)
 
 					vm.ObjectMeta.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					vm.DeletionGracePeriodSeconds = kvpointer.P(v1.DefaultGracePeriodSeconds)
 					vmi.Status.Phase = phase
 
 					if condType != "" {
@@ -3258,6 +3311,7 @@ var _ = Describe("VirtualMachine", func() {
 					addVirtualMachine(vm)
 					vmiFeeder.Add(vmi)
 
+					shouldExpectGracePeriodPatched(v1.DefaultGracePeriodSeconds, vmi)
 					vmiInterface.EXPECT().Delete(context.Background(), gomock.Any(), gomock.Any()).AnyTimes()
 					vmInterface.EXPECT().UpdateStatus(context.Background(), gomock.Any()).Times(1).Do(func(ctx context.Context, obj interface{}) {
 						objVM := obj.(*virtv1.VirtualMachine)
@@ -3418,11 +3472,11 @@ var _ = Describe("VirtualMachine", func() {
 				vm  *virtv1.VirtualMachine
 				vmi *virtv1.VirtualMachineInstance
 
-				fakeInstancetypeClients       v1alpha2.InstancetypeV1alpha2Interface
-				fakeInstancetypeClient        v1alpha2.VirtualMachineInstancetypeInterface
-				fakeClusterInstancetypeClient v1alpha2.VirtualMachineClusterInstancetypeInterface
-				fakePreferenceClient          v1alpha2.VirtualMachinePreferenceInterface
-				fakeClusterPreferenceClient   v1alpha2.VirtualMachineClusterPreferenceInterface
+				fakeInstancetypeClients       instancetypeclientset.InstancetypeV1beta1Interface
+				fakeInstancetypeClient        instancetypeclientset.VirtualMachineInstancetypeInterface
+				fakeClusterInstancetypeClient instancetypeclientset.VirtualMachineClusterInstancetypeInterface
+				fakePreferenceClient          instancetypeclientset.VirtualMachinePreferenceInterface
+				fakeClusterPreferenceClient   instancetypeclientset.VirtualMachineClusterPreferenceInterface
 
 				instancetypeInformerStore        cache.Store
 				clusterInstancetypeInformerStore cache.Store
@@ -3437,7 +3491,7 @@ var _ = Describe("VirtualMachine", func() {
 				// We need to clear the domainSpec here to ensure the instancetype doesn't conflict
 				vm.Spec.Template.Spec.Domain = v1.DomainSpec{}
 
-				fakeInstancetypeClients = fakeclientset.NewSimpleClientset().InstancetypeV1alpha2()
+				fakeInstancetypeClients = fakeclientset.NewSimpleClientset().InstancetypeV1beta1()
 
 				fakeInstancetypeClient = fakeInstancetypeClients.VirtualMachineInstancetypes(metav1.NamespaceDefault)
 				virtClient.EXPECT().VirtualMachineInstancetype(gomock.Any()).Return(fakeInstancetypeClient).AnyTimes()
@@ -3454,16 +3508,16 @@ var _ = Describe("VirtualMachine", func() {
 				k8sClient = k8sfake.NewSimpleClientset()
 				virtClient.EXPECT().AppsV1().Return(k8sClient.AppsV1()).AnyTimes()
 
-				instancetypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineInstancetype{})
+				instancetypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineInstancetype{})
 				instancetypeInformerStore = instancetypeInformer.GetStore()
 
-				clusterInstancetypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineClusterInstancetype{})
+				clusterInstancetypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineClusterInstancetype{})
 				clusterInstancetypeInformerStore = clusterInstancetypeInformer.GetStore()
 
-				preferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachinePreference{})
+				preferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachinePreference{})
 				preferenceInformerStore = preferenceInformer.GetStore()
 
-				clusterPreferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineClusterPreference{})
+				clusterPreferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineClusterPreference{})
 				clusterPreferenceInformerStore = clusterPreferenceInformer.GetStore()
 
 				controllerrevisionInformer, _ := testutils.NewFakeInformerFor(&appsv1.ControllerRevision{})
@@ -3481,20 +3535,24 @@ var _ = Describe("VirtualMachine", func() {
 
 			Context("instancetype", func() {
 				var (
-					instancetypeObj        *instancetypev1alpha2.VirtualMachineInstancetype
-					clusterInstancetypeObj *instancetypev1alpha2.VirtualMachineClusterInstancetype
+					instancetypeObj        *instancetypev1beta1.VirtualMachineInstancetype
+					clusterInstancetypeObj *instancetypev1beta1.VirtualMachineClusterInstancetype
 				)
 
 				BeforeEach(func() {
-					instancetypeSpec := instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-						CPU: instancetypev1alpha2.CPUInstancetype{
+					instancetypeSpec := instancetypev1beta1.VirtualMachineInstancetypeSpec{
+						CPU: instancetypev1beta1.CPUInstancetype{
 							Guest: uint32(2),
 						},
-						Memory: instancetypev1alpha2.MemoryInstancetype{
+						Memory: instancetypev1beta1.MemoryInstancetype{
 							Guest: resource.MustParse("128M"),
 						},
 					}
-					instancetypeObj = &instancetypev1alpha2.VirtualMachineInstancetype{
+					instancetypeObj = &instancetypev1beta1.VirtualMachineInstancetype{
+						TypeMeta: metav1.TypeMeta{
+							APIVersion: instancetypev1beta1.SchemeGroupVersion.String(),
+							Kind:       "VirtualMachineInstancetype",
+						},
 						ObjectMeta: metav1.ObjectMeta{
 							Name:       "instancetype",
 							Namespace:  vm.Namespace,
@@ -3509,7 +3567,7 @@ var _ = Describe("VirtualMachine", func() {
 					err = instancetypeInformerStore.Add(instancetypeObj)
 					Expect(err).NotTo(HaveOccurred())
 
-					clusterInstancetypeObj = &instancetypev1alpha2.VirtualMachineClusterInstancetype{
+					clusterInstancetypeObj = &instancetypev1beta1.VirtualMachineClusterInstancetype{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:       "clusterInstancetype",
 							UID:        resourceUID,
@@ -3558,17 +3616,23 @@ var _ = Describe("VirtualMachine", func() {
 					revision, err := virtClient.AppsV1().ControllerRevisions(vm.Namespace).Get(context.Background(), expectedRevisionName, metav1.GetOptions{})
 					Expect(err).ToNot(HaveOccurred())
 
-					revisionInstancetype, ok := revision.Data.Object.(*instancetypev1alpha2.VirtualMachineInstancetype)
+					revisionInstancetype, ok := revision.Data.Object.(*instancetypev1beta1.VirtualMachineInstancetype)
 					Expect(ok).To(BeTrue(), "Expected Instancetype in ControllerRevision")
 
 					Expect(revisionInstancetype.Spec).To(Equal(instancetypeObj.Spec))
 				})
 
-				It("should apply VirtualMachineInstancetype from ControllerRevision to VirtualMachineInstance", func() {
-					instancetypeRevision, err := instancetype.CreateControllerRevision(vm, instancetypeObj)
-					Expect(err).ToNot(HaveOccurred())
+				DescribeTable("should apply VirtualMachineInstancetype from ControllerRevision to VirtualMachineInstance", func(getRevisionData func() []byte) {
+					instancetypeRevision := &appsv1.ControllerRevision{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "crName",
+						},
+						Data: runtime.RawExtension{
+							Raw: getRevisionData(),
+						},
+					}
 
-					_, err = virtClient.AppsV1().ControllerRevisions(vm.Namespace).Create(context.Background(), instancetypeRevision, metav1.CreateOptions{})
+					instancetypeRevision, err := virtClient.AppsV1().ControllerRevisions(vm.Namespace).Create(context.Background(), instancetypeRevision, metav1.CreateOptions{})
 					Expect(err).ToNot(HaveOccurred())
 
 					vm.Spec.Instancetype = &v1.InstancetypeMatcher{
@@ -3593,7 +3657,104 @@ var _ = Describe("VirtualMachine", func() {
 
 					controller.Execute()
 
-				})
+				},
+					Entry("using v1alpha1 and VirtualMachineInstancetypeSpecRevision with APIVersion", func() []byte {
+						v1alpha1instancetypeSpec := instancetypev1alpha1.VirtualMachineInstancetypeSpec{
+							CPU: instancetypev1alpha1.CPUInstancetype{
+								Guest: instancetypeObj.Spec.CPU.Guest,
+							},
+							Memory: instancetypev1alpha1.MemoryInstancetype{
+								Guest: instancetypeObj.Spec.Memory.Guest,
+							},
+						}
+
+						specBytes, err := json.Marshal(&v1alpha1instancetypeSpec)
+						Expect(err).ToNot(HaveOccurred())
+
+						specRevision := instancetypev1alpha1.VirtualMachineInstancetypeSpecRevision{
+							APIVersion: instancetypev1alpha1.SchemeGroupVersion.String(),
+							Spec:       specBytes,
+						}
+						specRevisionBytes, err := json.Marshal(specRevision)
+						Expect(err).ToNot(HaveOccurred())
+
+						return specRevisionBytes
+					}),
+					Entry("using v1alpha1 and VirtualMachineInstancetypeSpecRevision without APIVersion", func() []byte {
+						v1alpha1instancetypeSpec := instancetypev1alpha1.VirtualMachineInstancetypeSpec{
+							CPU: instancetypev1alpha1.CPUInstancetype{
+								Guest: instancetypeObj.Spec.CPU.Guest,
+							},
+							Memory: instancetypev1alpha1.MemoryInstancetype{
+								Guest: instancetypeObj.Spec.Memory.Guest,
+							},
+						}
+
+						specBytes, err := json.Marshal(&v1alpha1instancetypeSpec)
+						Expect(err).ToNot(HaveOccurred())
+
+						specRevision := instancetypev1alpha1.VirtualMachineInstancetypeSpecRevision{
+							APIVersion: "",
+							Spec:       specBytes,
+						}
+						specRevisionBytes, err := json.Marshal(specRevision)
+						Expect(err).ToNot(HaveOccurred())
+
+						return specRevisionBytes
+					}),
+					Entry("using v1alpha1", func() []byte {
+						v1alpha1instancetype := &instancetypev1alpha1.VirtualMachineInstancetype{
+							TypeMeta: metav1.TypeMeta{
+								APIVersion: instancetypev1alpha1.SchemeGroupVersion.String(),
+								Kind:       "VirtualMachineInstancetype",
+							},
+							ObjectMeta: metav1.ObjectMeta{
+								Name: instancetypeObj.Name,
+							},
+							Spec: instancetypev1alpha1.VirtualMachineInstancetypeSpec{
+								CPU: instancetypev1alpha1.CPUInstancetype{
+									Guest: instancetypeObj.Spec.CPU.Guest,
+								},
+								Memory: instancetypev1alpha1.MemoryInstancetype{
+									Guest: instancetypeObj.Spec.Memory.Guest,
+								},
+							},
+						}
+						instancetypeBytes, err := json.Marshal(v1alpha1instancetype)
+						Expect(err).ToNot(HaveOccurred())
+
+						return instancetypeBytes
+					}),
+					Entry("using v1alpha2", func() []byte {
+						v1alpha2instancetype := &instancetypev1alpha2.VirtualMachineInstancetype{
+							TypeMeta: metav1.TypeMeta{
+								APIVersion: instancetypev1alpha2.SchemeGroupVersion.String(),
+								Kind:       "VirtualMachineInstancetype",
+							},
+							ObjectMeta: metav1.ObjectMeta{
+								Name: instancetypeObj.Name,
+							},
+							Spec: instancetypev1alpha2.VirtualMachineInstancetypeSpec{
+								CPU: instancetypev1alpha2.CPUInstancetype{
+									Guest: instancetypeObj.Spec.CPU.Guest,
+								},
+								Memory: instancetypev1alpha2.MemoryInstancetype{
+									Guest: instancetypeObj.Spec.Memory.Guest,
+								},
+							},
+						}
+						instancetypeBytes, err := json.Marshal(v1alpha2instancetype)
+						Expect(err).ToNot(HaveOccurred())
+
+						return instancetypeBytes
+					}),
+					Entry("using v1beta1", func() []byte {
+						instancetypeBytes, err := json.Marshal(instancetypeObj)
+						Expect(err).ToNot(HaveOccurred())
+
+						return instancetypeBytes
+					}),
+				)
 
 				It("should apply VirtualMachineInstancetype to VirtualMachineInstance if an existing ControllerRevision is present but not referenced by InstancetypeMatcher", func() {
 					instancetypeRevision, err := instancetype.CreateControllerRevision(vm, instancetypeObj)
@@ -3667,7 +3828,7 @@ var _ = Describe("VirtualMachine", func() {
 					revision, err := virtClient.AppsV1().ControllerRevisions(vm.Namespace).Get(context.Background(), expectedRevisionName, metav1.GetOptions{})
 					Expect(err).ToNot(HaveOccurred())
 
-					revisionClusterInstancetype, ok := revision.Data.Object.(*instancetypev1alpha2.VirtualMachineClusterInstancetype)
+					revisionClusterInstancetype, ok := revision.Data.Object.(*instancetypev1beta1.VirtualMachineClusterInstancetype)
 					Expect(ok).To(BeTrue(), "Expected ClusterInstancetype in ControllerRevision")
 
 					Expect(revisionClusterInstancetype.Spec).To(Equal(clusterInstancetypeObj.Spec))
@@ -3877,28 +4038,32 @@ var _ = Describe("VirtualMachine", func() {
 
 			Context("preference", func() {
 				var (
-					preference        *instancetypev1alpha2.VirtualMachinePreference
-					clusterPreference *instancetypev1alpha2.VirtualMachineClusterPreference
+					preference        *instancetypev1beta1.VirtualMachinePreference
+					clusterPreference *instancetypev1beta1.VirtualMachineClusterPreference
 				)
 
 				BeforeEach(func() {
-					preferenceSpec := instancetypev1alpha2.VirtualMachinePreferenceSpec{
-						Firmware: &instancetypev1alpha2.FirmwarePreferences{
+					preferenceSpec := instancetypev1beta1.VirtualMachinePreferenceSpec{
+						Firmware: &instancetypev1beta1.FirmwarePreferences{
 							PreferredUseEfi: pointer.Bool(true),
 						},
-						Devices: &instancetypev1alpha2.DevicePreferences{
+						Devices: &instancetypev1beta1.DevicePreferences{
 							PreferredDiskBus:        virtv1.DiskBusVirtio,
 							PreferredInterfaceModel: "virtio",
 							PreferredInputBus:       virtv1.InputBusUSB,
 							PreferredInputType:      virtv1.InputTypeTablet,
 						},
 					}
-					preference = &instancetypev1alpha2.VirtualMachinePreference{
+					preference = &instancetypev1beta1.VirtualMachinePreference{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:       "preference",
 							Namespace:  vm.Namespace,
 							UID:        resourceUID,
 							Generation: resourceGeneration,
+						},
+						TypeMeta: metav1.TypeMeta{
+							APIVersion: instancetypev1beta1.SchemeGroupVersion.String(),
+							Kind:       "VirtualMachinePreference",
 						},
 						Spec: preferenceSpec,
 					}
@@ -3908,7 +4073,7 @@ var _ = Describe("VirtualMachine", func() {
 					err = preferenceInformerStore.Add(preference)
 					Expect(err).NotTo(HaveOccurred())
 
-					clusterPreference = &instancetypev1alpha2.VirtualMachineClusterPreference{
+					clusterPreference = &instancetypev1beta1.VirtualMachineClusterPreference{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:       "clusterPreference",
 							UID:        resourceUID,
@@ -3958,16 +4123,22 @@ var _ = Describe("VirtualMachine", func() {
 					preferenceRevision, err := virtClient.AppsV1().ControllerRevisions(vm.Namespace).Get(context.Background(), expectedPreferenceRevisionName, metav1.GetOptions{})
 					Expect(err).ToNot(HaveOccurred())
 
-					preferenceRevisionObj, ok := preferenceRevision.Data.Object.(*instancetypev1alpha2.VirtualMachinePreference)
+					preferenceRevisionObj, ok := preferenceRevision.Data.Object.(*instancetypev1beta1.VirtualMachinePreference)
 					Expect(ok).To(BeTrue(), "Expected Preference in ControllerRevision")
 					Expect(preferenceRevisionObj.Spec).To(Equal(preference.Spec))
 				})
 
-				It("should apply VirtualMachinePreference from ControllerRevision to VirtualMachineInstance", func() {
-					preferenceRevision, err := instancetype.CreateControllerRevision(vm, preference)
-					Expect(err).ToNot(HaveOccurred())
+				DescribeTable("should apply VirtualMachinePreference from ControllerRevision to VirtualMachineInstance", func(getRevisionData func() []byte) {
+					preferenceRevision := &appsv1.ControllerRevision{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "crName",
+						},
+						Data: runtime.RawExtension{
+							Raw: getRevisionData(),
+						},
+					}
 
-					_, err = virtClient.AppsV1().ControllerRevisions(vm.Namespace).Create(context.Background(), preferenceRevision, metav1.CreateOptions{})
+					preferenceRevision, err := virtClient.AppsV1().ControllerRevisions(vm.Namespace).Create(context.Background(), preferenceRevision, metav1.CreateOptions{})
 					Expect(err).ToNot(HaveOccurred())
 
 					vm.Spec.Preference = &v1.PreferenceMatcher{
@@ -3992,7 +4163,116 @@ var _ = Describe("VirtualMachine", func() {
 
 					controller.Execute()
 
-				})
+				},
+					Entry("using v1alpha1 and VirtualMachinePreferenceSpecRevision with APIVersion", func() []byte {
+						v1alpha1preferenceSpec := instancetypev1alpha1.VirtualMachinePreferenceSpec{
+							Firmware: &instancetypev1alpha1.FirmwarePreferences{
+								PreferredUseEfi: pointer.Bool(true),
+							},
+							Devices: &instancetypev1alpha1.DevicePreferences{
+								PreferredDiskBus:        virtv1.DiskBusVirtio,
+								PreferredInterfaceModel: "virtio",
+								PreferredInputBus:       virtv1.InputBusUSB,
+								PreferredInputType:      virtv1.InputTypeTablet,
+							},
+						}
+
+						specBytes, err := json.Marshal(&v1alpha1preferenceSpec)
+						Expect(err).ToNot(HaveOccurred())
+
+						specRevision := instancetypev1alpha1.VirtualMachinePreferenceSpecRevision{
+							APIVersion: instancetypev1alpha1.SchemeGroupVersion.String(),
+							Spec:       specBytes,
+						}
+						specRevisionBytes, err := json.Marshal(specRevision)
+						Expect(err).ToNot(HaveOccurred())
+
+						return specRevisionBytes
+					}),
+					Entry("using v1alpha1 and VirtualMachinePreferenceSpecRevision without APIVersion", func() []byte {
+						v1alpha1preferenceSpec := instancetypev1alpha1.VirtualMachinePreferenceSpec{
+							Firmware: &instancetypev1alpha1.FirmwarePreferences{
+								PreferredUseEfi: pointer.Bool(true),
+							},
+							Devices: &instancetypev1alpha1.DevicePreferences{
+								PreferredDiskBus:        virtv1.DiskBusVirtio,
+								PreferredInterfaceModel: "virtio",
+								PreferredInputBus:       virtv1.InputBusUSB,
+								PreferredInputType:      virtv1.InputTypeTablet,
+							},
+						}
+
+						specBytes, err := json.Marshal(&v1alpha1preferenceSpec)
+						Expect(err).ToNot(HaveOccurred())
+
+						specRevision := instancetypev1alpha1.VirtualMachinePreferenceSpecRevision{
+							APIVersion: "",
+							Spec:       specBytes,
+						}
+						specRevisionBytes, err := json.Marshal(specRevision)
+						Expect(err).ToNot(HaveOccurred())
+
+						return specRevisionBytes
+					}),
+					Entry("using v1alpha1", func() []byte {
+						v1alpha1preference := &instancetypev1alpha1.VirtualMachinePreference{
+							TypeMeta: metav1.TypeMeta{
+								APIVersion: instancetypev1alpha1.SchemeGroupVersion.String(),
+								Kind:       "VirtualMachinePreference",
+							},
+							ObjectMeta: metav1.ObjectMeta{
+								Name: preference.Name,
+							},
+							Spec: instancetypev1alpha1.VirtualMachinePreferenceSpec{
+								Firmware: &instancetypev1alpha1.FirmwarePreferences{
+									PreferredUseEfi: pointer.Bool(true),
+								},
+								Devices: &instancetypev1alpha1.DevicePreferences{
+									PreferredDiskBus:        virtv1.DiskBusVirtio,
+									PreferredInterfaceModel: "virtio",
+									PreferredInputBus:       virtv1.InputBusUSB,
+									PreferredInputType:      virtv1.InputTypeTablet,
+								},
+							},
+						}
+						preferenceBytes, err := json.Marshal(v1alpha1preference)
+						Expect(err).ToNot(HaveOccurred())
+
+						return preferenceBytes
+					}),
+					Entry("using v1alpha2", func() []byte {
+						v1alpha2preference := &instancetypev1alpha2.VirtualMachinePreference{
+							TypeMeta: metav1.TypeMeta{
+								APIVersion: instancetypev1alpha2.SchemeGroupVersion.String(),
+								Kind:       "VirtualMachinePreference",
+							},
+							ObjectMeta: metav1.ObjectMeta{
+								Name: preference.Name,
+							},
+							Spec: instancetypev1alpha2.VirtualMachinePreferenceSpec{
+								Firmware: &instancetypev1alpha2.FirmwarePreferences{
+									PreferredUseEfi: pointer.Bool(true),
+								},
+								Devices: &instancetypev1alpha2.DevicePreferences{
+									PreferredDiskBus:        virtv1.DiskBusVirtio,
+									PreferredInterfaceModel: "virtio",
+									PreferredInputBus:       virtv1.InputBusUSB,
+									PreferredInputType:      virtv1.InputTypeTablet,
+								},
+							},
+						}
+						preferenceBytes, err := json.Marshal(v1alpha2preference)
+						Expect(err).ToNot(HaveOccurred())
+
+						return preferenceBytes
+					}),
+					Entry("using v1beta1", func() []byte {
+						preferenceBytes, err := json.Marshal(preference)
+						Expect(err).ToNot(HaveOccurred())
+
+						return preferenceBytes
+					}),
+				)
 
 				It("should apply VirtualMachinePreference to VirtualMachineInstance if an existing ControllerRevision is present but not referenced by PreferenceMatcher", func() {
 					preferenceRevision, err := instancetype.CreateControllerRevision(vm, preference)
@@ -4068,7 +4348,7 @@ var _ = Describe("VirtualMachine", func() {
 					preferenceRevision, err := virtClient.AppsV1().ControllerRevisions(vm.Namespace).Get(context.Background(), expectedPreferenceRevisionName, metav1.GetOptions{})
 					Expect(err).ToNot(HaveOccurred())
 
-					preferenceRevisionObj, ok := preferenceRevision.Data.Object.(*instancetypev1alpha2.VirtualMachineClusterPreference)
+					preferenceRevisionObj, ok := preferenceRevision.Data.Object.(*instancetypev1beta1.VirtualMachineClusterPreference)
 					Expect(ok).To(BeTrue(), "Expected Preference in ControllerRevision")
 					Expect(preferenceRevisionObj.Spec).To(Equal(clusterPreference.Spec))
 				})
@@ -4214,7 +4494,7 @@ var _ = Describe("VirtualMachine", func() {
 
 				It("should reject if an existing ControllerRevision is found with unexpected VirtualMachinePreferenceSpec data", func() {
 					unexpectedPreference := preference.DeepCopy()
-					unexpectedPreference.Spec.Firmware = &instancetypev1alpha2.FirmwarePreferences{
+					unexpectedPreference.Spec.Firmware = &instancetypev1beta1.FirmwarePreferences{
 						PreferredUseBios: pointer.Bool(true),
 					}
 
@@ -4279,15 +4559,15 @@ var _ = Describe("VirtualMachine", func() {
 
 				It("should apply preferredAutoattachPodInterface and skip adding default network interface", func() {
 
-					autoattachPodInterfacePreference := &instancetypev1alpha2.VirtualMachinePreference{
+					autoattachPodInterfacePreference := &instancetypev1beta1.VirtualMachinePreference{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:       "autoattachPodInterfacePreference",
 							Namespace:  vm.Namespace,
 							UID:        resourceUID,
 							Generation: resourceGeneration,
 						},
-						Spec: instancetypev1alpha2.VirtualMachinePreferenceSpec{
-							Devices: &instancetypev1alpha2.DevicePreferences{
+						Spec: instancetypev1beta1.VirtualMachinePreferenceSpec{
+							Devices: &instancetypev1beta1.DevicePreferences{
 								PreferredAutoattachPodInterface: pointer.Bool(false),
 							},
 						},
@@ -4414,15 +4694,15 @@ var _ = Describe("VirtualMachine", func() {
 
 				It("should apply preferences to preferredAutoattachInputDevice attached input device", func() {
 
-					autoattachInputDevicePreference := &instancetypev1alpha2.VirtualMachinePreference{
+					autoattachInputDevicePreference := &instancetypev1beta1.VirtualMachinePreference{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:       "autoattachInputDevicePreference",
 							Namespace:  vm.Namespace,
 							UID:        resourceUID,
 							Generation: resourceGeneration,
 						},
-						Spec: instancetypev1alpha2.VirtualMachinePreferenceSpec{
-							Devices: &instancetypev1alpha2.DevicePreferences{
+						Spec: instancetypev1beta1.VirtualMachinePreferenceSpec{
+							Devices: &instancetypev1beta1.DevicePreferences{
 								PreferredAutoattachInputDevice: pointer.Bool(true),
 								PreferredInputBus:              virtv1.InputBusVirtio,
 								PreferredInputType:             virtv1.InputTypeTablet,
@@ -4462,15 +4742,15 @@ var _ = Describe("VirtualMachine", func() {
 
 				It("should apply preferredAutoattachInputDevice and skip adding default input device", func() {
 
-					autoattachInputDevicePreference := &instancetypev1alpha2.VirtualMachinePreference{
+					autoattachInputDevicePreference := &instancetypev1beta1.VirtualMachinePreference{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:       "preferredAutoattachInputDevicePreference",
 							Namespace:  vm.Namespace,
 							UID:        resourceUID,
 							Generation: resourceGeneration,
 						},
-						Spec: instancetypev1alpha2.VirtualMachinePreferenceSpec{
-							Devices: &instancetypev1alpha2.DevicePreferences{
+						Spec: instancetypev1beta1.VirtualMachinePreferenceSpec{
+							Devices: &instancetypev1beta1.DevicePreferences{
 								PreferredAutoattachInputDevice: pointer.Bool(false),
 							},
 						},
@@ -4641,6 +4921,373 @@ var _ = Describe("VirtualMachine", func() {
 			Entry("not add default input device by default", nil, []v1.Input{}, nil),
 			Entry("not add default input device when devices already present in VirtualMachine", pointer.Bool(true), []v1.Input{{Name: "existing-0"}}, &v1.Input{Name: "existing-0"}),
 		)
+
+		Context("Live update features", func() {
+			const maxSocketsFromSpec uint32 = 24
+			const maxSocketsFromConfig uint32 = 48
+			maxGuestFromSpec := resource.MustParse("128Mi")
+			maxGuestFromConfig := resource.MustParse("256Mi")
+
+			Context("CPU", func() {
+				It("should honour the maximum CPU sockets from VM spec", func() {
+					vm, _ := DefaultVirtualMachine(true)
+					vm.Spec.LiveUpdateFeatures = &virtv1.LiveUpdateFeatures{
+						CPU: &virtv1.LiveUpdateCPU{
+							MaxSockets: kvpointer.P(maxSocketsFromSpec),
+						},
+					}
+
+					vmi := controller.setupVMIFromVM(vm)
+					Expect(vmi.Spec.Domain.CPU.MaxSockets).To(Equal(maxSocketsFromSpec))
+				})
+
+				It("should prefer maximum CPU sockets from VM spec rather than from cluster config", func() {
+					vm, _ := DefaultVirtualMachine(true)
+					vm.Spec.LiveUpdateFeatures = &virtv1.LiveUpdateFeatures{
+						CPU: &virtv1.LiveUpdateCPU{
+							MaxSockets: kvpointer.P(maxSocketsFromSpec),
+						},
+					}
+					testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, &v1.KubeVirt{
+						Spec: v1.KubeVirtSpec{
+							Configuration: v1.KubeVirtConfiguration{
+								LiveUpdateConfiguration: &virtv1.LiveUpdateConfiguration{
+									MaxCpuSockets: kvpointer.P(maxSocketsFromConfig),
+								},
+							},
+						},
+					})
+
+					vmi := controller.setupVMIFromVM(vm)
+					Expect(vmi.Spec.Domain.CPU.MaxSockets).To(Equal(maxSocketsFromSpec))
+				})
+
+				It("should use maximum sockets configured in cluster config when its not set in VM spec", func() {
+					vm, _ := DefaultVirtualMachine(true)
+					vm.Spec.LiveUpdateFeatures = &virtv1.LiveUpdateFeatures{
+						CPU: &virtv1.LiveUpdateCPU{},
+					}
+					testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, &v1.KubeVirt{
+						Spec: v1.KubeVirtSpec{
+							Configuration: v1.KubeVirtConfiguration{
+								LiveUpdateConfiguration: &virtv1.LiveUpdateConfiguration{
+									MaxCpuSockets: kvpointer.P(maxSocketsFromConfig),
+								},
+							},
+						},
+					})
+
+					vmi := controller.setupVMIFromVM(vm)
+					Expect(vmi.Spec.Domain.CPU.MaxSockets).To(Equal(maxSocketsFromConfig))
+				})
+
+				It("should calculate max sockets to be 4x times the configured sockets when no max sockets defined ", func() {
+					const cpuSockets uint32 = 4
+					vm, _ := DefaultVirtualMachine(true)
+					vm.Spec.LiveUpdateFeatures = &virtv1.LiveUpdateFeatures{
+						CPU: &virtv1.LiveUpdateCPU{},
+					}
+					vm.Spec.Template.Spec.Domain.CPU = &virtv1.CPU{
+						Sockets: cpuSockets,
+					}
+
+					vmi := controller.setupVMIFromVM(vm)
+					Expect(vmi.Spec.Domain.CPU.MaxSockets).To(Equal(cpuSockets * 4))
+				})
+
+				It("should calculate max sockets to be 4x times the default sockets when default CPU topology used", func() {
+					const defaultSockets uint32 = 1
+					vm, _ := DefaultVirtualMachine(true)
+					vm.Spec.LiveUpdateFeatures = &virtv1.LiveUpdateFeatures{
+						CPU: &virtv1.LiveUpdateCPU{},
+					}
+
+					vmi := controller.setupVMIFromVM(vm)
+					Expect(vmi.Spec.Domain.CPU.MaxSockets).To(Equal(defaultSockets * 4))
+				})
+			})
+
+			Context("Memory", func() {
+				It("should honour the max guest memory from VM spec", func() {
+					vm, _ := DefaultVirtualMachine(true)
+					guestMemory := resource.MustParse("64Mi")
+					vm.Spec.Template.Spec.Domain.Memory = &virtv1.Memory{Guest: &guestMemory}
+					vm.Spec.LiveUpdateFeatures = &virtv1.LiveUpdateFeatures{
+						Memory: &virtv1.LiveUpdateMemory{
+							MaxGuest: &maxGuestFromSpec,
+						},
+					}
+
+					vmi := controller.setupVMIFromVM(vm)
+					Expect(*vmi.Spec.Domain.Memory.MaxGuest).To(Equal(maxGuestFromSpec))
+				})
+
+				It("should prefer maxGuest from VM spec rather than from cluster config", func() {
+					vm, _ := DefaultVirtualMachine(true)
+					guestMemory := resource.MustParse("64Mi")
+					vm.Spec.Template.Spec.Domain.Memory = &virtv1.Memory{Guest: &guestMemory}
+					vm.Spec.LiveUpdateFeatures = &virtv1.LiveUpdateFeatures{
+						Memory: &virtv1.LiveUpdateMemory{
+							MaxGuest: &maxGuestFromSpec,
+						},
+					}
+					testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, &v1.KubeVirt{
+						Spec: v1.KubeVirtSpec{
+							Configuration: v1.KubeVirtConfiguration{
+								LiveUpdateConfiguration: &virtv1.LiveUpdateConfiguration{
+									MaxGuest: &maxGuestFromConfig,
+								},
+							},
+						},
+					})
+
+					vmi := controller.setupVMIFromVM(vm)
+					Expect(*vmi.Spec.Domain.Memory.MaxGuest).To(Equal(maxGuestFromSpec))
+				})
+
+				It("should use maxGuest configured in cluster config when its not set in VM spec", func() {
+					vm, _ := DefaultVirtualMachine(true)
+					guestMemory := resource.MustParse("64Mi")
+					vm.Spec.Template.Spec.Domain.Memory = &virtv1.Memory{Guest: &guestMemory}
+					vm.Spec.LiveUpdateFeatures = &virtv1.LiveUpdateFeatures{
+						Memory: &virtv1.LiveUpdateMemory{},
+					}
+					testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, &v1.KubeVirt{
+						Spec: v1.KubeVirtSpec{
+							Configuration: v1.KubeVirtConfiguration{
+								LiveUpdateConfiguration: &virtv1.LiveUpdateConfiguration{
+									MaxGuest: &maxGuestFromConfig,
+								},
+							},
+						},
+					})
+
+					vmi := controller.setupVMIFromVM(vm)
+					Expect(*vmi.Spec.Domain.Memory.MaxGuest).To(Equal(maxGuestFromConfig))
+				})
+
+				It("should opt-out from memory live-update if liveUpdateFeatures is disabled in the VM spec", func() {
+					vm, _ := DefaultVirtualMachine(true)
+					guestMemory := resource.MustParse("0")
+					vm.Spec.Template.Spec.Domain.Memory = &virtv1.Memory{Guest: &guestMemory}
+					vm.Spec.LiveUpdateFeatures = &virtv1.LiveUpdateFeatures{
+						Memory: nil,
+					}
+					testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, &v1.KubeVirt{
+						Spec: v1.KubeVirtSpec{
+							Configuration: v1.KubeVirtConfiguration{
+								LiveUpdateConfiguration: &virtv1.LiveUpdateConfiguration{
+									MaxGuest: &maxGuestFromConfig,
+								},
+							},
+						},
+					})
+
+					vmi := controller.setupVMIFromVM(vm)
+					Expect(vmi.Spec.Domain.Memory.MaxGuest).To(BeNil())
+				})
+
+				It("should calculate maxGuest to be `MaxHotplugRatio` times the configured guest memory when no maxGuest is defined", func() {
+					vm, _ := DefaultVirtualMachine(true)
+					guestMemory := resource.MustParse("64Mi")
+					vm.Spec.Template.Spec.Domain.Memory = &virtv1.Memory{Guest: &guestMemory}
+					vm.Spec.LiveUpdateFeatures = &virtv1.LiveUpdateFeatures{
+						Memory: &virtv1.LiveUpdateMemory{},
+					}
+
+					vmi := controller.setupVMIFromVM(vm)
+					Expect(vmi.Spec.Domain.Memory.MaxGuest.Value()).To(Equal(guestMemory.Value() * int64(config.GetMaxHotplugRatio())))
+				})
+
+				It("should patch VMI when memory hotplug is requested", func() {
+					vm, _ := DefaultVirtualMachine(true)
+					newMemory := resource.MustParse("128Mi")
+					vm.Spec.Template.Spec.Domain.Memory = &virtv1.Memory{Guest: &newMemory}
+					vm.Spec.LiveUpdateFeatures = &virtv1.LiveUpdateFeatures{
+						Memory: &virtv1.LiveUpdateMemory{
+							MaxGuest: &maxGuestFromSpec,
+						},
+					}
+
+					vmi := api.NewMinimalVMI(vm.Name)
+					guestMemory := resource.MustParse("64Mi")
+					vmi.Spec.Domain.Memory = &virtv1.Memory{Guest: &guestMemory}
+
+					memReqBuffer := resource.MustParse("100Mi")
+					memoryRequest := guestMemory.DeepCopy()
+					memoryRequest.Add(memReqBuffer)
+					vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory] = memoryRequest
+
+					vmi.Status.Memory = &virtv1.MemoryStatus{
+						GuestAtBoot:    &guestMemory,
+						GuestCurrent:   &guestMemory,
+						GuestRequested: &guestMemory,
+					}
+
+					vmiInterface.EXPECT().Patch(context.Background(), vmi.Name, types.JSONPatchType, gomock.Any(), &metav1.PatchOptions{}).Do(func(ctx context.Context, name, patchType, patch, opts interface{}, subs ...interface{}) {
+						originalVMIBytes, err := json.Marshal(vmi)
+						Expect(err).ToNot(HaveOccurred())
+						patchBytes := patch.([]byte)
+
+						patchJSON, err := jsonpatch.DecodePatch(patchBytes)
+						Expect(err).ToNot(HaveOccurred())
+						newVMIBytes, err := patchJSON.Apply(originalVMIBytes)
+						Expect(err).ToNot(HaveOccurred())
+
+						var newVMI *virtv1.VirtualMachineInstance
+						err = json.Unmarshal(newVMIBytes, &newVMI)
+						Expect(err).ToNot(HaveOccurred())
+
+						// this tests when memory request is not equal guest memory
+						expectedMemReq := vm.Spec.Template.Spec.Domain.Memory.Guest.DeepCopy()
+						expectedMemReq.Add(memReqBuffer)
+
+						Expect(newVMI.Spec.Domain.Memory.Guest.Value()).To(Equal(vm.Spec.Template.Spec.Domain.Memory.Guest.Value()))
+						Expect(newVMI.Spec.Domain.Resources.Requests.Memory().Value()).To(Equal(expectedMemReq.Value()))
+
+					})
+
+					err := controller.handleMemoryHotplugRequest(vm, vmi)
+					Expect(err).ToNot(HaveOccurred())
+				})
+
+				It("should not patch VMI if memory hotplug is already in progress", func() {
+					vm, _ := DefaultVirtualMachine(true)
+					newMemory := resource.MustParse("128Mi")
+					vm.Spec.Template.Spec.Domain.Memory = &virtv1.Memory{Guest: &newMemory}
+					vm.Spec.LiveUpdateFeatures = &virtv1.LiveUpdateFeatures{
+						Memory: &virtv1.LiveUpdateMemory{
+							MaxGuest: &maxGuestFromSpec,
+						},
+					}
+
+					vmi := api.NewMinimalVMI(vm.Name)
+					guestMemory := resource.MustParse("64Mi")
+					vmi.Spec.Domain.Memory = &virtv1.Memory{Guest: &guestMemory}
+					vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory] = guestMemory
+					vmi.Status.Memory = &virtv1.MemoryStatus{
+						GuestAtBoot:    &guestMemory,
+						GuestCurrent:   &guestMemory,
+						GuestRequested: &guestMemory,
+					}
+
+					condition := virtv1.VirtualMachineInstanceCondition{
+						Type:   virtv1.VirtualMachineInstanceMemoryChange,
+						Status: k8sv1.ConditionTrue,
+					}
+					virtcontroller.NewVirtualMachineInstanceConditionManager().UpdateCondition(vmi, &condition)
+
+					err := controller.handleMemoryHotplugRequest(vm, vmi)
+					Expect(err).To(HaveOccurred())
+				})
+
+				It("should not patch VMI if a migration is in progress", func() {
+					vm, _ := DefaultVirtualMachine(true)
+					newMemory := resource.MustParse("128Mi")
+					vm.Spec.Template.Spec.Domain.Memory = &virtv1.Memory{Guest: &newMemory}
+					vm.Spec.LiveUpdateFeatures = &virtv1.LiveUpdateFeatures{
+						Memory: &virtv1.LiveUpdateMemory{
+							MaxGuest: &maxGuestFromSpec,
+						},
+					}
+
+					vmi := api.NewMinimalVMI(vm.Name)
+					guestMemory := resource.MustParse("64Mi")
+					vmi.Spec.Domain.Memory = &virtv1.Memory{Guest: &guestMemory}
+					vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory] = guestMemory
+					vmi.Status.Memory = &virtv1.MemoryStatus{
+						GuestAtBoot:  &guestMemory,
+						GuestCurrent: &guestMemory,
+					}
+					migrationStart := metav1.Now()
+					vmi.Status.MigrationState = &virtv1.VirtualMachineInstanceMigrationState{
+						StartTimestamp: &migrationStart,
+					}
+
+					err := controller.handleMemoryHotplugRequest(vm, vmi)
+					Expect(err).To(HaveOccurred())
+				})
+
+				It("should not patch VMI if guest memory did not change", func() {
+					guestMemory := resource.MustParse("64Mi")
+					vm, _ := DefaultVirtualMachine(true)
+					vm.Spec.Template.Spec.Domain.Memory = &virtv1.Memory{Guest: &guestMemory}
+					vm.Spec.LiveUpdateFeatures = &virtv1.LiveUpdateFeatures{
+						Memory: &virtv1.LiveUpdateMemory{
+							MaxGuest: &maxGuestFromSpec,
+						},
+					}
+
+					vmi := api.NewMinimalVMI(vm.Name)
+					vmi.Spec.Domain.Memory = &virtv1.Memory{Guest: &guestMemory}
+					vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory] = guestMemory
+					vmi.Status.Memory = &virtv1.MemoryStatus{
+						GuestAtBoot:  &guestMemory,
+						GuestCurrent: &guestMemory,
+					}
+
+					err := controller.handleMemoryHotplugRequest(vm, vmi)
+					Expect(err).ToNot(HaveOccurred())
+				})
+			})
+		})
+
+		Context("CPU topology", func() {
+			When("isn't set in VMI template", func() {
+				It("Set default CPU topology in VMI status", func() {
+					vm, vmi := DefaultVirtualMachine(true)
+					addVirtualMachine(vm)
+
+					vmiInterface.EXPECT().Create(context.Background(), gomock.Any()).Do(func(ctx context.Context, arg interface{}) {
+						Expect(arg.(*virtv1.VirtualMachineInstance).Status.CurrentCPUTopology).To(Not(BeNil()))
+					}).Return(vmi, nil)
+
+					// expect update status is called
+					vmInterface.EXPECT().UpdateStatus(context.Background(), gomock.Any()).Do(func(ctx context.Context, arg interface{}) {
+						Expect(arg.(*virtv1.VirtualMachine).Status.Created).To(BeFalse())
+						Expect(arg.(*virtv1.VirtualMachine).Status.Ready).To(BeFalse())
+					}).Return(nil, nil)
+
+					controller.Execute()
+
+					testutils.ExpectEvent(recorder, SuccessfulCreateVirtualMachineReason)
+				})
+			})
+			When("set in VMI template", func() {
+				It("copy CPU topology to VMI status", func() {
+					const (
+						numOfSockets uint32 = 8
+						numOfCores   uint32 = 8
+						numOfThreads uint32 = 8
+					)
+					vm, vmi := DefaultVirtualMachine(true)
+					vm.Spec.Template.Spec.Domain.CPU = &v1.CPU{
+						Sockets: numOfSockets,
+						Cores:   numOfCores,
+						Threads: numOfThreads,
+					}
+					addVirtualMachine(vm)
+
+					vmiInterface.EXPECT().Create(context.Background(), gomock.Any()).Do(func(ctx context.Context, arg interface{}) {
+						currentCPUTopology := arg.(*virtv1.VirtualMachineInstance).Status.CurrentCPUTopology
+						Expect(currentCPUTopology).To(Not(BeNil()))
+						Expect(currentCPUTopology.Sockets).To(Equal(numOfSockets))
+						Expect(currentCPUTopology.Cores).To(Equal(numOfCores))
+						Expect(currentCPUTopology.Threads).To(Equal(numOfThreads))
+					}).Return(vmi, nil)
+
+					// expect update status is called
+					vmInterface.EXPECT().UpdateStatus(context.Background(), gomock.Any()).Do(func(ctx context.Context, arg interface{}) {
+						Expect(arg.(*virtv1.VirtualMachine).Status.Created).To(BeFalse())
+						Expect(arg.(*virtv1.VirtualMachine).Status.Ready).To(BeFalse())
+					}).Return(nil, nil)
+
+					controller.Execute()
+
+					testutils.ExpectEvent(recorder, SuccessfulCreateVirtualMachineReason)
+				})
+			})
+		})
 	})
 })
 

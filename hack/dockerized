@@ -12,7 +12,7 @@ fi
 
 fail_if_cri_bin_missing
 
-KUBEVIRT_BUILDER_IMAGE="quay.io/kubevirt/builder:2212180911-8818abcfa"
+KUBEVIRT_BUILDER_IMAGE=${KUBEVIRT_BUILDER_IMAGE:-"quay.io/kubevirt/builder:2306271234-e00d9fcf9"}
 
 SYNC_OUT=${SYNC_OUT:-true}
 
@@ -113,7 +113,7 @@ volumes="$volumes -v ${HOME}/.docker/secrets:/root/.docker/secrets:ro${selinux_b
 # Use a bind-mount to expose docker/podman auth file to the container
 if [[ $KUBEVIRT_CRI = podman* ]] && [[ -f "${XDG_RUNTIME_DIR}/containers/auth.json" ]]; then
     volumes="$volumes --mount type=bind,source=${XDG_RUNTIME_DIR}/containers/auth.json,target=/root/.docker/config.json,readonly"
-elif [[ -f "${HOME}/.docker/config.json" ]]; then
+elif [[ -f "${HOME}/.docker/config.json" && "$(cat ${HOME}/.docker/config.json | jq 'has("credHelpers")')" != "true" ]]; then
     volumes="$volumes --mount type=bind,source=${HOME}/.docker/config.json,target=/root/.docker/config.json,readonly"
 fi
 

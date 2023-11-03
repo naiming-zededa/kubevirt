@@ -30,8 +30,9 @@ import (
 	"sync"
 	"time"
 
+	"context"
+
 	"github.com/fsnotify/fsnotify"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
 	v1 "kubevirt.io/api/core/v1"
@@ -159,10 +160,6 @@ func (dpi *MediatedDevicePlugin) Start(stop <-chan struct{}) (err error) {
 	err = <-errChan
 
 	return err
-}
-
-func (dpi *MediatedDevicePlugin) GetDevicePath() string {
-	return dpi.devicePath
 }
 
 func (dpi *MediatedDevicePlugin) GetDeviceName() string {

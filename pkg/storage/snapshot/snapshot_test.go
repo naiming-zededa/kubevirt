@@ -30,18 +30,17 @@ import (
 
 	v1 "kubevirt.io/api/core/v1"
 	instancetypeapi "kubevirt.io/api/instancetype"
-	instancetypev1alpha2 "kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 	snapshotv1 "kubevirt.io/api/snapshot/v1alpha1"
 	k8ssnapshotfake "kubevirt.io/client-go/generated/external-snapshotter/clientset/versioned/fake"
 	kubevirtfake "kubevirt.io/client-go/generated/kubevirt/clientset/versioned/fake"
 	"kubevirt.io/client-go/kubecli"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
-	"kubevirt.io/kubevirt/pkg/instancetype"
-	"kubevirt.io/kubevirt/pkg/util"
-
 	virtcontroller "kubevirt.io/kubevirt/pkg/controller"
+	"kubevirt.io/kubevirt/pkg/instancetype"
 	"kubevirt.io/kubevirt/pkg/testutils"
+	"kubevirt.io/kubevirt/pkg/util"
 	"kubevirt.io/kubevirt/pkg/util/status"
 )
 
@@ -436,6 +435,11 @@ var _ = Describe("Snapshot controlleer", func() {
 				controller.dynamicInformerMap[volumeSnapshotClassCRD].informer = volumeSnapshotClassInformer
 				go volumeSnapshotInformer.Run(stopCh)
 				go volumeSnapshotClassInformer.Run(stopCh)
+				Expect(cache.WaitForCacheSync(
+					stopCh,
+					volumeSnapshotInformer.HasSynced,
+					volumeSnapshotClassInformer.HasSynced,
+				)).To(BeTrue())
 			})
 
 			It("should initialize VirtualMachineSnapshot status", func() {
@@ -622,6 +626,32 @@ var _ = Describe("Snapshot controlleer", func() {
 			It("should (partial) lock source", func() {
 				vmSnapshot := createVMSnapshotInProgress()
 				vm := createVM()
+				vmUpdate := vm.DeepCopy()
+				vmUpdate.ResourceVersion = "1"
+				vmUpdate.Status.SnapshotInProgress = &vmSnapshotName
+
+				vmSource.Add(vm)
+				vmInterface.EXPECT().UpdateStatus(context.Background(), vmUpdate).Return(vmUpdate, nil).Times(1)
+
+				updatedSnapshot := vmSnapshot.DeepCopy()
+				updatedSnapshot.ResourceVersion = "1"
+				updatedSnapshot.Status.Conditions = []snapshotv1.Condition{
+					newProgressingCondition(corev1.ConditionFalse, "Source not locked"),
+					newReadyCondition(corev1.ConditionFalse, "Not ready"),
+				}
+				updatedSnapshot.Status.Indications = []snapshotv1.Indication{}
+				expectVMSnapshotUpdate(vmSnapshotClient, updatedSnapshot)
+
+				addVirtualMachineSnapshot(vmSnapshot)
+				controller.processVMSnapshotWorkItem()
+			})
+
+			It("should (partial) lock source manual runstrategy", func() {
+				vmSnapshot := createVMSnapshotInProgress()
+				vm := createVM()
+				vm.Spec.Running = nil
+				rs := v1.RunStrategyManual
+				vm.Spec.RunStrategy = &rs
 				vmUpdate := vm.DeepCopy()
 				vmUpdate.ResourceVersion = "1"
 				vmUpdate.Status.SnapshotInProgress = &vmSnapshotName
@@ -1990,8 +2020,8 @@ var _ = Describe("Snapshot controlleer", func() {
 				var (
 					vm              *v1.VirtualMachine
 					vmSnapshot      *snapshotv1.VirtualMachineSnapshot
-					instancetypeObj *instancetypev1alpha2.VirtualMachineInstancetype
-					preferenceObj   *instancetypev1alpha2.VirtualMachinePreference
+					instancetypeObj *instancetypev1beta1.VirtualMachineInstancetype
+					preferenceObj   *instancetypev1beta1.VirtualMachinePreference
 					instancetypeCR  *appsv1.ControllerRevision
 					preferenceCR    *appsv1.ControllerRevision
 					err             error
@@ -2440,11 +2470,11 @@ func updateVMWithMemoryDump(vm *v1.VirtualMachine) *v1.VirtualMachine {
 	return vm
 }
 
-func createInstancetype() *instancetypev1alpha2.VirtualMachineInstancetype {
-	return &instancetypev1alpha2.VirtualMachineInstancetype{
+func createInstancetype() *instancetypev1beta1.VirtualMachineInstancetype {
+	return &instancetypev1beta1.VirtualMachineInstancetype{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       instancetypeapi.SingularResourceName,
-			APIVersion: instancetypev1alpha2.SchemeGroupVersion.String(),
+			APIVersion: instancetypev1beta1.SchemeGroupVersion.String(),
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "test-instancetype",
@@ -2452,19 +2482,20 @@ func createInstancetype() *instancetypev1alpha2.VirtualMachineInstancetype {
 			UID:        instancetypeUID,
 			Generation: 1,
 		},
-		Spec: instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-			CPU: instancetypev1alpha2.CPUInstancetype{
+		Spec: instancetypev1beta1.VirtualMachineInstancetypeSpec{
+			CPU: instancetypev1beta1.CPUInstancetype{
 				Guest: uint32(2),
 			},
 		},
 	}
 }
 
-func createPreference() *instancetypev1alpha2.VirtualMachinePreference {
-	return &instancetypev1alpha2.VirtualMachinePreference{
+func createPreference() *instancetypev1beta1.VirtualMachinePreference {
+	preferredCPUTopology := instancetypev1beta1.PreferThreads
+	return &instancetypev1beta1.VirtualMachinePreference{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       instancetypeapi.SingularPreferenceResourceName,
-			APIVersion: instancetypev1alpha2.SchemeGroupVersion.String(),
+			APIVersion: instancetypev1beta1.SchemeGroupVersion.String(),
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "test-preference",
@@ -2472,9 +2503,9 @@ func createPreference() *instancetypev1alpha2.VirtualMachinePreference {
 			UID:        preferenceUID,
 			Generation: 1,
 		},
-		Spec: instancetypev1alpha2.VirtualMachinePreferenceSpec{
-			CPU: &instancetypev1alpha2.CPUPreferences{
-				PreferredCPUTopology: instancetypev1alpha2.PreferThreads,
+		Spec: instancetypev1beta1.VirtualMachinePreferenceSpec{
+			CPU: &instancetypev1beta1.CPUPreferences{
+				PreferredCPUTopology: &preferredCPUTopology,
 			},
 		},
 	}
@@ -2497,6 +2528,16 @@ func createInstancetypeVirtualMachineSnapshotCR(vm *v1.VirtualMachine, vmSnapsho
 	return cr
 }
 
+func expectControllerRevisionToEqualExpected(controllerRevision, expectedControllerRevision *appsv1.ControllerRevision) {
+	// This is already covered by the below assertion but be explicit here to ensure coverage
+	Expect(controllerRevision.Labels).To(HaveKey(instancetypeapi.ControllerRevisionObjectGenerationLabel))
+	Expect(controllerRevision.Labels).To(HaveKey(instancetypeapi.ControllerRevisionObjectKindLabel))
+	Expect(controllerRevision.Labels).To(HaveKey(instancetypeapi.ControllerRevisionObjectNameLabel))
+	Expect(controllerRevision.Labels).To(HaveKey(instancetypeapi.ControllerRevisionObjectUIDLabel))
+	Expect(controllerRevision.Labels).To(HaveKey(instancetypeapi.ControllerRevisionObjectVersionLabel))
+	Expect(*controllerRevision).To(Equal(*expectedControllerRevision))
+}
+
 func expectControllerRevisionCreate(client *k8sfake.Clientset, expectedCR *appsv1.ControllerRevision) {
 	client.Fake.PrependReactor("create", "controllerrevisions", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
 		create, ok := action.(testing.CreateAction)
@@ -2507,7 +2548,7 @@ func expectControllerRevisionCreate(client *k8sfake.Clientset, expectedCR *appsv
 		expectedCR.ResourceVersion = ""
 
 		createObj := create.GetObject().(*appsv1.ControllerRevision)
-		Expect(*createObj).To(Equal(*expectedCR))
+		expectControllerRevisionToEqualExpected(createObj, expectedCR)
 
 		return true, createObj, nil
 	})
@@ -2523,7 +2564,7 @@ func expectCreateControllerRevisionAlreadyExists(client *k8sfake.Clientset, expe
 		expectedCR.ResourceVersion = ""
 
 		createObj := create.GetObject().(*appsv1.ControllerRevision)
-		Expect(*createObj).To(Equal(*expectedCR))
+		expectControllerRevisionToEqualExpected(createObj, expectedCR)
 
 		return true, create.GetObject(), errors.NewAlreadyExists(schema.GroupResource{}, expectedCR.Name)
 	})
@@ -2535,7 +2576,7 @@ func expectControllerRevisionUpdate(client *k8sfake.Clientset, expectedCR *appsv
 		Expect(ok).To(BeTrue())
 
 		updateObj := update.GetObject().(*appsv1.ControllerRevision)
-		Expect(*updateObj).To(Equal(*expectedCR))
+		expectControllerRevisionToEqualExpected(updateObj, expectedCR)
 
 		return true, update.GetObject(), nil
 	})

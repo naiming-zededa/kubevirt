@@ -29,7 +29,7 @@ import (
 
 	kvtls "kubevirt.io/kubevirt/pkg/util/tls"
 
-	"github.com/emicklei/go-restful"
+	"github.com/emicklei/go-restful/v3"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/pflag"
 	"k8s.io/client-go/util/certificate"
@@ -86,13 +86,15 @@ type VirtOperatorApp struct {
 	restClient      *clientrest.RESTClient
 	informerFactory controller.KubeInformerFactory
 
-	kubeVirtController KubeVirtController
+	kubeVirtController *KubeVirtController
 	kubeVirtRecorder   record.EventRecorder
 
 	operatorNamespace string
 
 	kubeVirtInformer cache.SharedIndexInformer
 	kubeVirtCache    cache.Store
+
+	crdInformer cache.SharedIndexInformer
 
 	stores    util.Stores
 	informers util.Informers
@@ -103,6 +105,10 @@ type VirtOperatorApp struct {
 
 	clusterConfig *virtconfig.ClusterConfig
 	host          string
+
+	ctx context.Context
+
+	reInitChan chan string
 }
 
 var (
@@ -110,14 +116,14 @@ var (
 
 	leaderGauge = prometheus.NewGauge(
 		prometheus.GaugeOpts{
-			Name: "kubevirt_virt_operator_leading",
+			Name: "kubevirt_virt_operator_leading_status",
 			Help: "Indication for an operating virt-operator.",
 		},
 	)
 
 	readyGauge = prometheus.NewGauge(
 		prometheus.GaugeOpts{
-			Name: "kubevirt_virt_operator_ready",
+			Name: "kubevirt_virt_operator_ready_status",
 			Help: "Indication for a virt-operator that is ready to take the lead.",
 		},
 	)
@@ -233,6 +239,8 @@ func Execute() {
 		ConfigMapCache:                app.informerFactory.OperatorConfigMap().GetStore(),
 	}
 
+	app.crdInformer = app.informerFactory.CRD()
+
 	onOpenShift, err := clusterutil.IsOnOpenShift(app.clientSet)
 	if err != nil {
 		golog.Fatalf("Error determining cluster type: %v", err)
@@ -286,7 +294,10 @@ func Execute() {
 	app.prepareCertManagers()
 
 	app.kubeVirtRecorder = app.getNewRecorder(k8sv1.NamespaceAll, VirtOperator)
-	app.kubeVirtController = *NewKubeVirtController(app.clientSet, app.aggregatorClient.ApiregistrationV1().APIServices(), app.kubeVirtInformer, app.kubeVirtRecorder, app.stores, app.informers, app.operatorNamespace)
+	app.kubeVirtController, err = NewKubeVirtController(app.clientSet, app.aggregatorClient.ApiregistrationV1().APIServices(), app.kubeVirtInformer, app.kubeVirtRecorder, app.stores, app.informers, app.operatorNamespace)
+	if err != nil {
+		panic(err)
+	}
 
 	image := util.GetOperatorImage()
 	if image == "" {
@@ -294,16 +305,26 @@ func Execute() {
 	}
 	log.Log.Infof("Operator image: %s", image)
 
-	app.clusterConfig = virtconfig.NewClusterConfig(
+	app.clusterConfig, err = virtconfig.NewClusterConfig(
 		app.informerFactory.CRD(),
 		app.informerFactory.KubeVirt(),
 		app.operatorNamespace,
 	)
 
+	if err != nil {
+		panic(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	app.ctx = ctx
+
+	app.reInitChan = make(chan string, 0)
 	app.clusterConfig.SetConfigModifiedCallback(app.shouldChangeLogVerbosity)
 	app.clusterConfig.SetConfigModifiedCallback(app.shouldUpdateConfigurationMetrics)
 
-	app.Run()
+	go app.Run()
+	<-app.reInitChan
 }
 
 func (app *VirtOperatorApp) Run() {
@@ -330,14 +351,14 @@ func (app *VirtOperatorApp) Run() {
 			Addr:      app.ServiceListen.Address(),
 			Handler:   mux,
 			TLSConfig: promTLSConfig,
+			// Disable HTTP/2
+			// See CVE-2023-44487
+			TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 		}
 		if err := server.ListenAndServeTLS("", ""); err != nil {
 			golog.Fatal(err)
 		}
 	}()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	endpointName := VirtOperator
 
@@ -363,8 +384,13 @@ func (app *VirtOperatorApp) Run() {
 
 	apiAuthConfig := app.informerFactory.ApiAuthConfigMap()
 
-	stop := ctx.Done()
+	stop := app.ctx.Done()
 	app.informerFactory.Start(stop)
+
+	stopChan := app.ctx.Done()
+	cache.WaitForCacheSync(stopChan, app.crdInformer.HasSynced, app.kubeVirtInformer.HasSynced)
+	app.clusterConfig.SetConfigModifiedCallback(app.configModificationCallback)
+
 	cache.WaitForCacheSync(stop, apiAuthConfig.HasSynced)
 
 	go app.operatorCertManager.Start()
@@ -385,6 +411,9 @@ func (app *VirtOperatorApp) Run() {
 	mux.HandleFunc(components.KubeVirtUpdateValidatePath, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		validating_webhooks.Serve(w, r, operator_webhooks.NewKubeVirtUpdateAdmitter(app.clientSet, app.clusterConfig))
 	}))
+	mux.HandleFunc(components.KubeVirtCreateValidatePath, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		validating_webhooks.Serve(w, r, operator_webhooks.NewKubeVirtCreateAdmitter(app.clientSet))
+	}))
 	webhookServer.Handler = &mux
 	go func() {
 		err := webhookServer.ListenAndServeTLS("", "")
@@ -404,9 +433,6 @@ func (app *VirtOperatorApp) Run() {
 					leaderGauge.Set(1)
 					log.Log.Infof("Started leading")
 
-					log.Log.V(5).Info("start monitoring the kubevirt-config configMap")
-					app.kubeVirtController.checkIfConfigMapStillExists(log.Log, stop)
-
 					// run app
 					go app.kubeVirtController.Run(controllerThreads, stop)
 				},
@@ -423,9 +449,37 @@ func (app *VirtOperatorApp) Run() {
 
 	readyGauge.Set(1)
 	log.Log.Infof("Attempting to acquire leader status")
-	leaderElector.Run(ctx)
+	leaderElector.Run(app.ctx)
+
 	panic("unreachable")
 
+}
+
+// Detects if ServiceMonitor or PrometheusRule crd has been applied or deleted that
+// re-initializing virt-operator.
+func (app *VirtOperatorApp) configModificationCallback() {
+	msgf := "Reinitialize virt-operator, %s has been %s"
+
+	smEnabled := app.clusterConfig.HasServiceMonitorAPI()
+	if app.stores.ServiceMonitorEnabled != smEnabled {
+		if !app.stores.ServiceMonitorEnabled && smEnabled {
+			log.Log.Infof(msgf, "ServiceMonitor", "introduced")
+		} else {
+			log.Log.Infof(msgf, "ServiceMonitor", "removed")
+		}
+		app.reInitChan <- "reinit"
+		return
+	}
+
+	prEnabled := app.clusterConfig.HasPrometheusRuleAPI()
+	if app.stores.PrometheusRulesEnabled != prEnabled {
+		if !app.stores.PrometheusRulesEnabled && prEnabled {
+			log.Log.Infof(msgf, "PrometheusRule", "introduced")
+		} else {
+			log.Log.Infof(msgf, "PrometheusRule", "removed")
+		}
+		app.reInitChan <- "reinit"
+	}
 }
 
 func (app *VirtOperatorApp) getNewRecorder(namespace string, componentName string) record.EventRecorder {

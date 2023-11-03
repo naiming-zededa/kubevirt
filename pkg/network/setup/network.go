@@ -25,6 +25,7 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 
 	netdriver "kubevirt.io/kubevirt/pkg/network/driver"
+	"kubevirt.io/kubevirt/pkg/network/vmispec"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 )
 
@@ -34,55 +35,41 @@ type VMNetworkConfigurator struct {
 	cacheCreator cacheCreator
 }
 
-func newVMNetworkConfiguratorWithHandlerAndCache(vmi *v1.VirtualMachineInstance, handler netdriver.NetworkHandler, cacheCreator cacheCreator) *VMNetworkConfigurator {
-	return &VMNetworkConfigurator{
+type vmNetConfiguratorOption func(v *VMNetworkConfigurator)
+
+func NewVMNetworkConfigurator(vmi *v1.VirtualMachineInstance, cacheCreator cacheCreator, opts ...vmNetConfiguratorOption) *VMNetworkConfigurator {
+	v := &VMNetworkConfigurator{
 		vmi:          vmi,
-		handler:      handler,
+		handler:      &netdriver.NetworkUtilsHandler{},
 		cacheCreator: cacheCreator,
 	}
-}
-
-func NewVMNetworkConfigurator(vmi *v1.VirtualMachineInstance, cacheCreator cacheCreator) *VMNetworkConfigurator {
-	return newVMNetworkConfiguratorWithHandlerAndCache(vmi, &netdriver.NetworkUtilsHandler{}, cacheCreator)
-}
-
-func (v VMNetworkConfigurator) getPhase1NICs(launcherPID *int, networks []v1.Network) ([]podNIC, error) {
-	var nics []podNIC
-
-	for i := range networks {
-		nic, err := newPhase1PodNIC(v.vmi, &networks[i], v.handler, v.cacheCreator, launcherPID)
-		if err != nil {
-			return nil, err
-		}
-		nics = append(nics, *nic)
+	for _, opt := range opts {
+		opt(v)
 	}
-	return nics, nil
+	return v
 }
 
 func (v VMNetworkConfigurator) getPhase2NICs(domain *api.Domain, networks []v1.Network) ([]podNIC, error) {
 	var nics []podNIC
 
 	for i := range networks {
-		nic, err := newPhase2PodNIC(v.vmi, &networks[i], v.handler, v.cacheCreator, domain)
+		iface := vmispec.LookupInterfaceByName(v.vmi.Spec.Domain.Devices.Interfaces, networks[i].Name)
+		if iface == nil {
+			return nil, fmt.Errorf("no iface matching with network %s", networks[i].Name)
+		}
+
+		// Binding plugin, SR-IOV and Slirp devices are not part of the phases
+		if iface.Binding != nil || iface.SRIOV != nil || iface.Slirp != nil {
+			continue
+		}
+
+		nic, err := newPhase2PodNIC(v.vmi, &networks[i], iface, v.handler, v.cacheCreator, domain)
 		if err != nil {
 			return nil, err
 		}
 		nics = append(nics, *nic)
 	}
 	return nics, nil
-}
-
-func (n *VMNetworkConfigurator) SetupPodNetworkPhase1(launcherPID int, networks []v1.Network) error {
-	nics, err := n.getPhase1NICs(&launcherPID, networks)
-	if err != nil {
-		return err
-	}
-	for _, nic := range nics {
-		if err := nic.PlugPhase1(); err != nil {
-			return fmt.Errorf("failed plugging phase1 at nic '%s': %w", nic.podInterfaceName, err)
-		}
-	}
-	return nil
 }
 
 func (n *VMNetworkConfigurator) SetupPodNetworkPhase2(domain *api.Domain, networks []v1.Network) error {

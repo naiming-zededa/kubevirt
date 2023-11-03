@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"time"
 
+	"kubevirt.io/kubevirt/tests/libmigration"
+
 	"kubevirt.io/kubevirt/tests/decorators"
 	"kubevirt.io/kubevirt/tests/framework/kubevirt"
 
@@ -187,10 +189,10 @@ var _ = SIGDescribe("Macvtap", decorators.Macvtap, func() {
 		It("should be successful when the VMI MAC address is defined in its spec", func() {
 			By("starting the migration")
 			migration := tests.NewRandomMigration(clientVMI.Name, clientVMI.Namespace)
-			migration = tests.RunMigrationAndExpectCompletion(virtClient, migration, tests.MigrationWaitTime)
+			migration = libmigration.RunMigrationAndExpectToCompleteWithDefaultTimeout(virtClient, migration)
 
 			// check VMI, confirm migration state
-			tests.ConfirmVMIPostMigration(virtClient, clientVMI, migration)
+			libmigration.ConfirmVMIPostMigration(virtClient, clientVMI, migration)
 		})
 
 		Context("with live traffic", func() {
@@ -259,13 +261,14 @@ var _ = SIGDescribe("Macvtap", decorators.Macvtap, func() {
 			})
 
 			It("should keep connectivity after a migration", func() {
+				const containerCompletionWaitTime = 60
 				migration := tests.NewRandomMigration(serverVMI.Name, serverVMI.GetNamespace())
-				_ = tests.RunMigrationAndExpectCompletion(virtClient, migration, tests.MigrationWaitTime)
+				_ = libmigration.RunMigrationAndExpectToCompleteWithDefaultTimeout(virtClient, migration)
 				// In case of clientVMI and serverVMI running on the same node before migration, the serverVMI
 				// will be reachable only when the original launcher pod terminates.
 				Eventually(func() error {
 					return waitForPodCompleted(serverVMI.Namespace, serverVMIPodName)
-				}, tests.ContainerCompletionWaitTime, time.Second).Should(Succeed(), fmt.Sprintf("all containers should complete in source virt-launcher pod: %s", serverVMIPodName))
+				}, containerCompletionWaitTime, time.Second).Should(Succeed(), fmt.Sprintf("all containers should complete in source virt-launcher pod: %s", serverVMIPodName))
 				Expect(libnet.PingFromVMConsole(clientVMI, serverIP)).To(Succeed(), "connectivity is expected *after* migrating the VMI")
 			})
 		})

@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"kubevirt.io/kubevirt/tests/decorators"
+	"kubevirt.io/kubevirt/tests/libmigration"
 
 	k8sv1 "k8s.io/api/core/v1"
 
@@ -54,6 +55,7 @@ import (
 	"kubevirt.io/kubevirt/tests"
 	"kubevirt.io/kubevirt/tests/console"
 	"kubevirt.io/kubevirt/tests/libnet"
+	"kubevirt.io/kubevirt/tests/libnet/job"
 	"kubevirt.io/kubevirt/tests/libvmi"
 	"kubevirt.io/kubevirt/tests/libwait"
 )
@@ -130,7 +132,7 @@ var istioTests = func(vmType VmType) {
 			By("Running job to send a request to the server")
 			return virtClient.BatchV1().Jobs(namespace).Create(
 				context.Background(),
-				tests.NewHelloWorldJobHTTP(vmiIP, fmt.Sprintf("%d", targetPort)),
+				job.NewHelloWorldJobHTTP(vmiIP, fmt.Sprintf("%d", targetPort)),
 				metav1.CreateOptions{},
 			)
 		}
@@ -171,16 +173,6 @@ var istioTests = func(vmType VmType) {
 			var (
 				sourcePodName string
 			)
-			migrationCompleted := func(migration *v1.VirtualMachineInstanceMigration) error {
-				migration, err := virtClient.VirtualMachineInstanceMigration(migration.Namespace).Get(migration.Name, &metav1.GetOptions{})
-				if err != nil {
-					return err
-				}
-				if migration.Status.Phase == v1.MigrationSucceeded {
-					return nil
-				}
-				return fmt.Errorf("migration is in phase %s", migration.Status.Phase)
-			}
 			allContainersCompleted := func(podName string) error {
 				pod, err := virtClient.CoreV1().Pods(vmi.Namespace).Get(context.TODO(), podName, metav1.GetOptions{})
 				if err != nil {
@@ -202,16 +194,13 @@ var istioTests = func(vmType VmType) {
 			JustBeforeEach(func() {
 				sourcePodName = tests.GetVmPodName(virtClient, vmi)
 				migration := tests.NewRandomMigration(vmi.Name, vmi.Namespace)
-				migration, err = virtClient.VirtualMachineInstanceMigration(migration.Namespace).Create(migration, &metav1.CreateOptions{})
-				Expect(err).NotTo(HaveOccurred())
-				Eventually(func() error {
-					return migrationCompleted(migration)
-				}, tests.MigrationWaitTime, time.Second).Should(Succeed(), fmt.Sprintf(" migration should succeed"))
+				libmigration.RunMigrationAndExpectToCompleteWithDefaultTimeout(virtClient, migration)
 			})
 			It("All containers should complete in source virt-launcher pod after migration", func() {
+				const containerCompletionWaitTime = 60
 				Eventually(func() error {
 					return allContainersCompleted(sourcePodName)
-				}, tests.ContainerCompletionWaitTime, time.Second).Should(Succeed(), fmt.Sprintf("all containers should complete in source virt-launcher pod"))
+				}, containerCompletionWaitTime, time.Second).Should(Succeed(), fmt.Sprintf("all containers should complete in source virt-launcher pod"))
 			})
 		})
 		Describe("SSH traffic", func() {
@@ -272,12 +261,12 @@ var istioTests = func(vmType VmType) {
 		})
 		Describe("Inbound traffic", func() {
 			checkVMIReachability := func(vmi *v1.VirtualMachineInstance, targetPort int) error {
-				job, err := createJobCheckingVMIReachability(vmi, targetPort)
+				httpJob, err := createJobCheckingVMIReachability(vmi, targetPort)
 				if err != nil {
 					return err
 				}
 				By("Waiting for the job to succeed")
-				return tests.WaitForJobToSucceed(job, 480*time.Second)
+				return job.WaitForJobToSucceed(httpJob, 480*time.Second)
 			}
 
 			Context("With VMI having explicit ports specified", func() {

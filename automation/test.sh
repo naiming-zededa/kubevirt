@@ -402,7 +402,7 @@ if [[ -z ${KUBEVIRT_E2E_FOCUS} && -z ${KUBEVIRT_E2E_SKIP} ]]; then
       add_to_label_filter "(!migration-based-hotplug-NICs)" "&&"
     fi
   elif [[ $TARGET =~ sig-storage ]]; then
-    label_filter='((sig-storage,storage-req) && !sig-compute-migrations)'
+    label_filter='(sig-storage)'
   elif [[ $TARGET =~ vgpu.* ]]; then
     label_filter='(VGPU)'
   elif [[ $TARGET =~ sig-compute-realtime ]]; then
@@ -432,12 +432,6 @@ if [[ -z ${KUBEVIRT_E2E_FOCUS} && -z ${KUBEVIRT_E2E_SKIP} ]]; then
   fi
 fi
 
-if [[ $KUBEVIRT_NONROOT =~ true ]]; then
-  add_to_label_filter '(verify-non-root)' ','
-else
-  add_to_label_filter '(!verify-non-root)' '&&'
-fi
-
 # No lane currently supports loading a custom policy
 add_to_label_filter '(!CustomSELinux)' '&&'
 
@@ -450,11 +444,7 @@ fi
 # If KUBEVIRT_QUARANTINE is not set, do not run quarantined tests. When it is
 # set the whole suite (quarantined and stable) will be run.
 if [ -z "$KUBEVIRT_QUARANTINE" ]; then
-    if [ -n "$KUBEVIRT_E2E_SKIP" ]; then
-        export KUBEVIRT_E2E_SKIP="${KUBEVIRT_E2E_SKIP}|QUARANTINE"
-    else
-        export KUBEVIRT_E2E_SKIP="QUARANTINE"
-    fi
+  add_to_label_filter '(!QUARANTINE)' '&&'
 fi
 
 # Prepare RHEL PV for Template testing

@@ -23,6 +23,7 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
 
+	virtcontroller "kubevirt.io/kubevirt/pkg/controller"
 	"kubevirt.io/kubevirt/pkg/testutils"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 
@@ -113,7 +114,7 @@ var _ = Describe("Workload Updater", func() {
 		kubeVirtInformer, _ = testutils.NewFakeInformerFor(&v1.KubeVirt{})
 		kubeVirtInformer, kubeVirtSource = testutils.NewFakeInformerFor(&v1.KubeVirt{})
 
-		controller = NewWorkloadUpdateController(expectedImage, vmiInformer, podInformer, migrationInformer, kubeVirtInformer, recorder, virtClient, config)
+		controller, _ = NewWorkloadUpdateController(expectedImage, vmiInformer, podInformer, migrationInformer, kubeVirtInformer, recorder, virtClient, config)
 		mockQueue = testutils.NewMockWorkQueue(controller.queue)
 		controller.queue = mockQueue
 		migrationFeeder = testutils.NewMigrationFeeder(mockQueue, migrationSource)
@@ -255,9 +256,15 @@ var _ = Describe("Workload Updater", func() {
 
 		It("should detect in-flight migrations when only migrate VMIs up to the global max migration count", func() {
 			const desiredNumberOfVMs = 50
+			const vmsPendingMigration = int(virtconfig.ParallelMigrationsPerClusterDefault)
 			kv := newKubeVirt(desiredNumberOfVMs)
 			kv.Spec.WorkloadUpdateStrategy.WorkloadUpdateMethods = []v1.WorkloadUpdateMethod{v1.WorkloadUpdateMethodLiveMigrate, v1.WorkloadUpdateMethodEvict}
 			addKubeVirt(kv)
+
+			By("populating with pending migrations that should be ignored while counting the threshold")
+			for i := 0; i < vmsPendingMigration; i++ {
+				migrationFeeder.Add(newMigration(fmt.Sprintf("vmim-pending-%d", i), fmt.Sprintf("testvm-migratable-pending-%d", i), v1.MigrationPending))
+			}
 
 			reasons := []string{}
 			for i := 0; i < desiredNumberOfVMs; i++ {
@@ -276,7 +283,6 @@ var _ = Describe("Workload Updater", func() {
 
 			waitForNumberOfInstancesOnVMIInformerCache(controller, desiredNumberOfVMs)
 
-			//migrationInterface.EXPECT().Create(gomock.Any()).Return(&v1.VirtualMachineInstanceMigration{ObjectMeta: v13.ObjectMeta{Name: "something"}}, nil).AnyTimes()
 			migrationInterface.EXPECT().Create(gomock.Any(), &metav1.CreateOptions{}).Return(&v1.VirtualMachineInstanceMigration{ObjectMeta: v13.ObjectMeta{Name: "something"}}, nil).Times(1)
 
 			controller.Execute()
@@ -435,6 +441,20 @@ var _ = Describe("Workload Updater", func() {
 			Expect(evictionCount).To(Equal(batchDeletions * 2))
 		})
 
+	})
+
+	Context("LiveUpdate features", func() {
+		It("VMI needs to be migrated when memory hotplug is requested", func() {
+			vmi := api.NewMinimalVMI("testvm")
+
+			condition := v1.VirtualMachineInstanceCondition{
+				Type:   v1.VirtualMachineInstanceMemoryChange,
+				Status: k8sv1.ConditionTrue,
+			}
+			virtcontroller.NewVirtualMachineInstanceConditionManager().UpdateCondition(vmi, &condition)
+
+			Expect(controller.doesRequireMigration(vmi)).To(BeTrue())
+		})
 	})
 
 	AfterEach(func() {

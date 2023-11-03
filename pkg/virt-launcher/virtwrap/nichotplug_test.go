@@ -20,11 +20,16 @@
 package virtwrap
 
 import (
+	"encoding/xml"
 	"fmt"
+
+	"kubevirt.io/kubevirt/pkg/network/namescheme"
 
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	"libvirt.org/go/libvirt"
 
 	v1 "kubevirt.io/api/core/v1"
 
@@ -76,9 +81,35 @@ var _ = Describe("nic hotplug on virt-launcher", func() {
 			map[string]api.Interface{networkName: {Alias: api.NewUserDefinedAlias(networkName)}},
 			nil,
 		),
+		Entry("vmi with 1 network marked for removal, pod interface ready and no interfaces in the domain",
+			&v1.VirtualMachineInstance{
+				Spec: v1.VirtualMachineInstanceSpec{
+					Networks: []v1.Network{generateNetwork(networkName, nadName)},
+					Domain: v1.DomainSpec{Devices: v1.Devices{Interfaces: []v1.Interface{{
+						Name:                   networkName,
+						InterfaceBindingMethod: v1.InterfaceBindingMethod{Bridge: &v1.InterfaceBridge{}},
+						State:                  v1.InterfaceStateAbsent,
+					}}}},
+				},
+				Status: v1.VirtualMachineInstanceStatus{
+					Interfaces: []v1.VirtualMachineInstanceNetworkInterface{{
+						Name:       networkName,
+						InfoSource: vmispec.InfoSourceMultusStatus,
+					}},
+				},
+			},
+			map[string]api.Interface{},
+			nil,
+		),
 		Entry("vmi with 1 network (when the pod interface *is* ready), but no interfaces in the domain",
 			&v1.VirtualMachineInstance{
-				Spec: v1.VirtualMachineInstanceSpec{Networks: []v1.Network{generateNetwork(networkName, nadName)}},
+				Spec: v1.VirtualMachineInstanceSpec{
+					Networks: []v1.Network{generateNetwork(networkName, nadName)},
+					Domain: v1.DomainSpec{Devices: v1.Devices{Interfaces: []v1.Interface{{
+						Name:                   networkName,
+						InterfaceBindingMethod: v1.InterfaceBindingMethod{Bridge: &v1.InterfaceBridge{}},
+					}}}},
+				},
 				Status: v1.VirtualMachineInstanceStatus{
 					Interfaces: []v1.VirtualMachineInstanceNetworkInterface{{
 						Name:       networkName,
@@ -88,6 +119,25 @@ var _ = Describe("nic hotplug on virt-launcher", func() {
 			},
 			map[string]api.Interface{},
 			[]v1.Network{generateNetwork(networkName, nadName)},
+		),
+		Entry("vmi with 1 SR-IOV network (when the pod interface is ready) and no interfaces in the domain",
+			&v1.VirtualMachineInstance{
+				Spec: v1.VirtualMachineInstanceSpec{
+					Networks: []v1.Network{generateNetwork(networkName, nadName)},
+					Domain: v1.DomainSpec{Devices: v1.Devices{Interfaces: []v1.Interface{{
+						Name:                   networkName,
+						InterfaceBindingMethod: v1.InterfaceBindingMethod{SRIOV: &v1.InterfaceSRIOV{}},
+					}}}},
+				},
+				Status: v1.VirtualMachineInstanceStatus{
+					Interfaces: []v1.VirtualMachineInstanceNetworkInterface{{
+						Name:       networkName,
+						InfoSource: vmispec.InfoSourceMultusStatus,
+					}},
+				},
+			},
+			map[string]api.Interface{},
+			[]v1.Network{},
 		),
 	)
 
@@ -139,6 +189,124 @@ var _ = Describe("nic hotplug on virt-launcher", func() {
 			libvirtClientResult{expectedError: fmt.Errorf("boom")},
 		),
 	)
+})
+
+var _ = Describe("nic hot-unplug on virt-launcher", func() {
+	const (
+		networkName   = "n1"
+		ordinalDevice = "tap2"
+
+		sriovNetworkName = "n2-sriov"
+	)
+
+	hashedDevice := "tap" + namescheme.GenerateHashedInterfaceName(networkName)[3:]
+
+	DescribeTable("domain interfaces to hot-unplug",
+		func(vmiSpecIfaces []v1.Interface, domainSpecIfaces []api.Interface, expectedDomainSpecIfaces []api.Interface) {
+			Expect(interfacesToHotUnplug(vmiSpecIfaces, domainSpecIfaces)).To(ConsistOf(expectedDomainSpecIfaces))
+		},
+		Entry("given no VMI interfaces and no domain interfaces", nil, nil, nil),
+		Entry("given no VMI interfaces and 1 domain interface",
+			nil,
+			[]api.Interface{{Alias: api.NewUserDefinedAlias(networkName)}},
+			nil,
+		),
+		Entry("given 1 VMI non-absent interface and an associated interface in the domain",
+			[]v1.Interface{{Name: networkName}},
+			[]api.Interface{{Alias: api.NewUserDefinedAlias(networkName)}},
+			nil,
+		),
+		Entry("given 1 VMI absent interface and an associated interface in the domain is using ordinal device",
+			[]v1.Interface{{Name: networkName, State: v1.InterfaceStateAbsent, InterfaceBindingMethod: v1.InterfaceBindingMethod{Bridge: &v1.InterfaceBridge{}}}},
+			[]api.Interface{
+				{Target: &api.InterfaceTarget{Device: ordinalDevice}, Alias: api.NewUserDefinedAlias(networkName)},
+			},
+			nil,
+		),
+		Entry("given 1 VMI absent interface and an associated interface in the domain is using hashed device",
+			[]v1.Interface{{Name: networkName, State: v1.InterfaceStateAbsent, InterfaceBindingMethod: v1.InterfaceBindingMethod{Bridge: &v1.InterfaceBridge{}}}},
+			[]api.Interface{{
+				Target: &api.InterfaceTarget{Device: hashedDevice}, Alias: api.NewUserDefinedAlias(networkName)},
+			},
+			[]api.Interface{
+				{Target: &api.InterfaceTarget{Device: hashedDevice}, Alias: api.NewUserDefinedAlias(networkName)},
+			},
+		),
+	)
+})
+
+var _ = Describe("domain network interfaces resources", func() {
+
+	DescribeTable("are ignored when",
+		func(vmiSpecIfaces []v1.Interface) {
+			vmi := &v1.VirtualMachineInstance{}
+			vmi.Spec.Domain.Devices.Interfaces = vmiSpecIfaces
+			domainSpec := &api.DomainSpec{}
+			countCalls := 0
+			_, _ = withNetworkIfacesResources(vmi, domainSpec, func(v *v1.VirtualMachineInstance, s *api.DomainSpec) (cli.VirDomain, error) {
+				countCalls++
+				return nil, nil
+			})
+			// The counter tracks the tested function behavior.
+			// It is expected that the callback function is called only once when there is no need
+			// to add placeholders interfaces.
+			Expect(countCalls).To(Equal(1))
+		},
+		Entry("no defined interfaces exist", nil),
+		Entry("the reserved interfaces count is less than defined interfaces", []v1.Interface{{}, {}, {}, {}, {}}),
+		Entry("the interface resource-request is equal to the defined interfaces", []v1.Interface{{}, {}, {}, {}}),
+	)
+
+	It("are ignored when placePCIDevicesOnRootComplex annotation is used on the VMI", func() {
+		vmi := &v1.VirtualMachineInstance{}
+		vmi.Annotations = map[string]string{v1.PlacePCIDevicesOnRootComplex: "true"}
+		vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{{}}
+		domainSpec := &api.DomainSpec{}
+		countCalls := 0
+		_, _ = withNetworkIfacesResources(vmi, domainSpec, func(v *v1.VirtualMachineInstance, s *api.DomainSpec) (cli.VirDomain, error) {
+			countCalls++
+			return nil, nil
+		})
+		// The counter tracks the tested function behavior.
+		// It is expected that the callback function is called only once when there is no need
+		// to add placeholders interfaces.
+		Expect(countCalls).To(Equal(1))
+	})
+
+	It("are reserved when the default reserved interfaces count is larger than the defined interfaces", func() {
+		vmi := &v1.VirtualMachineInstance{}
+		vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{{}}
+		domainSpec := &api.DomainSpec{}
+		for range vmi.Spec.Domain.Devices.Interfaces {
+			domainSpec.Devices.Interfaces = append(domainSpec.Devices.Interfaces, api.Interface{})
+		}
+
+		ctrl := gomock.NewController(GinkgoT())
+		mockDomain := cli.NewMockVirDomain(ctrl)
+		domxml, err := xml.MarshalIndent(domainSpec, "", "\t")
+		Expect(err).ToNot(HaveOccurred())
+		mockDomain.EXPECT().GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE).Return(string(domxml), nil)
+
+		originalDomainSpec := domainSpec.DeepCopy()
+		countCalls := 0
+		_, err = withNetworkIfacesResources(vmi, domainSpec, func(v *v1.VirtualMachineInstance, s *api.DomainSpec) (cli.VirDomain, error) {
+			// Tracking the behavior of the tested function.
+			// It is expected that the callback function is called twice when placeholders are needed.
+			// The first time it is called with the placeholders in place.
+			// The second time it is called without the placeholders.
+			countCalls++
+			if countCalls == 1 {
+				Expect(s.Devices.Interfaces).To(HaveLen(ReservedInterfaces))
+			} else {
+				Expect(s.Devices.Interfaces).To(Equal(originalDomainSpec.Devices.Interfaces))
+			}
+
+			return mockDomain, nil
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(countCalls).To(Equal(2))
+		Expect(domainSpec.Devices.Interfaces).To(Equal(originalDomainSpec.Devices.Interfaces))
+	})
 })
 
 type libvirtClientResult struct {

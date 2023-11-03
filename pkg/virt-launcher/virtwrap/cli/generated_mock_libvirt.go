@@ -7,6 +7,7 @@ import (
 	gomock "github.com/golang/mock/gomock"
 	libvirt "libvirt.org/go/libvirt"
 
+	api "kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 	stats "kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/stats"
 )
 
@@ -115,6 +116,16 @@ func (_mr *_MockConnectionRecorder) VolatileDomainEventDeviceRemovedRegister(arg
 	return _mr.mock.ctrl.RecordCall(_mr.mock, "VolatileDomainEventDeviceRemovedRegister", arg0, arg1)
 }
 
+func (_m *MockConnection) DomainEventMemoryDeviceSizeChangeRegister(callback libvirt.DomainEventMemoryDeviceSizeChangeCallback) error {
+	ret := _m.ctrl.Call(_m, "DomainEventMemoryDeviceSizeChangeRegister", callback)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+func (_mr *_MockConnectionRecorder) DomainEventMemoryDeviceSizeChangeRegister(arg0 interface{}) *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "DomainEventMemoryDeviceSizeChangeRegister", arg0)
+}
+
 func (_m *MockConnection) DomainEventDeregister(registrationID int) error {
 	ret := _m.ctrl.Call(_m, "DomainEventDeregister", registrationID)
 	ret0, _ := ret[0].(error)
@@ -197,6 +208,17 @@ func (_m *MockConnection) GetQemuVersion() (string, error) {
 
 func (_mr *_MockConnectionRecorder) GetQemuVersion() *gomock.Call {
 	return _mr.mock.ctrl.RecordCall(_mr.mock, "GetQemuVersion")
+}
+
+func (_m *MockConnection) GetSEVInfo() (*api.SEVNodeParameters, error) {
+	ret := _m.ctrl.Call(_m, "GetSEVInfo")
+	ret0, _ := ret[0].(*api.SEVNodeParameters)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+func (_mr *_MockConnectionRecorder) GetSEVInfo() *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "GetSEVInfo")
 }
 
 // Mock of Stream interface
@@ -374,6 +396,16 @@ func (_m *MockVirDomain) AttachDeviceFlags(xml string, flags libvirt.DomainDevic
 
 func (_mr *_MockVirDomainRecorder) AttachDeviceFlags(arg0, arg1 interface{}) *gomock.Call {
 	return _mr.mock.ctrl.RecordCall(_mr.mock, "AttachDeviceFlags", arg0, arg1)
+}
+
+func (_m *MockVirDomain) UpdateDeviceFlags(xml string, flags libvirt.DomainDeviceModifyFlags) error {
+	ret := _m.ctrl.Call(_m, "UpdateDeviceFlags", xml, flags)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+func (_mr *_MockVirDomainRecorder) UpdateDeviceFlags(arg0, arg1 interface{}) *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "UpdateDeviceFlags", arg0, arg1)
 }
 
 func (_m *MockVirDomain) DetachDevice(xml string) error {
@@ -564,6 +596,27 @@ func (_mr *_MockVirDomainRecorder) SetTime(arg0, arg1, arg2 interface{}) *gomock
 	return _mr.mock.ctrl.RecordCall(_mr.mock, "SetTime", arg0, arg1, arg2)
 }
 
+func (_m *MockVirDomain) AuthorizedSSHKeysGet(user string, flags libvirt.DomainAuthorizedSSHKeysFlags) ([]string, error) {
+	ret := _m.ctrl.Call(_m, "AuthorizedSSHKeysGet", user, flags)
+	ret0, _ := ret[0].([]string)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+func (_mr *_MockVirDomainRecorder) AuthorizedSSHKeysGet(arg0, arg1 interface{}) *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "AuthorizedSSHKeysGet", arg0, arg1)
+}
+
+func (_m *MockVirDomain) AuthorizedSSHKeysSet(user string, keys []string, flags libvirt.DomainAuthorizedSSHKeysFlags) error {
+	ret := _m.ctrl.Call(_m, "AuthorizedSSHKeysSet", user, keys, flags)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+func (_mr *_MockVirDomainRecorder) AuthorizedSSHKeysSet(arg0, arg1, arg2 interface{}) *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "AuthorizedSSHKeysSet", arg0, arg1, arg2)
+}
+
 func (_m *MockVirDomain) AbortJob() error {
 	ret := _m.ctrl.Call(_m, "AbortJob")
 	ret0, _ := ret[0].(error)
@@ -592,4 +645,55 @@ func (_m *MockVirDomain) CoreDumpWithFormat(to string, format libvirt.DomainCore
 
 func (_mr *_MockVirDomainRecorder) CoreDumpWithFormat(arg0, arg1, arg2 interface{}) *gomock.Call {
 	return _mr.mock.ctrl.RecordCall(_mr.mock, "CoreDumpWithFormat", arg0, arg1, arg2)
+}
+
+func (_m *MockVirDomain) PinVcpuFlags(vcpu uint, cpuMap []bool, flags libvirt.DomainModificationImpact) error {
+	ret := _m.ctrl.Call(_m, "PinVcpuFlags", vcpu, cpuMap, flags)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+func (_mr *_MockVirDomainRecorder) PinVcpuFlags(arg0, arg1, arg2 interface{}) *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "PinVcpuFlags", arg0, arg1, arg2)
+}
+
+func (_m *MockVirDomain) PinEmulator(cpumap []bool, flags libvirt.DomainModificationImpact) error {
+	ret := _m.ctrl.Call(_m, "PinEmulator", cpumap, flags)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+func (_mr *_MockVirDomainRecorder) PinEmulator(arg0, arg1 interface{}) *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "PinEmulator", arg0, arg1)
+}
+
+func (_m *MockVirDomain) SetVcpusFlags(vcpu uint, flags libvirt.DomainVcpuFlags) error {
+	ret := _m.ctrl.Call(_m, "SetVcpusFlags", vcpu, flags)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+func (_mr *_MockVirDomainRecorder) SetVcpusFlags(arg0, arg1 interface{}) *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "SetVcpusFlags", arg0, arg1)
+}
+
+func (_m *MockVirDomain) GetLaunchSecurityInfo(flags uint32) (*libvirt.DomainLaunchSecurityParameters, error) {
+	ret := _m.ctrl.Call(_m, "GetLaunchSecurityInfo", flags)
+	ret0, _ := ret[0].(*libvirt.DomainLaunchSecurityParameters)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+func (_mr *_MockVirDomainRecorder) GetLaunchSecurityInfo(arg0 interface{}) *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "GetLaunchSecurityInfo", arg0)
+}
+
+func (_m *MockVirDomain) SetLaunchSecurityState(params *libvirt.DomainLaunchSecurityStateParameters, flags uint32) error {
+	ret := _m.ctrl.Call(_m, "SetLaunchSecurityState", params, flags)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+func (_mr *_MockVirDomainRecorder) SetLaunchSecurityState(arg0, arg1 interface{}) *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "SetLaunchSecurityState", arg0, arg1)
 }

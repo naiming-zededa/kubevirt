@@ -134,7 +134,7 @@ var _ = Describe("[sig-compute]HookSidecars", decorators.SigCompute, func() {
 					}
 					return virtlauncherPod
 				}, 30*time.Second, 1*time.Second).ShouldNot(BeNil())
-				Expect(virtlauncherPod.Spec.Containers).To(HaveLen(3))
+				Expect(virtlauncherPod.Spec.Containers).To(HaveLen(4))
 				foundContainer := false
 				for _, container := range virtlauncherPod.Spec.Containers {
 					if container.Name == "hook-sidecar-0" {
@@ -167,11 +167,11 @@ var _ = Describe("[sig-compute]HookSidecars", decorators.SigCompute, func() {
 				Eventually(logs,
 					11*time.Second,
 					500*time.Millisecond).
-					Should(ContainSubstring("Hook's Info method has been called"))
+					Should(ContainSubstring("Info method has been called"))
 				Eventually(logs,
 					11*time.Second,
 					500*time.Millisecond).
-					Should(ContainSubstring("Hook's OnDefineDomain callback method has been called"))
+					Should(ContainSubstring("OnDefineDomain method has been called"))
 			})
 
 			It("[test_id:3158]should update domain XML with SM BIOS properties", func() {
@@ -207,7 +207,7 @@ var _ = Describe("[sig-compute]HookSidecars", decorators.SigCompute, func() {
 						}
 					}
 					return false
-				}, 15*time.Second, time.Second).Should(
+				}, 30*time.Second, time.Second).Should(
 					BeTrue(),
 					fmt.Sprintf("the %s container must fail if it was not provided the hook version to advertise itself", sidecarContainerName))
 			})

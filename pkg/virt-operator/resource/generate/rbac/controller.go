@@ -113,6 +113,17 @@ func newControllerRole(namespace string) *rbacv1.Role {
 					"watch",
 				},
 			},
+			{
+				APIGroups: []string{
+					"coordination.k8s.io",
+				},
+				Resources: []string{
+					"leases",
+				},
+				Verbs: []string{
+					"get", "list", "watch", "delete", "update", "create", "patch",
+				},
+			},
 		},
 	}
 }
@@ -362,7 +373,8 @@ func newControllerClusterRole() *rbacv1.ClusterRole {
 					"virtualmachineinstances/freeze",
 					"virtualmachineinstances/unfreeze",
 					"virtualmachineinstances/softreboot",
-					"virtualmachineinstances/addinterface",
+					"virtualmachineinstances/sev/setupsession",
+					"virtualmachineinstances/sev/injectlaunchsecret",
 				},
 				Verbs: []string{
 					"update",
@@ -386,9 +398,7 @@ func newControllerClusterRole() *rbacv1.ClusterRole {
 				Resources: []string{
 					"network-attachment-definitions",
 				},
-				Verbs: []string{
-					"get", "list", "watch",
-				},
+				Verbs: []string{"get"},
 			},
 			{
 				APIGroups: []string{
@@ -503,6 +513,18 @@ func newControllerClusterRole() *rbacv1.ClusterRole {
 				},
 				Verbs: []string{
 					"get",
+				},
+			},
+			{
+				APIGroups: []string{
+					"",
+				},
+				Resources: []string{
+					"resourcequotas",
+				},
+				Verbs: []string{
+					"list",
+					"watch",
 				},
 			},
 		},

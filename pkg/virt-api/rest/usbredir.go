@@ -3,7 +3,7 @@ package rest
 import (
 	"fmt"
 
-	restful "github.com/emicklei/go-restful"
+	restful "github.com/emicklei/go-restful/v3"
 	"k8s.io/apimachinery/pkg/api/errors"
 
 	v1 "kubevirt.io/api/core/v1"
@@ -30,6 +30,9 @@ func (app *SubresourceAPIApp) USBRedirRequestHandler(request *restful.Request, r
 func validateVMIForUSBRedir(vmi *v1.VirtualMachineInstance) *errors.StatusError {
 	if vmi.Spec.Domain.Devices.ClientPassthrough == nil {
 		return errors.NewConflict(v1.Resource("virtualmachineinstance"), vmi.Name, fmt.Errorf("Not configured with USB Redirection"))
+	}
+	if !vmi.IsRunning() {
+		return errors.NewBadRequest(vmiNotRunning)
 	}
 	return nil
 }

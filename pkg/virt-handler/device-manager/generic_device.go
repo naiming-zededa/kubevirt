@@ -20,6 +20,7 @@
 package device_manager
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -31,7 +32,6 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
 	"kubevirt.io/client-go/log"
@@ -47,7 +47,6 @@ const (
 
 type Device interface {
 	Start(stop <-chan struct{}) (err error)
-	GetDevicePath() string
 	GetDeviceName() string
 	GetInitialized() bool
 }
@@ -95,10 +94,6 @@ func NewGenericDevicePlugin(deviceName string, devicePath string, maxDevices int
 	}
 
 	return dpi
-}
-
-func (dpi *GenericDevicePlugin) GetDevicePath() string {
-	return dpi.devicePath
 }
 
 func (dpi *GenericDevicePlugin) GetDeviceName() string {

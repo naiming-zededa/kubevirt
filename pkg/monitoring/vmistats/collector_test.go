@@ -29,7 +29,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	k6tv1 "kubevirt.io/api/core/v1"
-	instancetypev1alpha2 "kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 
 	"kubevirt.io/kubevirt/pkg/testutils"
 )
@@ -242,12 +242,24 @@ var _ = Describe("Utility functions", func() {
 				},
 			}
 
-			countMap := co.makeVMICountMetricMap(vmis)
-			Expect(countMap).To(HaveLen(1))
+			ch := make(chan prometheus.Metric, 1)
+			defer close(ch)
+			co.updateVMIsPhase(vmis, ch)
 
-			for metric, count := range countMap {
-				Expect(metric.InstanceType).To(Equal(expected))
-				Expect(count).To(Equal(uint64(1)))
+			Expect(ch).To(HaveLen(1), "Expected 1 metric")
+			result := <-ch
+			dto := &io_prometheus_client.Metric{}
+			result.Write(dto)
+
+			Expect(result).ToNot(BeNil())
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_phase_count"))
+			Expect(dto.Gauge.GetValue()).To(BeEquivalentTo(1))
+			Expect(dto.Label).To(HaveLen(7))
+			for _, pair := range dto.Label {
+				if pair.GetName() == "instance_type" {
+					Expect(pair.GetValue()).To(Equal(expected))
+					return
+				}
 			}
 		},
 			Entry("with no instance type expect <none>", k6tv1.InstancetypeAnnotation, "", "<none>"),
@@ -273,12 +285,24 @@ var _ = Describe("Utility functions", func() {
 				},
 			}
 
-			countMap := co.makeVMICountMetricMap(vmis)
-			Expect(countMap).To(HaveLen(1))
+			ch := make(chan prometheus.Metric, 1)
+			defer close(ch)
+			co.updateVMIsPhase(vmis, ch)
 
-			for metric, count := range countMap {
-				Expect(metric.Preference).To(Equal(expected))
-				Expect(count).To(Equal(uint64(1)))
+			Expect(ch).To(HaveLen(1), "Expected 1 metric")
+			result := <-ch
+			dto := &io_prometheus_client.Metric{}
+			result.Write(dto)
+
+			Expect(result).ToNot(BeNil())
+			Expect(result.Desc().String()).To(ContainSubstring("kubevirt_vmi_phase_count"))
+			Expect(dto.Gauge.GetValue()).To(BeEquivalentTo(1))
+			Expect(dto.Label).To(HaveLen(7))
+			for _, pair := range dto.Label {
+				if pair.GetName() == "preference" {
+					Expect(pair.GetValue()).To(Equal(expected))
+					return
+				}
 			}
 		},
 			Entry("with no preference expect <none>", k6tv1.PreferenceAnnotation, "", "<none>"),
@@ -292,33 +316,33 @@ var _ = Describe("Utility functions", func() {
 })
 
 func setupTestVMICollector() *VMICollector {
-	instanceTypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineInstancetype{})
-	clusterInstanceTypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineClusterInstancetype{})
-	preferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachinePreference{})
-	clusterPreferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1alpha2.VirtualMachineClusterPreference{})
+	instanceTypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineInstancetype{})
+	clusterInstanceTypeInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineClusterInstancetype{})
+	preferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachinePreference{})
+	clusterPreferenceInformer, _ := testutils.NewFakeInformerFor(&instancetypev1beta1.VirtualMachineClusterPreference{})
 
-	_ = instanceTypeInformer.GetStore().Add(&instancetypev1alpha2.VirtualMachineInstancetype{
+	_ = instanceTypeInformer.GetStore().Add(&instancetypev1beta1.VirtualMachineInstancetype{
 		ObjectMeta: newObjectMetaForInstancetypes("i-managed", "kubevirt.io"),
 	})
-	_ = instanceTypeInformer.GetStore().Add(&instancetypev1alpha2.VirtualMachineInstancetype{
+	_ = instanceTypeInformer.GetStore().Add(&instancetypev1beta1.VirtualMachineInstancetype{
 		ObjectMeta: newObjectMetaForInstancetypes("i-unmanaged", "some-user"),
 	})
 
-	_ = clusterInstanceTypeInformer.GetStore().Add(&instancetypev1alpha2.VirtualMachineClusterInstancetype{
+	_ = clusterInstanceTypeInformer.GetStore().Add(&instancetypev1beta1.VirtualMachineClusterInstancetype{
 		ObjectMeta: newObjectMetaForInstancetypes("ci-managed", "kubevirt.io"),
 	})
-	_ = clusterInstanceTypeInformer.GetStore().Add(&instancetypev1alpha2.VirtualMachineClusterInstancetype{
+	_ = clusterInstanceTypeInformer.GetStore().Add(&instancetypev1beta1.VirtualMachineClusterInstancetype{
 		ObjectMeta: newObjectMetaForInstancetypes("ci-unmanaged", ""),
 	})
 
-	_ = preferenceInformer.GetStore().Add(&instancetypev1alpha2.VirtualMachinePreference{
+	_ = preferenceInformer.GetStore().Add(&instancetypev1beta1.VirtualMachinePreference{
 		ObjectMeta: newObjectMetaForInstancetypes("p-managed", "kubevirt.io"),
 	})
-	_ = preferenceInformer.GetStore().Add(&instancetypev1alpha2.VirtualMachinePreference{
+	_ = preferenceInformer.GetStore().Add(&instancetypev1beta1.VirtualMachinePreference{
 		ObjectMeta: newObjectMetaForInstancetypes("p-unmanaged", "some-vendor.com"),
 	})
 
-	_ = clusterPreferenceInformer.GetStore().Add(&instancetypev1alpha2.VirtualMachineClusterPreference{
+	_ = clusterPreferenceInformer.GetStore().Add(&instancetypev1beta1.VirtualMachineClusterPreference{
 		ObjectMeta: newObjectMetaForInstancetypes("cp-managed", "kubevirt.io"),
 	})
 

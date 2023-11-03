@@ -27,7 +27,10 @@ import (
 	"strings"
 	"time"
 
+	"kubevirt.io/kubevirt/tests/libmigration"
+
 	"kubevirt.io/kubevirt/tests/decorators"
+	"kubevirt.io/kubevirt/tests/libnet/job"
 
 	"kubevirt.io/kubevirt/tests/libnode"
 
@@ -53,10 +56,12 @@ import (
 	"kubevirt.io/client-go/kubecli"
 	"kubevirt.io/client-go/log"
 
+	"kubevirt.io/kubevirt/pkg/network/netbinding"
 	"kubevirt.io/kubevirt/pkg/virt-controller/services"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 	"kubevirt.io/kubevirt/tests"
 	"kubevirt.io/kubevirt/tests/console"
+	"kubevirt.io/kubevirt/tests/events"
 	"kubevirt.io/kubevirt/tests/flags"
 	"kubevirt.io/kubevirt/tests/libnet"
 	"kubevirt.io/kubevirt/tests/libvmi"
@@ -236,8 +241,8 @@ var _ = SIGDescribe("[rfe_id:694][crit:medium][vendor:cnv-qe@redhat.com][level:c
 					Skip("Skip network test that requires multiple nodes when only one node is present.")
 				}
 
-				job := tests.NewHelloWorldJobTCP(ip, strconv.Itoa(testPort))
-				job.Spec.Template.Spec.Affinity = &k8sv1.Affinity{
+				tcpJob := job.NewHelloWorldJobTCP(ip, strconv.Itoa(testPort))
+				tcpJob.Spec.Template.Spec.Affinity = &k8sv1.Affinity{
 					NodeAffinity: &k8sv1.NodeAffinity{
 						RequiredDuringSchedulingIgnoredDuringExecution: &k8sv1.NodeSelector{
 							NodeSelectorTerms: []k8sv1.NodeSelectorTerm{
@@ -250,11 +255,11 @@ var _ = SIGDescribe("[rfe_id:694][crit:medium][vendor:cnv-qe@redhat.com][level:c
 						},
 					},
 				}
-				job.Spec.Template.Spec.HostNetwork = hostNetwork
+				tcpJob.Spec.Template.Spec.HostNetwork = hostNetwork
 
-				job, err = virtClient.BatchV1().Jobs(inboundVMI.ObjectMeta.Namespace).Create(context.Background(), job, metav1.CreateOptions{})
+				tcpJob, err = virtClient.BatchV1().Jobs(inboundVMI.ObjectMeta.Namespace).Create(context.Background(), tcpJob, metav1.CreateOptions{})
 				Expect(err).ToNot(HaveOccurred())
-				Expect(tests.WaitForJobToSucceed(job, 90*time.Second)).To(Succeed())
+				Expect(job.WaitForJobToSucceed(tcpJob, 90*time.Second)).To(Succeed())
 			},
 				Entry("[test_id:1543]on the same node from Pod", k8sv1.NodeSelectorOpIn, false),
 				Entry("[test_id:1544]on a different node from Pod", k8sv1.NodeSelectorOpNotIn, false),
@@ -414,8 +419,13 @@ var _ = SIGDescribe("[rfe_id:694][crit:medium][vendor:cnv-qe@redhat.com][level:c
 			deadbeafVMI, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), deadbeafVMI)
 			Expect(err).ToNot(HaveOccurred())
 
-			libwait.WaitUntilVMIReady(deadbeafVMI, console.LoginToAlpine)
+			const unregisterSlipImageWarning = "no Slirp network binding plugin image is set in Kubevirt config, using " +
+				"'quay.io/kubevirt/network-slirp-binding:20230830_638c60fc8' sidecar image for Slirp network binding configuration"
+			warnings := append(testsuite.TestRunConfiguration.WarningToIgnoreList, unregisterSlipImageWarning)
+			libwait.WaitUntilVMIReady(deadbeafVMI, console.LoginToAlpine, libwait.WithWarningsIgnoreList(warnings))
 			checkMacAddress(deadbeafVMI, deadbeafVMI.Spec.Domain.Devices.Interfaces[0].MacAddress)
+
+			events.ExpectEvent(deadbeafVMI, k8sv1.EventTypeWarning, netbinding.UnregisteredNetworkBindingPluginReason)
 		})
 	})
 
@@ -512,7 +522,7 @@ var _ = SIGDescribe("[rfe_id:694][crit:medium][vendor:cnv-qe@redhat.com][level:c
 	It("VMI with an interface that has ACPI Index set", func() {
 		const acpiIndex = 101
 		const pciAddress = "0000:01:00.0"
-		iface := *v1.DefaultBridgeNetworkInterface()
+		iface := *v1.DefaultMasqueradeNetworkInterface()
 		iface.ACPIIndex = acpiIndex
 		iface.PciAddress = pciAddress
 		testVMI := libvmi.NewAlpine(
@@ -895,7 +905,7 @@ var _ = SIGDescribe("[rfe_id:694][crit:medium][vendor:cnv-qe@redhat.com][level:c
 
 				By("starting the migration")
 				migration := tests.NewRandomMigration(vmi.Name, vmi.Namespace)
-				tests.RunMigrationAndExpectCompletion(virtClient, migration, tests.MigrationWaitTime)
+				libmigration.RunMigrationAndExpectToCompleteWithDefaultTimeout(virtClient, migration)
 
 				vmi, err = virtClient.VirtualMachineInstance(vmi.Namespace).Get(context.Background(), vmi.Name, &metav1.GetOptions{})
 				Expect(err).ToNot(HaveOccurred())
@@ -937,7 +947,7 @@ var _ = SIGDescribe("[rfe_id:694][crit:medium][vendor:cnv-qe@redhat.com][level:c
 
 				By("starting the migration")
 				migration := tests.NewRandomMigration(vmi.Name, vmi.Namespace)
-				tests.RunMigrationAndExpectCompletion(virtClient, migration, tests.MigrationWaitTime)
+				libmigration.RunMigrationAndExpectToCompleteWithDefaultTimeout(virtClient, migration)
 
 				vmi, err = virtClient.VirtualMachineInstance(vmi.Namespace).Get(context.Background(), vmi.Name, &metav1.GetOptions{})
 				Expect(err).ToNot(HaveOccurred())

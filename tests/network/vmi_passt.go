@@ -61,9 +61,17 @@ var _ = SIGDescribe("[Serial] Passt", decorators.PasstGate, Serial, func() {
 
 	Context("VirtualMachineInstance with passt binding mechanism", func() {
 
-		It("should report the IP to the status", func() {
+		It("should apply the interface configuration", func() {
+			const testMACAddr = "02:02:02:02:02:02"
+			const testPCIAddr = "0000:01:00.0"
 			vmi := libvmi.NewAlpineWithTestTooling(
-				libvmi.WithPasstInterfaceWithPort(),
+				libvmi.WithInterface(v1.Interface{
+					Name:                   libvmi.DefaultInterfaceName,
+					InterfaceBindingMethod: v1.InterfaceBindingMethod{Passt: &v1.InterfacePasst{}},
+					Ports:                  []v1.Port{{Port: 1234, Protocol: "TCP"}},
+					MacAddress:             testMACAddr,
+					PciAddress:             testPCIAddr,
+				}),
 				libvmi.WithNetwork(v1.DefaultPodNetwork()),
 			)
 
@@ -74,6 +82,11 @@ var _ = SIGDescribe("[Serial] Passt", decorators.PasstGate, Serial, func() {
 			Expect(vmi.Status.Interfaces).To(HaveLen(1))
 			Expect(vmi.Status.Interfaces[0].IPs).NotTo(BeEmpty())
 			Expect(vmi.Status.Interfaces[0].IP).NotTo(BeEmpty())
+			Expect(vmi.Status.Interfaces[0].MAC).To(Equal(testMACAddr))
+
+			guestIfaceName := vmi.Status.Interfaces[0].InterfaceName
+			cmd := fmt.Sprintf("ls /sys/bus/pci/devices/%s/virtio0/net/%s", testPCIAddr, guestIfaceName)
+			Expect(console.RunCommand(vmi, cmd, time.Second*5)).To(Succeed())
 		})
 
 		Context("should allow regular network connection", func() {
@@ -89,7 +102,11 @@ var _ = SIGDescribe("[Serial] Passt", decorators.PasstGate, Serial, func() {
 
 					serverVMI, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), serverVMI)
 					Expect(err).ToNot(HaveOccurred())
-					serverVMI = libwait.WaitForSuccessfulVMIStartIgnoreWarnings(serverVMI)
+					serverVMI = libwait.WaitForSuccessfulVMIStart(
+						serverVMI,
+						libwait.WithFailOnWarnings(false),
+						libwait.WithTimeout(180),
+					)
 					Expect(console.LoginToAlpine(serverVMI)).To(Succeed())
 				}
 
@@ -136,7 +153,10 @@ var _ = SIGDescribe("[Serial] Passt", decorators.PasstGate, Serial, func() {
 
 						clientVMI, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), clientVMI)
 						Expect(err).ToNot(HaveOccurred())
-						clientVMI = libwait.WaitForSuccessfulVMIStartIgnoreWarnings(clientVMI)
+						clientVMI = libwait.WaitForSuccessfulVMIStart(clientVMI,
+							libwait.WithFailOnWarnings(false),
+							libwait.WithTimeout(180),
+						)
 						Expect(console.LoginToAlpine(clientVMI)).To(Succeed())
 					}
 					DescribeTable("Client server connectivity", func(ports []v1.Port, tcpPort int, ipFamily k8sv1.IPFamily) {
@@ -208,7 +228,10 @@ EOL`, inetSuffix, serverIP, serverPort)
 
 						By("Starting server VMI")
 						startServerVMI([]v1.Port{{Port: SERVER_PORT, Protocol: "UDP"}})
-						serverVMI = libwait.WaitForSuccessfulVMIStartIgnoreWarnings(serverVMI)
+						serverVMI = libwait.WaitForSuccessfulVMIStart(serverVMI,
+							libwait.WithFailOnWarnings(false),
+							libwait.WithTimeout(180),
+						)
 						Expect(console.LoginToAlpine(serverVMI)).To(Succeed())
 
 						By("Starting a UDP server")
@@ -221,7 +244,10 @@ EOL`, inetSuffix, serverIP, serverPort)
 						)
 						clientVMI, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), clientVMI)
 						Expect(err).ToNot(HaveOccurred())
-						clientVMI = libwait.WaitForSuccessfulVMIStartIgnoreWarnings(clientVMI)
+						clientVMI = libwait.WaitForSuccessfulVMIStart(clientVMI,
+							libwait.WithFailOnWarnings(false),
+							libwait.WithTimeout(180),
+						)
 						Expect(console.LoginToAlpine(clientVMI)).To(Succeed())
 
 						By("Starting and verifying UDP client")
@@ -257,7 +283,10 @@ EOL`, inetSuffix, serverIP, serverPort)
 				)
 				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), vmi)
 				Expect(err).ToNot(HaveOccurred())
-				vmi = libwait.WaitForSuccessfulVMIStartIgnoreWarnings(vmi)
+				vmi = libwait.WaitForSuccessfulVMIStart(vmi,
+					libwait.WithFailOnWarnings(false),
+					libwait.WithTimeout(180),
+				)
 				Expect(console.LoginToAlpine(vmi)).To(Succeed())
 
 				By("Checking ping (IPv4)")
@@ -282,7 +311,10 @@ EOL`, inetSuffix, serverIP, serverPort)
 				Expect(err).ToNot(HaveOccurred())
 				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), vmi)
 				Expect(err).ToNot(HaveOccurred())
-				vmi = libwait.WaitForSuccessfulVMIStartIgnoreWarnings(vmi)
+				vmi = libwait.WaitForSuccessfulVMIStart(vmi,
+					libwait.WithFailOnWarnings(false),
+					libwait.WithTimeout(180),
+				)
 				Expect(console.LoginToAlpine(vmi)).To(Succeed())
 
 				By("Checking ping (IPv6) from VM to cluster nodes gateway")

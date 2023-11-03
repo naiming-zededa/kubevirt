@@ -26,6 +26,8 @@ import (
 	"strings"
 	"time"
 
+	"kubevirt.io/kubevirt/tests/libmigration"
+
 	"kubevirt.io/kubevirt/tests/decorators"
 
 	"kubevirt.io/kubevirt/tests/framework/checks"
@@ -132,7 +134,7 @@ var _ = Describe("[Serial][sig-compute]SwapTest", Serial, decorators.SigCompute,
 	}
 
 	getAffinityForTargetNode := func(targetNode *v1.Node) (nodeAffinity *v1.Affinity, err error) {
-		nodeAffinityRuleForVmiToFill, err := affinityToMigrateFromSourceToTargetAndBack(targetNode, targetNode)
+		nodeAffinityRuleForVmiToFill, err := libmigration.CreateNodeAffinityRuleToMigrateFromSourceToTargetAndBack(targetNode, targetNode)
 		return &v1.Affinity{
 			NodeAffinity: nodeAffinityRuleForVmiToFill,
 		}, err
@@ -147,7 +149,6 @@ var _ = Describe("[Serial][sig-compute]SwapTest", Serial, decorators.SigCompute,
 		Expect(len(nodes.Items)).To(BeNumerically(">", 1),
 			"should have at least two schedulable nodes in the cluster")
 
-		checks.SkipIfVersionBelow("swap requires v1.22 and above", k8sSwapVer)
 		skipIfSwapOff(fmt.Sprintf("swap should be enabled through env var: KUBEVIRT_SWAP_ON=true "+
 			"and contain at least %dMi in the nodes when running these tests", maxSwapSizeToUseKib/bytesInKib))
 
@@ -155,7 +156,7 @@ var _ = Describe("[Serial][sig-compute]SwapTest", Serial, decorators.SigCompute,
 
 	Context("Migration to/from memory overcommitted nodes", decorators.SigComputeMigrations, func() {
 		It("Postcopy Migration of vmi that is dirtying(stress-ng) more memory than the source node's memory", func() {
-			sourceNode, targetNode, err := getValidSourceNodeAndTargetNodeForHostModelMigration(virtClient)
+			sourceNode, targetNode, err := libmigration.GetValidSourceNodeAndTargetNodeForHostModelMigration(virtClient)
 			Expect(err).ToNot(HaveOccurred(), "should be able to get valid source and target nodes for migartion")
 			totalMemKib := getTotalMemSizeInKib(*sourceNode)
 			availableMemSizeKib := getAvailableMemSizeInKib(*sourceNode)
@@ -179,8 +180,8 @@ var _ = Describe("[Serial][sig-compute]SwapTest", Serial, decorators.SigCompute,
 			//The vmi should have more memory than memToUseInTheVmKib
 			vmiMemSizeMi := resource.MustParse(fmt.Sprintf("%dMi", int((float64(memToUseInTheVmKib)+float64(gigbytesInkib*2))/bytesInKib)))
 
-			vmi := tests.NewRandomFedoraVMIWithGuestAgent()
-			nodeAffinityRule, err := affinityToMigrateFromSourceToTargetAndBack(sourceNode, targetNode)
+			vmi := tests.NewRandomFedoraVMI()
+			nodeAffinityRule, err := libmigration.CreateNodeAffinityRuleToMigrateFromSourceToTargetAndBack(sourceNode, targetNode)
 			Expect(err).ToNot(HaveOccurred())
 			vmi.Spec.Affinity = &v1.Affinity{
 				NodeAffinity: nodeAffinityRule,
@@ -205,10 +206,10 @@ var _ = Describe("[Serial][sig-compute]SwapTest", Serial, decorators.SigCompute,
 			// execute a migration, wait for finalized state
 			By("Starting the Migration")
 			migration := tests.NewRandomMigration(vmi.Name, vmi.Namespace)
-			migration = tests.RunMigrationAndExpectCompletion(virtClient, migration, tests.MigrationWaitTime*2)
+			migration = libmigration.RunMigrationAndExpectToComplete(virtClient, migration, libmigration.MigrationWaitTime*2)
 
 			// check VMI, confirm migration state
-			tests.ConfirmVMIPostMigration(virtClient, vmi, migration)
+			libmigration.ConfirmVMIPostMigration(virtClient, vmi, migration)
 			confirmMigrationMode(vmi, virtv1.MigrationPostCopy)
 			Expect(console.LoginToFedora(vmi)).To(Succeed())
 
@@ -225,7 +226,7 @@ var _ = Describe("[Serial][sig-compute]SwapTest", Serial, decorators.SigCompute,
 		})
 
 		It("Migration of vmi to memory overcommited node", func() {
-			sourceNode, targetNode, err := getValidSourceNodeAndTargetNodeForHostModelMigration(virtClient)
+			sourceNode, targetNode, err := libmigration.GetValidSourceNodeAndTargetNodeForHostModelMigration(virtClient)
 			Expect(err).ToNot(HaveOccurred(), "should be able to get valid source and target nodes for migartion")
 			vmMemoryRequestkib := 512000
 			availableMemSizeKib := getAvailableMemSizeInKib(*targetNode)
@@ -238,7 +239,7 @@ var _ = Describe("[Serial][sig-compute]SwapTest", Serial, decorators.SigCompute,
 			//The vmi should have more memory than memToUseInTheVm
 			vmiMemSize := resource.MustParse(fmt.Sprintf("%dMi", int((float64(memToUseInTargetNodeVmKib)+float64(gigbytesInkib*2))/bytesInKib)))
 			vmiMemReq := resource.MustParse(fmt.Sprintf("%dMi", vmMemoryRequestkib/bytesInKib))
-			vmiToFillTargetNodeMem := tests.NewRandomFedoraVMIWithGuestAgent()
+			vmiToFillTargetNodeMem := tests.NewRandomFedoraVMI()
 			//we want vmiToFillTargetNodeMem to land on the target node to achieve memory-overcommitment in target
 			affinityRuleForVmiToFill, err := getAffinityForTargetNode(targetNode)
 			Expect(err).ToNot(HaveOccurred())
@@ -255,8 +256,8 @@ var _ = Describe("[Serial][sig-compute]SwapTest", Serial, decorators.SigCompute,
 			err = fillMemWithStressFedoraVMI(vmiToFillTargetNodeMem, memToUseInTargetNodeVmKib)
 			ExpectWithOffset(1, err).ToNot(HaveOccurred())
 
-			vmiToMigrate := tests.NewRandomFedoraVMIWithGuestAgent()
-			nodeAffinityRule, err := affinityToMigrateFromSourceToTargetAndBack(sourceNode, targetNode)
+			vmiToMigrate := tests.NewRandomFedoraVMI()
+			nodeAffinityRule, err := libmigration.CreateNodeAffinityRuleToMigrateFromSourceToTargetAndBack(sourceNode, targetNode)
 			Expect(err).ToNot(HaveOccurred())
 			vmiToMigrate.Spec.Affinity = &v1.Affinity{
 				NodeAffinity: nodeAffinityRule,
@@ -271,7 +272,7 @@ var _ = Describe("[Serial][sig-compute]SwapTest", Serial, decorators.SigCompute,
 			// execute a migration, wait for finalized state
 			By("Starting the Migration")
 			migration := tests.NewRandomMigration(vmiToMigrate.Name, vmiToMigrate.Namespace)
-			tests.RunMigrationAndExpectCompletion(virtClient, migration, tests.MigrationWaitTime)
+			libmigration.RunMigrationAndExpectToCompleteWithDefaultTimeout(virtClient, migration)
 
 			By("The workloads in the node should consume more memory than the memory size eventually.")
 			swapSizeKib := getSwapSizeInKib(*targetNode)

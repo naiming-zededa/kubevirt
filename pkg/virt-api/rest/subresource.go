@@ -30,7 +30,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/emicklei/go-restful"
+	"github.com/emicklei/go-restful/v3"
 	v12 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -41,6 +41,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/utils/pointer"
 
 	"kubevirt.io/kubevirt/pkg/util/status"
 
@@ -65,13 +66,16 @@ const (
 	jsonpatchTestErr             = "jsonpatch test operation does not apply"
 	patchingVMStatusFmt          = "Patching VM status: %s"
 	vmiNotRunning                = "VMI is not running"
+	vmiNotPaused                 = "VMI is not paused"
 	vmiGuestAgentErr             = "VMI does not have guest agent connected"
+	vmiNoAttestationErr          = "Attestation not requested for VMI"
 	prepConnectionErrFmt         = "Cannot prepare connection %s"
 	getRequestErrFmt             = "Cannot GET request %s"
 	pvcVolumeModeErr             = "pvc should be filesystem pvc"
 	pvcAccessModeErr             = "pvc access mode can't be read only"
 	pvcSizeErrFmt                = "pvc size [%s] should be bigger then [%s]"
 	memoryDumpNameConflictErr    = "can't request memory dump for pvc [%s] while pvc [%s] is still associated as the memory dump pvc"
+	featureGateDisabledErrFmt    = "'%s' feature gate is not enabled"
 	defaultProfilerComponentPort = 8443
 )
 
@@ -201,8 +205,8 @@ func getTargetInterfaceIP(vmi *v1.VirtualMachineInstance) (string, error) {
 }
 
 func (app *SubresourceAPIApp) getVirtHandlerConnForVMI(vmi *v1.VirtualMachineInstance) (kubecli.VirtHandlerConn, error) {
-	if !vmi.IsRunning() {
-		return nil, goerror.New(fmt.Sprintf("Unable to connect to VirtualMachineInstance because phase is %s instead of %s", vmi.Status.Phase, v1.Running))
+	if !vmi.IsRunning() && !vmi.IsScheduled() {
+		return nil, goerror.New(fmt.Sprintf("Unable to connect to VirtualMachineInstance because phase is %s instead of %s or %s", vmi.Status.Phase, v1.Running, v1.Scheduled))
 	}
 	return kubecli.NewVirtHandlerClient(app.virtCli, app.handlerHttpClient).Port(app.consoleServerPort).ForNode(vmi.Status.NodeName), nil
 }
@@ -439,8 +443,8 @@ func (app *SubresourceAPIApp) RestartVMRequestHandler(request *restful.Request, 
 				response.WriteHeader(http.StatusAccepted)
 				return
 			}
-			// set terminationGracePeriod and delete the VMI pod to trigger a forced restart
-			err = app.virtCli.CoreV1().Pods(namespace).Delete(context.Background(), vmiPodname, k8smetav1.DeleteOptions{GracePeriodSeconds: bodyStruct.GracePeriodSeconds})
+			// set terminationGracePeriod to 1 (which is the shorted safe restart period) and delete the VMI pod to trigger a swift restart.
+			err = app.virtCli.CoreV1().Pods(namespace).Delete(context.Background(), vmiPodname, k8smetav1.DeleteOptions{GracePeriodSeconds: pointer.Int64(1)})
 			if err != nil {
 				if !errors.IsNotFound(err) {
 					writeError(errors.NewInternalError(err), response)
@@ -748,11 +752,11 @@ func (app *SubresourceAPIApp) UnpauseVMIRequestHandler(request *restful.Request,
 
 	validate := func(vmi *v1.VirtualMachineInstance) *errors.StatusError {
 		if vmi.Status.Phase != v1.Running {
-			return errors.NewConflict(v1.Resource("virtualmachineinstance"), vmi.Name, fmt.Errorf("VMI is not paused"))
+			return errors.NewConflict(v1.Resource("virtualmachineinstance"), vmi.Name, fmt.Errorf(vmiNotRunning))
 		}
 		condManager := controller.NewVirtualMachineInstanceConditionManager()
 		if !condManager.HasCondition(vmi, v1.VirtualMachineInstancePaused) {
-			return errors.NewConflict(v1.Resource("virtualmachineinstance"), vmi.Name, fmt.Errorf("VMI is not paused"))
+			return errors.NewConflict(v1.Resource("virtualmachineinstance"), vmi.Name, fmt.Errorf(vmiNotPaused))
 		}
 		return nil
 	}
@@ -1282,7 +1286,7 @@ func (app *SubresourceAPIApp) vmiVolumePatch(name, namespace string, volumeReque
 	dryRunOption := app.getDryRunOption(volumeRequest)
 	log.Log.Object(vmi).V(4).Infof("Patching VMI: %s", patch)
 	if _, err := app.virtCli.VirtualMachineInstance(vmi.Namespace).Patch(context.Background(), vmi.Name, types.JSONPatchType, []byte(patch), &k8smetav1.PatchOptions{DryRun: dryRunOption}); err != nil {
-		log.Log.Object(vmi).V(1).Errorf("unable to patch vmi: %v", err)
+		log.Log.Object(vmi).Errorf("unable to patch vmi: %v", err)
 		if errors.IsInvalid(err) {
 			if statErr, ok := err.(*errors.StatusError); ok {
 				return statErr
@@ -1312,7 +1316,7 @@ func (app *SubresourceAPIApp) vmVolumePatchStatus(name, namespace string, volume
 	dryRunOption := app.getDryRunOption(volumeRequest)
 	log.Log.Object(vm).V(4).Infof(patchingVMFmt, patch)
 	if err := app.statusUpdater.PatchStatus(vm, types.JSONPatchType, []byte(patch), &k8smetav1.PatchOptions{DryRun: dryRunOption}); err != nil {
-		log.Log.Object(vm).V(1).Errorf("unable to patch vm status: %v", err)
+		log.Log.Object(vm).Errorf("unable to patch vm status: %v", err)
 		if errors.IsInvalid(err) {
 			if statErr, ok := err.(*errors.StatusError); ok {
 				return statErr
@@ -1527,7 +1531,7 @@ func (app *SubresourceAPIApp) vmMemoryDumpRequestPatchStatus(name, namespace str
 
 	log.Log.Object(vm).V(4).Infof(patchingVMFmt, patch)
 	if err := app.statusUpdater.PatchStatus(vm, types.JSONPatchType, []byte(patch), &k8smetav1.PatchOptions{}); err != nil {
-		log.Log.Object(vm).V(1).Errorf("unable to patch vm status: %v", err)
+		log.Log.Object(vm).Errorf("unable to patch vm status: %v", err)
 		if errors.IsInvalid(err) {
 			if statErr, ok := err.(*errors.StatusError); ok {
 				return statErr
@@ -1588,4 +1592,150 @@ func (app *SubresourceAPIApp) RemoveMemoryDumpVMRequestHandler(request *restful.
 	}
 
 	response.WriteHeader(http.StatusAccepted)
+}
+
+func (app *SubresourceAPIApp) ensureSEVEnabled(response *restful.Response) bool {
+	if !app.clusterConfig.WorkloadEncryptionSEVEnabled() {
+		writeError(errors.NewBadRequest(fmt.Sprintf(featureGateDisabledErrFmt, virtconfig.WorkloadEncryptionSEV)), response)
+		return false
+	}
+	return true
+}
+
+func (app *SubresourceAPIApp) SEVFetchCertChainRequestHandler(request *restful.Request, response *restful.Response) {
+	if !app.ensureSEVEnabled(response) {
+		return
+	}
+
+	validate := func(vmi *v1.VirtualMachineInstance) *errors.StatusError {
+		if !vmi.IsScheduled() && !vmi.IsRunning() {
+			return errors.NewConflict(v1.Resource("virtualmachineinstance"), vmi.Name, fmt.Errorf("VMI is not assigned to a node yet"))
+		}
+		if !kutil.IsSEVAttestationRequested(vmi) {
+			return errors.NewConflict(v1.Resource("virtualmachineinstance"), vmi.Name, fmt.Errorf(vmiNoAttestationErr))
+		}
+		return nil
+	}
+
+	getURL := func(vmi *v1.VirtualMachineInstance, conn kubecli.VirtHandlerConn) (string, error) {
+		return conn.SEVFetchCertChainURI(vmi)
+	}
+
+	app.httpGetRequestHandler(request, response, validate, getURL, v1.SEVPlatformInfo{})
+}
+
+func (app *SubresourceAPIApp) SEVQueryLaunchMeasurementHandler(request *restful.Request, response *restful.Response) {
+	if !app.ensureSEVEnabled(response) {
+		return
+	}
+
+	getURL := func(vmi *v1.VirtualMachineInstance, conn kubecli.VirtHandlerConn) (string, error) {
+		return conn.SEVQueryLaunchMeasurementURI(vmi)
+	}
+
+	app.httpGetRequestHandler(request, response, validateVMIForSEVAttestation, getURL, v1.SEVMeasurementInfo{})
+}
+
+func (app *SubresourceAPIApp) SEVSetupSessionHandler(request *restful.Request, response *restful.Response) {
+	if !app.ensureSEVEnabled(response) {
+		return
+	}
+
+	if request.Request.Body == nil {
+		writeError(errors.NewBadRequest("Request with no body: SEV session parameters are required"), response)
+		return
+	}
+
+	opts := &v1.SEVSessionOptions{}
+	err := yaml.NewYAMLOrJSONDecoder(request.Request.Body, 1024).Decode(opts)
+	switch err {
+	case io.EOF, nil:
+		break
+	default:
+		writeError(errors.NewBadRequest(fmt.Sprintf(unmarshalRequestErrFmt, err)), response)
+		return
+	}
+
+	if opts.Session == "" {
+		writeError(errors.NewBadRequest("Session blob is required"), response)
+		return
+	}
+
+	if opts.DHCert == "" {
+		writeError(errors.NewBadRequest("DH cert is required"), response)
+		return
+	}
+
+	validate := func(vmi *v1.VirtualMachineInstance) *errors.StatusError {
+		if !vmi.IsScheduled() {
+			return errors.NewConflict(v1.Resource("virtualmachineinstance"), vmi.Name, fmt.Errorf("VMI is not in %s phase", v1.Scheduled))
+		}
+		if !kutil.IsSEVAttestationRequested(vmi) {
+			return errors.NewConflict(v1.Resource("virtualmachineinstance"), vmi.Name, fmt.Errorf(vmiNoAttestationErr))
+		}
+		sev := vmi.Spec.Domain.LaunchSecurity.SEV
+		if sev.Session != "" || sev.DHCert != "" {
+			return errors.NewConflict(v1.Resource("virtualmachineinstance"), vmi.Name, fmt.Errorf("Session already defined"))
+		}
+		return nil
+	}
+
+	name := request.PathParameter("name")
+	namespace := request.PathParameter("namespace")
+	vmi, statusError := app.fetchAndValidateVirtualMachineInstance(namespace, name, validate)
+	if statusError != nil {
+		writeError(statusError, response)
+		return
+	}
+
+	oldSEV := vmi.Spec.Domain.LaunchSecurity.SEV
+	newSEV := oldSEV.DeepCopy()
+	newSEV.Session = opts.Session
+	newSEV.DHCert = opts.DHCert
+	patch, err := patch.GenerateTestReplacePatch("/spec/domain/launchSecurity/sev", oldSEV, newSEV)
+	if err != nil {
+		writeError(errors.NewInternalError(err), response)
+		return
+	}
+
+	log.Log.Object(vmi).Infof("Patching vmi: %s", string(patch))
+	if _, err := app.virtCli.VirtualMachineInstance(vmi.Namespace).Patch(context.Background(), vmi.Name, types.JSONPatchType, patch, &k8smetav1.PatchOptions{}); err != nil {
+		log.Log.Object(vmi).Reason(err).Errorf("Failed to patch vmi")
+		writeError(errors.NewInternalError(err), response)
+		return
+	}
+
+	response.WriteHeader(http.StatusAccepted)
+}
+
+func (app *SubresourceAPIApp) SEVInjectLaunchSecretHandler(request *restful.Request, response *restful.Response) {
+	if !app.ensureSEVEnabled(response) {
+		return
+	}
+
+	if request.Request.Body == nil {
+		writeError(errors.NewBadRequest("Request with no body: SEV secret parameters are required"), response)
+		return
+	}
+
+	getURL := func(vmi *v1.VirtualMachineInstance, conn kubecli.VirtHandlerConn) (string, error) {
+		return conn.SEVInjectLaunchSecretURI(vmi)
+	}
+
+	app.putRequestHandler(request, response, validateVMIForSEVAttestation, getURL, false)
+}
+
+// Validate a VMI for SEV attestation: Running, Paused and with Attestation requested.
+func validateVMIForSEVAttestation(vmi *v1.VirtualMachineInstance) *errors.StatusError {
+	if !vmi.IsRunning() {
+		return errors.NewConflict(v1.Resource("virtualmachineinstance"), vmi.Name, fmt.Errorf(vmiNotRunning))
+	}
+	if !kutil.IsSEVAttestationRequested(vmi) {
+		return errors.NewConflict(v1.Resource("virtualmachineinstance"), vmi.Name, fmt.Errorf(vmiNoAttestationErr))
+	}
+	condManager := controller.NewVirtualMachineInstanceConditionManager()
+	if !condManager.HasCondition(vmi, v1.VirtualMachineInstancePaused) {
+		return errors.NewConflict(v1.Resource("virtualmachineinstance"), vmi.Name, fmt.Errorf(vmiNotPaused))
+	}
+	return nil
 }

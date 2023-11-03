@@ -29,8 +29,6 @@ import (
 	"syscall"
 	"time"
 
-	"kubevirt.io/kubevirt/pkg/virt-launcher/metadata"
-
 	"github.com/spf13/pflag"
 	"k8s.io/apimachinery/pkg/types"
 	"libvirt.org/go/libvirt"
@@ -44,6 +42,7 @@ import (
 	cloudinit "kubevirt.io/kubevirt/pkg/cloud-init"
 	"kubevirt.io/kubevirt/pkg/config"
 	containerdisk "kubevirt.io/kubevirt/pkg/container-disk"
+	"kubevirt.io/kubevirt/pkg/downwardmetrics"
 	ephemeraldisk "kubevirt.io/kubevirt/pkg/ephemeral-disk"
 	"kubevirt.io/kubevirt/pkg/hooks"
 	hotplugdisk "kubevirt.io/kubevirt/pkg/hotplug-disk"
@@ -51,6 +50,7 @@ import (
 	putil "kubevirt.io/kubevirt/pkg/util"
 	cmdclient "kubevirt.io/kubevirt/pkg/virt-handler/cmd-client"
 	virtlauncher "kubevirt.io/kubevirt/pkg/virt-launcher"
+	"kubevirt.io/kubevirt/pkg/virt-launcher/metadata"
 	notifyclient "kubevirt.io/kubevirt/pkg/virt-launcher/notify-client"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap"
 	agentpoller "kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/agent-poller"
@@ -219,6 +219,11 @@ func initializeDirs(ephemeralDiskDir string,
 	if err != nil {
 		panic(err)
 	}
+
+	err = virtlauncher.InitializeDisksDirectories(downwardmetrics.DownwardMetricsChannelDir)
+	if err != nil {
+		panic(err)
+	}
 }
 
 func detectDomainWithUUID(domainManager virtwrap.DomainManager) *api.Domain {
@@ -237,14 +242,18 @@ func detectDomainWithUUID(domainManager virtwrap.DomainManager) *api.Domain {
 
 func waitForDomainUUID(timeout time.Duration, events chan watch.Event, stop chan struct{}, domainManager virtwrap.DomainManager) *api.Domain {
 
-	ticker := time.NewTicker(timeout).C
-	checkEarlyExit := time.NewTicker(time.Second * 2).C
-	domainCheckTicker := time.NewTicker(time.Second * 10).C
+	ticker := time.NewTicker(timeout)
+	defer ticker.Stop()
+	checkEarlyExit := time.NewTicker(time.Second * 2)
+	defer checkEarlyExit.Stop()
+	domainCheckTicker := time.NewTicker(time.Second * 10)
+	defer domainCheckTicker.Stop()
+
 	for {
 		select {
-		case <-ticker:
+		case <-ticker.C:
 			panic(fmt.Errorf("timed out waiting for domain to be defined"))
-		case <-domainCheckTicker:
+		case <-domainCheckTicker.C:
 			log.Log.V(3).Infof("Periodically checking for domain with UUID")
 			domain := detectDomainWithUUID(domainManager)
 			if domain != nil {
@@ -258,7 +267,7 @@ func waitForDomainUUID(timeout time.Duration, events chan watch.Event, stop chan
 			}
 		case <-stop:
 			return nil
-		case <-checkEarlyExit:
+		case <-checkEarlyExit.C:
 			if cmdserver.ReceivedEarlyExitSignal() {
 				panic(fmt.Errorf("received early exit signal"))
 			}
@@ -365,6 +374,16 @@ func main() {
 		}
 	}
 
+	// Initialize local and shared directories
+	initializeDirs(*ephemeralDiskDir, *containerDiskDir, *hotplugDiskDir, *uid)
+
+	if !*runWithNonRoot {
+		err := virtlauncher.InitializeConsoleLogFile(filepath.Join("/var/run/kubevirt-private", *uid))
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	if *simulateCrash {
 		panic(fmt.Errorf("Simulated virt-launcher crash"))
 	}
@@ -378,8 +397,6 @@ func main() {
 
 	vmi := v1.NewVMIReferenceWithUUID(*namespace, *name, types.UID(*uid))
 
-	// Initialize local and shared directories
-	initializeDirs(*ephemeralDiskDir, *containerDiskDir, *hotplugDiskDir, *uid)
 	ephemeralDiskCreator := ephemeraldisk.NewEphemeralDiskCreator(filepath.Join(*ephemeralDiskDir, "disk-data"))
 	if err := ephemeralDiskCreator.Init(); err != nil {
 		panic(err)

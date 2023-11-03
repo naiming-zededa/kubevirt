@@ -31,11 +31,12 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	k8smetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	virtv1 "kubevirt.io/api/core/v1"
 )
 
 var _ = Describe("Kubevirt VirtualMachineInstanceReplicaSet Client", func() {
 	var server *ghttp.Server
-	basePath := "/apis/kubevirt.io/v1alpha3/namespaces/default/virtualmachineinstancereplicasets"
+	basePath := "/apis/kubevirt.io/v1/namespaces/default/virtualmachineinstancereplicasets"
 	rsPath := path.Join(basePath, "testrs")
 	proxyPath := "/proxy/path"
 
@@ -90,10 +91,13 @@ var _ = Describe("Kubevirt VirtualMachineInstanceReplicaSet Client", func() {
 			ghttp.RespondWithJSONEncoded(http.StatusOK, NewVirtualMachineInstanceReplicaSetList(*rs)),
 		))
 		fetchedVMIReplicaSetList, err := client.ReplicaSet(k8sv1.NamespaceDefault).List(k8smetav1.ListOptions{})
+		apiVersion, kind := virtv1.VirtualMachineInstanceReplicaSetGroupVersionKind.ToAPIVersionAndKind()
 
 		Expect(err).ToNot(HaveOccurred())
 		Expect(server.ReceivedRequests()).To(HaveLen(1))
 		Expect(fetchedVMIReplicaSetList.Items).To(HaveLen(1))
+		Expect(fetchedVMIReplicaSetList.Items[0].APIVersion).To(Equal(apiVersion))
+		Expect(fetchedVMIReplicaSetList.Items[0].Kind).To(Equal(kind))
 		Expect(fetchedVMIReplicaSetList.Items[0]).To(Equal(*rs))
 	},
 		Entry("with regular server URL", ""),

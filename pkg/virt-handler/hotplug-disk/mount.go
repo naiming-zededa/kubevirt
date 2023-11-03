@@ -46,10 +46,6 @@ var (
 		return safepath.JoinAndResolveWithRelativeRoot("/proc/1/root", fmt.Sprintf("/var/lib/kubelet/pods/%s/volumes/kubernetes.io~empty-dir/hotplug-disks", string(podUID)))
 	}
 
-	sourcePodBasePath = func(podUID types.UID) (*safepath.Path, error) {
-		return safepath.JoinAndResolveWithRelativeRoot("/proc/1/root", fmt.Sprintf("root/var/lib/kubelet/pods/%s/volumes", string(podUID)))
-	}
-
 	socketPath = func(podUID types.UID) string {
 		return fmt.Sprintf("pods/%s/volumes/kubernetes.io~empty-dir/hotplug-disks/hp.sock", string(podUID))
 	}
@@ -313,12 +309,16 @@ func (m *volumeMounter) mountHotplugVolume(vmi *v1.VirtualMachineInstance, volum
 		if m.isBlockVolume(&vmi.Status, volumeName) {
 			logger.V(4).Infof("Mounting block volume: %s", volumeName)
 			if err := m.mountBlockHotplugVolume(vmi, volumeName, sourceUID, record); err != nil {
-				return fmt.Errorf("failed to mount block hotplug volume %s: %v", volumeName, err)
+				if !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("failed to mount block hotplug volume %s: %v", volumeName, err)
+				}
 			}
 		} else {
 			logger.V(4).Infof("Mounting file system volume: %s", volumeName)
 			if err := m.mountFileSystemHotplugVolume(vmi, volumeName, sourceUID, record, mountDirectory); err != nil {
-				return fmt.Errorf("failed to mount filesystem hotplug volume %s: %v", volumeName, err)
+				if !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("failed to mount filesystem hotplug volume %s: %v", volumeName, err)
+				}
 			}
 		}
 	}
@@ -667,9 +667,13 @@ func (m *volumeMounter) Unmount(vmi *v1.VirtualMachineInstance) error {
 			var err error
 			if m.isBlockVolume(&vmi.Status, volumeStatus.Name) {
 				path, err = safepath.JoinNoFollow(basePath, volumeStatus.Name)
+				if errors.Is(err, os.ErrNotExist) {
+					// already unmounted or never mounted
+					continue
+				}
 			} else if m.isDirectoryMounted(&vmi.Status, volumeStatus.Name) {
 				path, err = m.hotplugDiskManager.GetFileSystemDirectoryTargetPathFromHostView(virtlauncherUID, volumeStatus.Name, false)
-				if os.IsExist(err) {
+				if errors.Is(err, os.ErrNotExist) {
 					// already unmounted or never mounted
 					continue
 				}

@@ -25,7 +25,7 @@ import (
 	"net/http"
 	"net/url"
 
-	restful "github.com/emicklei/go-restful"
+	restful "github.com/emicklei/go-restful/v3"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/ghttp"
@@ -223,6 +223,7 @@ var _ = Describe("Authorizer", func() {
 			},
 				// Root resources
 				Entry("root", "/"),
+				Entry("apis", "/apis"),
 				Entry("healthz", "/healthz"),
 				Entry("openapi", "/openapi/v2"),
 				Entry("start profiler", "/start-profiler"),

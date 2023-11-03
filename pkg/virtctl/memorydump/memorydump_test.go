@@ -1,10 +1,13 @@
 package memorydump_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"time"
 
@@ -363,6 +366,16 @@ var _ = Describe("MemoryDump", func() {
 			vmexport.SetHTTPClientCreator(func(*http.Transport, bool) *http.Client {
 				return server.Client()
 			})
+			vmexport.SetPortForwarder(func(client kubecli.KubevirtClient, pod k8sv1.Pod, namespace string, ports []string, stopChan, readyChan chan struct{}, portChan chan uint16) error {
+				readyChan <- struct{}{}
+				portChan <- uint16(5432)
+				return nil
+			})
+		})
+
+		AfterEach(func() {
+			vmexport.SetDefaultPortForwarder()
+			vmexport.SetDefaultHTTPClientCreator()
 		})
 
 		It("should get memory dump and call download memory dump", func() {
@@ -400,6 +413,73 @@ var _ = Describe("MemoryDump", func() {
 			cmd := clientcmd.NewVirtctlCommand(commandAndArgs...)
 			Expect(cmd.Execute()).To(Succeed())
 		})
+
+		It("should call download memory dump and decompress succesfully", func() {
+			vmexport.HandleHTTPRequest = func(client kubecli.KubevirtClient, vmexport *exportv1.VirtualMachineExport, downloadUrl string, insecure bool, exportURL string, headers map[string]string) (*http.Response, error) {
+				resp := http.Response{
+					StatusCode: http.StatusOK,
+					Body: io.NopCloser(bytes.NewReader([]byte{
+						0x1f, 0x8b, 0x08, 0x08, 0xc8, 0x58, 0x13, 0x4a,
+						0x00, 0x03, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2e,
+						0x74, 0x78, 0x74, 0x00, 0xcb, 0x48, 0xcd, 0xc9,
+						0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1,
+						0x02, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0x0c, 0x00,
+						0x00, 0x00,
+						0x1f, 0x8b, 0x08, 0x08, 0xc8, 0x58, 0x13, 0x4a,
+						0x00, 0x03, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2e,
+						0x74, 0x78, 0x74, 0x00, 0xcb, 0x48, 0xcd, 0xc9,
+						0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1,
+						0x02, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0x0c, 0x00,
+						0x00, 0x00,
+					})),
+				}
+				return &resp, nil
+			}
+			memorydump.WaitMemoryDumpComplete = waitForMemoryDumpDefault
+			vmexport := utils.VMExportSpecPVC(vmexportName, k8smetav1.NamespaceDefault, claimName, secretName)
+			vmexport.Status = utils.GetVMEStatus([]exportv1.VirtualMachineExportVolume{
+				{
+					Name:    claimName,
+					Formats: utils.GetExportVolumeFormat(server.URL, exportv1.KubeVirtGz),
+				},
+			}, secretName)
+			utils.HandleSecretGet(coreClient, secretName)
+			utils.HandleVMExportCreate(vmExportClient, vmexport)
+
+			commandAndArgs := []string{"memory-dump", "download", "testvm", outputFileFlag, "--format", "raw"}
+			cmd := clientcmd.NewVirtctlCommand(commandAndArgs...)
+			Expect(cmd.Execute()).To(Succeed())
+		})
+
+		DescribeTable("should call download memory dump with port-forward", func(commandAndArgs []string) {
+			vmexport.HandleHTTPRequest = func(client kubecli.KubevirtClient, vmexport *exportv1.VirtualMachineExport, downloadUrl string, insecure bool, exportURL string, headers map[string]string) (*http.Response, error) {
+				Expect(downloadUrl).To(Equal("https://127.0.0.1:5432"))
+				resp := http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("data")),
+				}
+				return &resp, nil
+			}
+			memorydump.WaitMemoryDumpComplete = waitForMemoryDumpDefault
+			vme := utils.VMExportSpecPVC(vmexportName, k8smetav1.NamespaceDefault, claimName, secretName)
+			vme.Status = utils.GetVMEStatus([]exportv1.VirtualMachineExportVolume{
+				{
+					Name:    claimName,
+					Formats: utils.GetExportVolumeFormat(server.URL, exportv1.KubeVirtGz),
+				},
+			}, secretName)
+			vme.Status.Links.Internal = vme.Status.Links.External
+			utils.HandleSecretGet(coreClient, secretName)
+			utils.HandleVMExportCreate(vmExportClient, vme)
+			utils.HandleServiceGet(coreClient, fmt.Sprintf("virt-export-%s", vme.Name), 443)
+			utils.HandlePodList(coreClient, fmt.Sprintf("virt-export-pod-%s", vme.Name))
+			cmd := clientcmd.NewVirtctlCommand(commandAndArgs...)
+			Expect(cmd.Execute()).To(Succeed())
+		},
+			Entry("with default port-forward", []string{"memory-dump", "download", "testvm", outputFileFlag, "--port-forward"}),
+			Entry("with port-forward specifying local port", []string{"memory-dump", "download", "testvm", outputFileFlag, "--port-forward", "--local-port", "5432"}),
+			Entry("with port-forward specifying default number on local port", []string{"memory-dump", "download", "testvm", outputFileFlag, "--port-forward", "--local-port", "0"}),
+		)
 
 		It("should fail download memory dump if not completed succesfully", func() {
 			memorydump.WaitMemoryDumpComplete = waitForMemoryDumpErr

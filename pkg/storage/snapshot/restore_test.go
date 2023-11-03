@@ -26,7 +26,7 @@ import (
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	v1 "kubevirt.io/api/core/v1"
 	instancetypeapi "kubevirt.io/api/instancetype"
-	instancetypev1alpha2 "kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 	snapshotv1 "kubevirt.io/api/snapshot/v1alpha1"
 	cdifake "kubevirt.io/client-go/generated/containerized-data-importer/clientset/versioned/fake"
 	kubevirtfake "kubevirt.io/client-go/generated/kubevirt/clientset/versioned/fake"
@@ -192,7 +192,16 @@ var _ = Describe("Restore controller", func() {
 				},
 				Spec: *dv.Spec.PVC,
 			}
-			pvc.Spec.DataSourceRef = dv.Spec.PVC.DataSource
+			if dv.Spec.PVC.DataSource == nil {
+				dv.Spec.PVC.DataSource = &corev1.TypedLocalObjectReference{}
+			}
+			dataSourceRef := &corev1.TypedObjectReference{
+				APIGroup: dv.Spec.PVC.DataSource.APIGroup,
+				Kind:     dv.Spec.PVC.DataSource.Kind,
+				Name:     dv.Spec.PVC.DataSource.Name,
+			}
+
+			pvc.Spec.DataSourceRef = dataSourceRef
 			pvc.Spec.VolumeName = fmt.Sprintf("volume%d", i+1)
 			pvc.ResourceVersion = "1"
 			pvcs = append(pvcs, pvc)
@@ -1002,10 +1011,10 @@ var _ = Describe("Restore controller", func() {
 				originalVM             *v1.VirtualMachine
 				vmSnapshotContent      *snapshotv1.VirtualMachineSnapshotContent
 				restore                *snapshotv1.VirtualMachineRestore
-				instancetypeObj        *instancetypev1alpha2.VirtualMachineInstancetype
+				instancetypeObj        *instancetypev1beta1.VirtualMachineInstancetype
 				instancetypeSnapshotCR *appsv1.ControllerRevision
 				instancetypeOriginalCR *appsv1.ControllerRevision
-				preferenceObj          *instancetypev1alpha2.VirtualMachinePreference
+				preferenceObj          *instancetypev1beta1.VirtualMachinePreference
 				preferenceSnapshotCR   *appsv1.ControllerRevision
 				preferenceOriginalCR   *appsv1.ControllerRevision
 			)
@@ -1019,7 +1028,7 @@ var _ = Describe("Restore controller", func() {
 				vm.Annotations = map[string]string{"restore.kubevirt.io/lastRestoreUID": "restore-uid"}
 				vmInterface.EXPECT().
 					Create(context.Background(), vm).
-					Do(func(objs ...interface{}) {
+					Do(func(ctx context.Context, newVM *v1.VirtualMachine) {
 						vm.UID = newVMUID
 					}).Return(vm, nil)
 			}
@@ -1062,7 +1071,7 @@ var _ = Describe("Restore controller", func() {
 				vm.Annotations = map[string]string{"restore.kubevirt.io/lastRestoreUID": "restore-uid"}
 				vmInterface.EXPECT().
 					Create(context.Background(), vm).
-					Do(func(objs ...interface{}) {
+					Do(func(ctx context.Context, newVM *v1.VirtualMachine) {
 						vm.UID = newVMUID
 					}).Return(vm, fmt.Errorf(vmCreationFailureMessage))
 			}
@@ -1398,7 +1407,13 @@ func expectPVCCreateWithDataSourceRef(client *k8sfake.Clientset, vmRestore *snap
 
 		Expect(createObj.Spec.DataSource).ToNot(BeNil())
 		Expect(createObj.Spec.DataSourceRef).ToNot(BeNil())
-		Expect(createObj.Spec.DataSource).To(Equal(createObj.Spec.DataSourceRef))
+
+		dataSourceRef := &corev1.TypedLocalObjectReference{
+			APIGroup: createObj.Spec.DataSourceRef.APIGroup,
+			Kind:     createObj.Spec.DataSourceRef.Kind,
+			Name:     createObj.Spec.DataSourceRef.Name,
+		}
+		Expect(createObj.Spec.DataSource).To(Equal(dataSourceRef))
 
 		return true, create.GetObject(), nil
 	})

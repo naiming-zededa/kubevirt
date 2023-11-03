@@ -115,6 +115,7 @@ func newVMIMigrationPhaseTransitionTimeFromCreationHistogramVec(informer cache.S
 	histogramVec := prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "kubevirt_vmi_migration_phase_transition_time_from_creation_seconds",
+			Help:    "Histogram of VM migration phase transitions duration from creation time in seconds",
 			Buckets: phaseTransitionTimeBuckets(),
 		},
 		[]string{
@@ -123,10 +124,13 @@ func newVMIMigrationPhaseTransitionTimeFromCreationHistogramVec(informer cache.S
 		},
 	)
 
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		UpdateFunc: func(oldVMIMigration, newVMIMigration interface{}) {
 			updateVMIMigrationPhaseTransitionTimeFromCreationTimeHistogramVec(histogramVec, oldVMIMigration.(*v1.VirtualMachineInstanceMigration), newVMIMigration.(*v1.VirtualMachineInstanceMigration))
 		},
 	})
+	if err != nil {
+		panic(err)
+	}
 	return histogramVec
 }

@@ -49,6 +49,8 @@ import (
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 	uploadcdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/upload/v1beta1"
 
+	instancetypeapi "kubevirt.io/api/instancetype"
+
 	storagetypes "kubevirt.io/kubevirt/pkg/storage/types"
 	"kubevirt.io/kubevirt/pkg/util"
 	"kubevirt.io/kubevirt/pkg/virtctl/templates"
@@ -65,6 +67,8 @@ const (
 	forceImmediateBindingAnnotation = "cdi.kubevirt.io/storage.bind.immediate.requested"
 	contentTypeAnnotation           = "cdi.kubevirt.io/storage.contentType"
 	deleteAfterCompletionAnnotation = "cdi.kubevirt.io/storage.deleteAfterCompletion"
+	UsePopulatorAnnotation          = "cdi.kubevirt.io/storage.usePopulator"
+	PVCPrimeNameAnnotation          = "cdi.kubevirt.io/storage.populator.pvcPrime"
 
 	uploadReadyWaitInterval = 2 * time.Second
 
@@ -83,18 +87,27 @@ const (
 	ProvisioningFailed = "ProvisioningFailed"
 	// ErrClaimNotValid stores the 'ErrClaimNotValid' event condition used for DV error handling
 	ErrClaimNotValid = "ErrClaimNotValid"
+
+	// OptimisticLockErrorMsg is returned by kube-apiserver when trying to update an old version of a resource
+	// https://github.com/kubernetes/kubernetes/blob/b89f564539fad77cd22de1b155d84638daf8c83f/staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go#L240
+	OptimisticLockErrorMsg = "the object has been modified; please apply your changes to the latest version and try again"
 )
 
 var (
-	insecure       bool
-	uploadProxyURL string
-	name           string
-	size           string
-	pvcSize        string
-	storageClass   string
-	imagePath      string
-	archivePath    string
-	accessMode     string
+	insecure                bool
+	uploadProxyURL          string
+	name                    string
+	size                    string
+	pvcSize                 string
+	storageClass            string
+	imagePath               string
+	volumeMode              string
+	archivePath             string
+	accessMode              string
+	defaultInstancetype     string
+	defaultInstancetypeKind string
+	defaultPreference       string
+	defaultPreferenceKind   string
 
 	uploadPodWaitSecs uint
 	blockVolume       bool
@@ -149,14 +162,20 @@ func NewImageUploadCommand(clientConfig clientcmd.ClientConfig) *cobra.Command {
 	cmd.Flags().StringVar(&storageClass, "storage-class", "", "The storage class for the PVC.")
 	cmd.Flags().StringVar(&accessMode, "access-mode", "", "The access mode for the PVC.")
 	cmd.Flags().BoolVar(&blockVolume, "block-volume", false, "Create a PVC with VolumeMode=Block (default is the storageProfile default. for archive upload default is filesystem).")
+	cmd.Flags().StringVar(&volumeMode, "volume-mode", "", "Specify the VolumeMode (block/filesystem) used to create the PVC. Default is the storageProfile default. For archive upload default is filesystem.")
 	cmd.Flags().StringVar(&imagePath, "image-path", "", "Path to the local VM image.")
 	cmd.Flags().StringVar(&archivePath, "archive-path", "", "Path to the local archive.")
 	cmd.Flags().BoolVar(&noCreate, "no-create", false, "Don't attempt to create a new DataVolume/PVC.")
 	cmd.Flags().UintVar(&uploadPodWaitSecs, "wait-secs", 300, "Seconds to wait for upload pod to start.")
 	cmd.Flags().BoolVar(&forceBind, "force-bind", false, "Force bind the PVC, ignoring the WaitForFirstConsumer logic.")
+	cmd.Flags().StringVar(&defaultInstancetype, "default-instancetype", "", "The default instance type to associate with the image.")
+	cmd.Flags().StringVar(&defaultInstancetypeKind, "default-instancetype-kind", "", "The default instance type kind to associate with the image.")
+	cmd.Flags().StringVar(&defaultPreference, "default-preference", "", "The default preference to associate with the image.")
+	cmd.Flags().StringVar(&defaultPreferenceKind, "default-preference-kind", "", "The default preference kind to associate with the image.")
 	cmd.SetUsageTemplate(templates.UsageTemplate())
 	cmd.Flags().MarkDeprecated("pvc-name", "specify the name as the second argument instead.")
 	cmd.Flags().MarkDeprecated("pvc-size", "use --size instead.")
+	cmd.Flags().MarkDeprecated("block-volume", "specify volume mode (filesystem/block) with --volume-mode instead.")
 	return cmd
 }
 
@@ -169,6 +188,9 @@ func usage() string {
 
   # Upload a local disk image to a newly created PersistentVolumeClaim
   {{ProgramName}} image-upload pvc fedora-pvc --size=10Gi --image-path=/images/fedora30.qcow2
+
+  # Upload a local disk image to a newly created PersistentVolumeClaim and label it with a default instance type and preference
+  {{ProgramName}} image-upload pvc fedora-pvc --size=10Gi --image-path=/images/fedora30.qcow2 --default-instancetype=n1.medium --default-preference=fedora
 
   # Upload a local disk image to an existing PersistentVolumeClaim
   {{ProgramName}} image-upload pvc fedora-pvc --no-create --image-path=/images/fedora30.qcow2
@@ -205,6 +227,18 @@ func parseArgs(args []string) error {
 		return nil
 	}
 
+	// check deprecated blockVolume flag
+	if blockVolume {
+		if volumeMode == "" {
+			volumeMode = "block"
+		} else if volumeMode != "block" {
+			return fmt.Errorf("incompatible --volume-mode '%s' and --block-volume", volumeMode)
+		}
+	}
+	if volumeMode != "block" && volumeMode != "filesystem" && volumeMode != "" {
+		return fmt.Errorf("Invalid volume mode '%s'. Valid values are 'block' and 'filesystem'.", volumeMode)
+	}
+
 	archiveUpload = false
 	if imagePath == "" && archivePath == "" {
 		return fmt.Errorf("either image-path or archive-path must be provided")
@@ -213,7 +247,7 @@ func parseArgs(args []string) error {
 	} else if archivePath != "" {
 		archiveUpload = true
 		imagePath = archivePath
-		if blockVolume {
+		if volumeMode == "block" {
 			return fmt.Errorf("In archive upload the volume mode should always be filesystem")
 		}
 	}
@@ -236,10 +270,28 @@ func parseArgs(args []string) error {
 	return nil
 }
 
+func validateDefaultInstancetypeArgs() error {
+	if defaultInstancetype == "" && defaultInstancetypeKind != "" {
+		return fmt.Errorf("--default-instancetype must be provided with --default-instancetype-kind")
+	}
+	if defaultPreference == "" && defaultPreferenceKind != "" {
+		return fmt.Errorf("--default-preference must be provided with --default-preference-kind")
+	}
+	if (defaultInstancetype != "" || defaultPreference != "") && noCreate {
+		return fmt.Errorf("--default-instancetype and --default-preference cannot be used with --no-create")
+	}
+	return nil
+}
+
 func (c *command) run(args []string) error {
 	if err := parseArgs(args); err != nil {
 		return err
 	}
+
+	if err := validateDefaultInstancetypeArgs(); err != nil {
+		return err
+	}
+
 	// #nosec G304 No risk for path injection as this function executes with
 	// the same privileges as those of virtctl user who supplies imagePath
 	file, err := os.Open(imagePath)
@@ -271,12 +323,12 @@ func (c *command) run(args []string) error {
 		var obj metav1.Object
 
 		if createPVC {
-			obj, err = createUploadPVC(virtClient, namespace, name, size, storageClass, accessMode, blockVolume, archiveUpload)
+			obj, err = createUploadPVC(virtClient, namespace, name, size, storageClass, accessMode, volumeMode, archiveUpload)
 			if err != nil {
 				return err
 			}
 		} else {
-			obj, err = createUploadDataVolume(virtClient, namespace, name, size, storageClass, accessMode, blockVolume, archiveUpload)
+			obj, err = createUploadDataVolume(virtClient, namespace, name, size, storageClass, accessMode, volumeMode, archiveUpload)
 			if err != nil {
 				return err
 			}
@@ -475,8 +527,8 @@ func waitDvUploadScheduled(client kubecli.KubevirtClient, namespace, name string
 			return false, err
 		}
 
-		if dv.Status.Phase == cdiv1.WaitForFirstConsumer && !forceBind {
-			return false, fmt.Errorf("cannot upload to DataVolume in WaitForFirstConsumer state, make sure the PVC is Bound")
+		if (dv.Status.Phase == cdiv1.WaitForFirstConsumer || dv.Status.Phase == cdiv1.PendingPopulation) && !forceBind {
+			return false, fmt.Errorf("cannot upload to DataVolume in %s phase, make sure the PVC is Bound, or use force-bind flag", string(dv.Status.Phase))
 		}
 
 		done := dv.Status.Phase == cdiv1.UploadReady
@@ -559,8 +611,23 @@ func waitUploadProcessingComplete(client kubernetes.Interface, namespace, name s
 	return err
 }
 
-func createUploadDataVolume(client kubecli.KubevirtClient, namespace, name, size, storageClass, accessMode string, blockVolume, archiveUpload bool) (*cdiv1.DataVolume, error) {
-	pvcSpec, err := createStorageSpec(client, size, storageClass, accessMode, blockVolume)
+func setDefaultInstancetypeLabels(labels map[string]string) {
+	if defaultInstancetype != "" {
+		labels[instancetypeapi.DefaultInstancetypeLabel] = defaultInstancetype
+	}
+	if defaultInstancetypeKind != "" {
+		labels[instancetypeapi.DefaultInstancetypeKindLabel] = defaultInstancetypeKind
+	}
+	if defaultPreference != "" {
+		labels[instancetypeapi.DefaultPreferenceLabel] = defaultPreference
+	}
+	if defaultPreferenceKind != "" {
+		labels[instancetypeapi.DefaultPreferenceKindLabel] = defaultPreferenceKind
+	}
+}
+
+func createUploadDataVolume(client kubecli.KubevirtClient, namespace, name, size, storageClass, accessMode, volumeMode string, archiveUpload bool) (*cdiv1.DataVolume, error) {
+	pvcSpec, err := createStorageSpec(client, size, storageClass, accessMode, volumeMode)
 	if err != nil {
 		return nil, err
 	}
@@ -578,6 +645,9 @@ func createUploadDataVolume(client kubecli.KubevirtClient, namespace, name, size
 		annotations[forceImmediateBindingAnnotation] = ""
 	}
 
+	labels := make(map[string]string)
+	setDefaultInstancetypeLabels(labels)
+
 	contentType := cdiv1.DataVolumeKubeVirt
 	if archiveUpload {
 		contentType = cdiv1.DataVolumeArchive
@@ -588,6 +658,7 @@ func createUploadDataVolume(client kubecli.KubevirtClient, namespace, name, size
 			Name:        name,
 			Namespace:   namespace,
 			Annotations: annotations,
+			Labels:      labels,
 		},
 		Spec: cdiv1.DataVolumeSpec{
 			Source: &cdiv1.DataVolumeSource{
@@ -606,7 +677,7 @@ func createUploadDataVolume(client kubecli.KubevirtClient, namespace, name, size
 	return dv, nil
 }
 
-func createStorageSpec(client kubecli.KubevirtClient, size, storageClass, accessMode string, blockVolume bool) (*cdiv1.StorageSpec, error) {
+func createStorageSpec(client kubecli.KubevirtClient, size, storageClass, accessMode, volumeMode string) (*cdiv1.StorageSpec, error) {
 	quantity, err := resource.ParseQuantity(size)
 	if err != nil {
 		return nil, fmt.Errorf("validation failed for size=%s: %s", size, err)
@@ -631,15 +702,19 @@ func createStorageSpec(client kubecli.KubevirtClient, size, storageClass, access
 		spec.AccessModes = []v1.PersistentVolumeAccessMode{v1.PersistentVolumeAccessMode(accessMode)}
 	}
 
-	if blockVolume {
+	switch volumeMode {
+	case "block":
 		volMode := v1.PersistentVolumeBlock
+		spec.VolumeMode = &volMode
+	case "filesystem":
+		volMode := v1.PersistentVolumeFilesystem
 		spec.VolumeMode = &volMode
 	}
 
 	return spec, nil
 }
 
-func createUploadPVC(client kubecli.KubevirtClient, namespace, name, size, storageClass, accessMode string, blockVolume, archiveUpload bool) (*v1.PersistentVolumeClaim, error) {
+func createUploadPVC(client kubecli.KubevirtClient, namespace, name, size, storageClass, accessMode, volumeMode string, archiveUpload bool) (*v1.PersistentVolumeClaim, error) {
 	if accessMode == string(v1.ReadOnlyMany) {
 		return nil, fmt.Errorf("cannot upload to a readonly volume, use either ReadWriteOnce or ReadWriteMany if supported")
 	}
@@ -656,7 +731,11 @@ func createUploadPVC(client kubecli.KubevirtClient, namespace, name, size, stora
 	if err != nil {
 		return nil, fmt.Errorf("validation failed for size=%s: %s", size, err)
 	}
-	pvc := storagetypes.RenderPVC(&quantity, name, namespace, storageClass, accessMode, blockVolume)
+	pvc := storagetypes.RenderPVC(&quantity, name, namespace, storageClass, accessMode, volumeMode == "block")
+	if volumeMode == "filesystem" {
+		volMode := v1.PersistentVolumeFilesystem
+		pvc.Spec.VolumeMode = &volMode
+	}
 
 	contentType := string(cdiv1.DataVolumeKubeVirt)
 	if archiveUpload {
@@ -673,6 +752,10 @@ func createUploadPVC(client kubecli.KubevirtClient, namespace, name, size, stora
 	}
 
 	pvc.ObjectMeta.Annotations = annotations
+
+	labels := make(map[string]string)
+	setDefaultInstancetypeLabels(labels)
+	pvc.ObjectMeta.Labels = labels
 
 	pvc, err = client.CoreV1().PersistentVolumeClaims(namespace).Create(context.Background(), pvc, metav1.CreateOptions{})
 	if err != nil {
@@ -708,18 +791,8 @@ func getAndValidateUploadPVC(client kubecli.KubevirtClient, namespace, name stri
 	}
 
 	if !createPVC {
-		_, err = client.CdiClient().CdiV1beta1().DataVolumes(namespace).Get(context.Background(), name, metav1.GetOptions{})
+		pvc, err = validateUploadDataVolume(client, pvc)
 		if err != nil {
-			// When the PVC exists but the DV doesn't, there are two possible outcomes:
-			if k8serrors.IsNotFound(err) {
-				// 1. The DV was already garbage-collected. The PVC was created and populated by CDI as expected.
-				if dvGarbageCollected := pvc.Annotations[deleteAfterCompletionAnnotation] == "true" &&
-					pvc.Annotations[PodPhaseAnnotation] == string(v1.PodSucceeded); dvGarbageCollected {
-					return nil, fmt.Errorf("DataVolume already garbage-collected: Assuming PVC %s/%s is successfully populated", namespace, name)
-				}
-				// 2. The PVC was created independently of a DV.
-				return nil, fmt.Errorf("No DataVolume is associated with the existing PVC %s/%s", namespace, name)
-			}
 			return nil, err
 		}
 	}
@@ -746,6 +819,42 @@ func getAndValidateUploadPVC(client kubecli.KubevirtClient, namespace, name stri
 		contentType, found := pvc.Annotations[contentTypeAnnotation]
 		if !found || contentType != string(cdiv1.DataVolumeArchive) {
 			return nil, fmt.Errorf("PVC %s doesn't have archive contentType annotation", name)
+		}
+	}
+
+	return pvc, nil
+}
+
+func validateUploadDataVolume(client kubecli.KubevirtClient, pvc *v1.PersistentVolumeClaim) (*v1.PersistentVolumeClaim, error) {
+	dv, err := client.CdiClient().CdiV1beta1().DataVolumes(pvc.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		// When the PVC exists but the DV doesn't, there are two possible outcomes:
+		if k8serrors.IsNotFound(err) {
+			// 1. The DV was already garbage-collected. The PVC was created and populated by CDI as expected.
+			if dvGarbageCollected := pvc.Annotations[deleteAfterCompletionAnnotation] == "true" &&
+				pvc.Annotations[PodPhaseAnnotation] == string(v1.PodSucceeded); dvGarbageCollected {
+				return nil, fmt.Errorf("DataVolume already garbage-collected: Assuming PVC %s/%s is successfully populated", pvc.Namespace, name)
+			}
+			// 2. The PVC was created independently of a DV.
+			return nil, fmt.Errorf("No DataVolume is associated with the existing PVC %s/%s", pvc.Namespace, name)
+		}
+		return nil, err
+	}
+
+	// When using populators, the upload happens on the PVC Prime. We need to check it instead.
+	if dv.Annotations[UsePopulatorAnnotation] == "true" {
+		// We can assume the PVC is populated once it's bound
+		if pvc.Status.Phase == v1.ClaimBound {
+			return nil, fmt.Errorf("PVC %s already successfully populated", name)
+		}
+		// Get the PVC Prime since the upload is happening there
+		pvcPrimeName, ok := pvc.Annotations[PVCPrimeNameAnnotation]
+		if !ok {
+			return nil, fmt.Errorf("Unable to get PVC Prime name from PVC %s/%s", pvc.Namespace, name)
+		}
+		pvc, err = client.CoreV1().PersistentVolumeClaims(dv.Namespace).Get(context.Background(), pvcPrimeName, metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("Unable to get PVC Prime %s/%s", dv.Namespace, name)
 		}
 	}
 
@@ -801,7 +910,9 @@ func handleEventErrors(client kubecli.KubevirtClient, pvcName, dvName, namespace
 	for _, event := range eventList.Items {
 		if event.InvolvedObject.Kind == "PersistentVolumeClaim" && event.InvolvedObject.UID == pvcUID {
 			if event.Reason == ProvisioningFailed {
-				return fmt.Errorf("Provisioning failed: %s", event.Message)
+				if !strings.Contains(event.Message, OptimisticLockErrorMsg) {
+					return fmt.Errorf("Provisioning failed: %s", event.Message)
+				}
 			}
 		}
 		if event.InvolvedObject.Kind == "DataVolume" && event.InvolvedObject.UID == dvUID {

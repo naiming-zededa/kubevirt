@@ -25,6 +25,8 @@ import (
 	"fmt"
 	"time"
 
+	"kubevirt.io/kubevirt/tests/libstorage"
+
 	"kubevirt.io/kubevirt/tests/framework/kubevirt"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -108,6 +110,8 @@ func AdjustKubeVirtResource() {
 		virtconfig.KubevirtSeccompProfile,
 		virtconfig.HotplugNetworkIfacesGate,
 		virtconfig.VMPersistentState,
+		virtconfig.VMLiveUpdateFeaturesGate,
+		virtconfig.AutoResourceLimitsGate,
 	)
 	if flags.DisableCustomSELinuxPolicy {
 		kv.Spec.Configuration.DeveloperConfiguration.FeatureGates = append(kv.Spec.Configuration.DeveloperConfiguration.FeatureGates,
@@ -121,6 +125,11 @@ func AdjustKubeVirtResource() {
 		kv.Spec.Configuration.NetworkConfiguration = &v1.NetworkConfiguration{
 			PermitSlirpInterface: &testDefaultPermitSlirpInterface,
 		}
+	}
+
+	storageClass, exists := libstorage.GetRWXFileSystemStorageClass()
+	if exists {
+		kv.Spec.Configuration.VMStateStorageClass = storageClass
 	}
 
 	data, err := json.Marshal(kv.Spec)

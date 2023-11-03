@@ -12,6 +12,7 @@ import (
 	vsv1 "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/gstruct"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -26,11 +27,10 @@ import (
 	"kubevirt.io/kubevirt/tests/exec"
 	"kubevirt.io/kubevirt/tests/framework/kubevirt"
 	"kubevirt.io/kubevirt/tests/framework/matcher"
-	. "kubevirt.io/kubevirt/tests/framework/matcher"
 	"kubevirt.io/kubevirt/tests/testsuite"
 
 	v1 "kubevirt.io/api/core/v1"
-	instancetypev1alpha2 "kubevirt.io/api/instancetype/v1alpha2"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
 	snapshotv1 "kubevirt.io/api/snapshot/v1alpha1"
 	"kubevirt.io/client-go/kubecli"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
@@ -83,31 +83,13 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 	}
 
 	waitSnapshotReady := func() {
-		Eventually(func() bool {
+		Eventually(func() *snapshotv1.VirtualMachineSnapshotStatus {
 			snapshot, err = virtClient.VirtualMachineSnapshot(vm.Namespace).Get(context.Background(), snapshot.Name, metav1.GetOptions{})
 			Expect(err).ToNot(HaveOccurred())
-			return snapshot.Status != nil && snapshot.Status.ReadyToUse != nil && *snapshot.Status.ReadyToUse
-		}, 180*time.Second, time.Second).Should(BeTrue())
-	}
-
-	isSnapshotSucceeded := func(snapshotStatus *snapshotv1.VirtualMachineSnapshotStatus) bool {
-		return snapshotStatus != nil &&
-			len(snapshotStatus.Conditions) == 2 &&
-			snapshotStatus.Conditions[0].Status == corev1.ConditionFalse &&
-			strings.Contains(snapshotStatus.Conditions[0].Reason, operationComplete) &&
-			snapshotStatus.Conditions[1].Status == corev1.ConditionTrue &&
-			strings.Contains(snapshotStatus.Conditions[1].Reason, operationComplete) &&
-			snapshotStatus.Phase == snapshotv1.Succeeded
-	}
-
-	isSnapshotInProgress := func(snapshotStatus *snapshotv1.VirtualMachineSnapshotStatus) bool {
-		return snapshotStatus != nil &&
-			len(snapshotStatus.Conditions) == 2 &&
-			snapshotStatus.Conditions[0].Status == corev1.ConditionTrue &&
-			strings.Contains(snapshotStatus.Conditions[0].Reason, "Source locked and operation in progress") &&
-			snapshotStatus.Conditions[1].Status == corev1.ConditionFalse &&
-			strings.Contains(snapshotStatus.Conditions[1].Reason, notReady) &&
-			snapshotStatus.Phase == snapshotv1.InProgress
+			return snapshot.Status
+		}, 180*time.Second, time.Second).Should(gstruct.PointTo(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+			"ReadyToUse": gstruct.PointTo(BeTrue()),
+		})))
 	}
 
 	waitSnapshotSucceeded := func(snapshotName string) *snapshotv1.VirtualMachineSnapshot {
@@ -116,7 +98,18 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 			snapshot, err = virtClient.VirtualMachineSnapshot(vm.Namespace).Get(context.Background(), snapshotName, metav1.GetOptions{})
 			Expect(err).ToNot(HaveOccurred())
 			return snapshot.Status
-		}, 30*time.Second, 2*time.Second).WithOffset(1).Should(Satisfy(isSnapshotSucceeded))
+		}, 180*time.Second, 2*time.Second).Should(gstruct.PointTo(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+			"Conditions": ContainElements(
+				gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+					"Type":   Equal(snapshotv1.ConditionReady),
+					"Status": Equal(corev1.ConditionTrue),
+					"Reason": Equal(operationComplete)}),
+				gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+					"Type":   Equal(snapshotv1.ConditionProgressing),
+					"Status": Equal(corev1.ConditionFalse),
+					"Reason": Equal(operationComplete)}),
+			),
+		})))
 
 		return snapshot
 	}
@@ -146,6 +139,16 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 		}
 		Expect(err).ToNot(HaveOccurred())
 		pvc = nil
+	}
+
+	waitDataVolumePopulated := func(namespace, name string) {
+		libstorage.EventuallyDVWith(namespace, name, 180, matcher.HaveSucceeded())
+		// THIS SHOULD NOT BE NECESSARY - but in DV/Populator integration
+		Eventually(func() string {
+			pvc, err := virtClient.CoreV1().PersistentVolumeClaims(namespace).Get(context.Background(), name, metav1.GetOptions{})
+			Expect(err).ToNot(HaveOccurred())
+			return pvc.Spec.VolumeName
+		}, 180*time.Second, time.Second).ShouldNot(BeEmpty())
 	}
 
 	createDenyVolumeSnapshotCreateWebhook := func() {
@@ -197,11 +200,8 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 		content, err := virtClient.VirtualMachineSnapshotContent(vm.Namespace).Get(context.Background(), contentName, metav1.GetOptions{})
 		Expect(err).ToNot(HaveOccurred())
 
-		vmi, err := virtClient.VirtualMachineInstance(vm.Namespace).Get(context.Background(), vm.Name, &metav1.GetOptions{})
-		Expect(err).ToNot(HaveOccurred())
-		vmi.Spec.Volumes = vm.Spec.Template.Spec.Volumes
-		vmi.Spec.Domain.Devices.Disks = vm.Spec.Template.Spec.Domain.Devices.Disks
-		vm.Spec.Template.Spec = vmi.Spec
+		vm.Spec.Template.Spec.Volumes = content.Spec.Source.VirtualMachine.Spec.Template.Spec.Volumes
+		vm.Spec.Template.Spec.Domain.Devices.Disks = content.Spec.Source.VirtualMachine.Spec.Template.Spec.Domain.Devices.Disks
 
 		Expect(*content.Spec.VirtualMachineSnapshotName).To(Equal(snapshot.Name))
 		Expect(content.Spec.Source.VirtualMachine.Spec).To(Equal(vm.Spec))
@@ -246,7 +246,7 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 			Expect(*snapshot.Status.SourceUID).To(Equal(vm.UID))
 
 			contentName := *snapshot.Status.VirtualMachineSnapshotContentName
-			if *vm.Spec.Running {
+			if vm.Spec.Running != nil && *vm.Spec.Running {
 				expectedIndications := []snapshotv1.Indication{snapshotv1.VMSnapshotOnlineSnapshotIndication, snapshotv1.VMSnapshotNoGuestAgentIndication}
 				Expect(snapshot.Status.Indications).To(Equal(expectedIndications))
 				checkOnlineSnapshotExpectedContentSource(vm, contentName, false)
@@ -271,6 +271,16 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 			vm, err = virtClient.VirtualMachine(vm.Namespace).Patch(context.Background(), vm.Name, types.JSONPatchType, patch, &metav1.PatchOptions{})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(*vm.Spec.Running).Should(BeTrue())
+
+			createAndVerifyVMSnapshot(vm)
+		})
+
+		It("should create a snapshot when VM runStrategy is Manual", func() {
+			patch := []byte("[{ \"op\": \"remove\", \"path\": \"/spec/running\"}, { \"op\": \"add\", \"path\": \"/spec/runStrategy\", \"value\": \"Manual\"}]")
+			vm, err = virtClient.VirtualMachine(vm.Namespace).Patch(context.Background(), vm.Name, types.JSONPatchType, patch, &metav1.PatchOptions{})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(vm.Spec.RunStrategy).ToNot(BeNil())
+			Expect(*vm.Spec.RunStrategy).Should(Equal(v1.RunStrategyManual))
 
 			createAndVerifyVMSnapshot(vm)
 		})
@@ -327,7 +337,7 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 					}
 					Expect(err).ToNot(HaveOccurred())
 					return vmi.Status.Phase == v1.Running
-				}, 180*time.Second, time.Second).Should(BeTrue())
+				}, 360*time.Second, time.Second).Should(BeTrue())
 
 				return vm, vmi
 			}
@@ -402,7 +412,7 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 			It("[test_id:6767]with volumes and guest agent available", func() {
 				quantity, err := resource.ParseQuantity("1Gi")
 				Expect(err).ToNot(HaveOccurred())
-				vmi := tests.NewRandomFedoraVMIWithGuestAgent()
+				vmi := tests.NewRandomFedoraVMI()
 				vmi.Namespace = testsuite.GetTestNamespace(nil)
 				vm = tests.NewRandomVirtualMachine(vmi, false)
 				dvName := "dv-" + vm.Name
@@ -445,7 +455,9 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 				})
 
 				vm, vmi = createAndStartVM(vm)
-				libwait.WaitForSuccessfulVMIStartWithTimeout(vmi, 300)
+				libwait.WaitForSuccessfulVMIStart(vmi,
+					libwait.WithTimeout(300),
+				)
 				Eventually(matcher.ThisVMI(vmi), 12*time.Minute, 2*time.Second).Should(matcher.HaveConditionTrue(v1.VirtualMachineInstanceAgentConnected))
 
 				initialMemory := vmi.Spec.Domain.Resources.Requests[corev1.ResourceMemory]
@@ -524,7 +536,9 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 				})
 
 				vm, vmi = createAndStartVM(vm)
-				libwait.WaitForSuccessfulVMIStartWithTimeout(vmi, 300)
+				libwait.WaitForSuccessfulVMIStart(vmi,
+					libwait.WithTimeout(300),
+				)
 
 				snapshot = newSnapshot()
 
@@ -541,12 +555,14 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 			})
 
 			It("[test_id:6769]without volumes with guest agent available", func() {
-				vmi := tests.NewRandomFedoraVMIWithGuestAgent()
+				vmi := tests.NewRandomFedoraVMI()
 				vmi.Namespace = testsuite.GetTestNamespace(nil)
 				vm = tests.NewRandomVirtualMachine(vmi, false)
 
 				vm, vmi = createAndStartVM(vm)
-				libwait.WaitForSuccessfulVMIStartWithTimeout(vmi, 300)
+				libwait.WaitForSuccessfulVMIStart(vmi,
+					libwait.WithTimeout(300),
+				)
 				Eventually(matcher.ThisVMI(vmi), 12*time.Minute, 2*time.Second).Should(matcher.HaveConditionTrue(v1.VirtualMachineInstanceAgentConnected))
 
 				snapshot = newSnapshot()
@@ -719,12 +735,14 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 
 			It("Calling Velero hooks should freeze/unfreeze VM", func() {
 				By("Creating VM")
-				vmi := tests.NewRandomFedoraVMIWithGuestAgent()
+				vmi := tests.NewRandomFedoraVMI()
 				vmi.Namespace = testsuite.GetTestNamespace(nil)
 				vm = tests.NewRandomVirtualMachine(vmi, false)
 
 				vm, vmi = createAndStartVM(vm)
-				libwait.WaitForSuccessfulVMIStartWithTimeout(vmi, 300)
+				libwait.WaitForSuccessfulVMIStart(vmi,
+					libwait.WithTimeout(300),
+				)
 				Eventually(matcher.ThisVMI(vmi), 12*time.Minute, 2*time.Second).Should(matcher.HaveConditionTrue(v1.VirtualMachineInstanceAgentConnected))
 
 				By("Logging into Fedora")
@@ -782,7 +800,9 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 				vm.Spec.Running = &running
 
 				vm, vmi = createAndStartVM(vm)
-				libwait.WaitForSuccessfulVMIStartWithTimeout(vmi, 300)
+				libwait.WaitForSuccessfulVMIStart(vmi,
+					libwait.WithTimeout(300),
+				)
 
 				By("Calling Velero pre-backup hook")
 				_, stderr, err := callVeleroHook(vmi, VELERO_PREBACKUP_HOOK_CONTAINER_ANNOTATION, VELERO_PREBACKUP_HOOK_COMMAND_ANNOTATION)
@@ -797,12 +817,14 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 
 			It("Calling Velero hooks should error if VM is Paused", func() {
 				By("Creating VM")
-				vmi := tests.NewRandomFedoraVMIWithGuestAgent()
+				vmi := tests.NewRandomFedoraVMI()
 				vmi.Namespace = testsuite.GetTestNamespace(nil)
 				vm = tests.NewRandomVirtualMachine(vmi, false)
 
 				vm, vmi = createAndStartVM(vm)
-				libwait.WaitForSuccessfulVMIStartWithTimeout(vmi, 300)
+				libwait.WaitForSuccessfulVMIStart(vmi,
+					libwait.WithTimeout(300),
+				)
 				Eventually(matcher.ThisVMI(vmi), 12*time.Minute, 2*time.Second).Should(matcher.HaveConditionTrue(v1.VirtualMachineInstanceAgentConnected))
 
 				By("Logging into Fedora")
@@ -948,7 +970,7 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 				Expect(err).ToNot(HaveOccurred())
 
 				for _, dvt := range vm.Spec.DataVolumeTemplates {
-					libstorage.EventuallyDVWith(vm.Namespace, dvt.Name, 180, HaveSucceeded())
+					waitDataVolumePopulated(vm.Namespace, dvt.Name)
 				}
 			})
 
@@ -1035,7 +1057,7 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 				Expect(cn).ToNot(BeNil())
 				vmSnapshotContent, err := virtClient.VirtualMachineSnapshotContent(vm.Namespace).Get(context.Background(), *cn, metav1.GetOptions{})
 				Expect(err).ToNot(HaveOccurred())
-
+				Expect(vmSnapshotContent.Spec.VolumeBackups).To(HaveLen(1))
 				vb := vmSnapshotContent.Spec.VolumeBackups[0]
 				Expect(vb.VolumeSnapshotName).ToNot(BeNil())
 
@@ -1053,7 +1075,7 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 
 				errStr := fmt.Sprintf("VolumeSnapshots (%s) missing", *vb.VolumeSnapshotName)
 				Expect(snapshot.Status.Error).ToNot(BeNil())
-				Expect(snapshot.Status.Error.Message).ToNot(Equal(errStr))
+				Expect(snapshot.Status.Error.Message).To(HaveValue(Equal(errStr)))
 			})
 
 			It("should not error if VolumeSnapshot has error", func() {
@@ -1068,7 +1090,7 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 				Expect(cn).ToNot(BeNil())
 				vmSnapshotContent, err := virtClient.VirtualMachineSnapshotContent(vm.Namespace).Get(context.Background(), *cn, metav1.GetOptions{})
 				Expect(err).ToNot(HaveOccurred())
-
+				Expect(vmSnapshotContent.Spec.VolumeBackups).To(HaveLen(1))
 				vb := vmSnapshotContent.Spec.VolumeBackups[0]
 				Expect(vb.VolumeSnapshotName).ToNot(BeNil())
 
@@ -1130,7 +1152,18 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 					Expect(err).ToNot(HaveOccurred())
 
 					return snapshot.Status
-				}, 30*time.Second, 2*time.Second).Should(Satisfy(isSnapshotInProgress))
+				}, 30*time.Second, 2*time.Second).Should(gstruct.PointTo(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+					"Conditions": ContainElements(
+						gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+							"Type":   Equal(snapshotv1.ConditionReady),
+							"Status": Equal(corev1.ConditionFalse)}),
+						gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+							"Type":   Equal(snapshotv1.ConditionProgressing),
+							"Status": Equal(corev1.ConditionTrue),
+							"Reason": Equal("Source locked and operation in progress")}),
+					),
+					"Phase": Equal(snapshotv1.InProgress),
+				})))
 
 				updatedVM, err := virtClient.VirtualMachine(vm.Namespace).Get(context.Background(), vm.Name, &metav1.GetOptions{})
 				Expect(err).ToNot(HaveOccurred())
@@ -1170,24 +1203,32 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 				Expect(err).ToNot(HaveOccurred())
 
 				contentName := fmt.Sprintf("%s-%s", vmSnapshotContent, snapshot.UID)
-				Eventually(func() bool {
+				Eventually(func() *snapshotv1.VirtualMachineSnapshotStatus {
 					snapshot, err = virtClient.VirtualMachineSnapshot(vm.Namespace).Get(context.Background(), snapshot.Name, metav1.GetOptions{})
 					Expect(err).ToNot(HaveOccurred())
 					_, contentErr := virtClient.VirtualMachineSnapshotContent(vm.Namespace).Get(context.Background(), contentName, metav1.GetOptions{})
-					return snapshot.Status != nil &&
-						len(snapshot.Status.Conditions) == 3 &&
-						snapshot.Status.Conditions[0].Status == corev1.ConditionFalse &&
-						strings.Contains(snapshot.Status.Conditions[0].Reason, snapshotDeadlineExceeded) &&
-						snapshot.Status.Conditions[1].Status == corev1.ConditionFalse &&
-						strings.Contains(snapshot.Status.Conditions[1].Reason, notReady) &&
-						snapshot.Status.Conditions[2].Status == corev1.ConditionTrue &&
-						snapshot.Status.Conditions[2].Type == snapshotv1.ConditionFailure &&
-						strings.Contains(snapshot.Status.Conditions[2].Reason, snapshotDeadlineExceeded) &&
-						snapshot.Status.Phase == snapshotv1.Failed &&
-						errors.IsNotFound(contentErr)
-				}, time.Minute, 2*time.Second).Should(BeTrue())
-
-				Eventually(ThisVM(vm), 30*time.Second, 2*time.Second).Should(
+					if !errors.IsNotFound(contentErr) {
+						_, _ = fmt.Fprintf(GinkgoWriter, "Content error is not 'not found' %v", contentErr)
+						return nil
+					}
+					return snapshot.Status
+				}, time.Minute, 2*time.Second).Should(gstruct.PointTo(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+					"Conditions": ContainElements(
+						gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+							"Type":   Equal(snapshotv1.ConditionReady),
+							"Status": Equal(corev1.ConditionFalse)}),
+						gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+							"Type":   Equal(snapshotv1.ConditionProgressing),
+							"Status": Equal(corev1.ConditionFalse),
+							"Reason": Equal(snapshotDeadlineExceeded)}),
+						gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+							"Type":   Equal(snapshotv1.ConditionFailure),
+							"Status": Equal(corev1.ConditionTrue),
+							"Reason": Equal(snapshotDeadlineExceeded)}),
+					),
+					"Phase": Equal(snapshotv1.Failed),
+				})))
+				Eventually(matcher.ThisVM(vm), 30*time.Second, 2*time.Second).Should(
 					And(
 						WithTransform(func(vm *v1.VirtualMachine) *string {
 							return vm.Status.SnapshotInProgress
@@ -1229,7 +1270,7 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 				Expect(err).ToNot(HaveOccurred())
 
 				for _, dvt := range vm.Spec.DataVolumeTemplates {
-					libstorage.EventuallyDVWith(vm.Namespace, dvt.Name, 180, HaveSucceeded())
+					waitDataVolumePopulated(vm.Namespace, dvt.Name)
 				}
 
 				snapshot = newSnapshot()
@@ -1335,7 +1376,7 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 				)
 				dv, err = virtClient.CdiClient().CdiV1beta1().DataVolumes(testsuite.GetTestNamespace(nil)).Create(context.Background(), includedDataVolume, metav1.CreateOptions{})
 				Expect(err).ToNot(HaveOccurred())
-				libstorage.EventuallyDVWith(dv.Namespace, dv.Name, 180, HaveSucceeded())
+				waitDataVolumePopulated(dv.Namespace, dv.Name)
 
 				By("Creating DV with no snapshot supported storage class")
 				excludedDataVolume := libdv.NewDataVolume(
@@ -1379,19 +1420,19 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 
 		Context("With VM using instancetype and preferences", func() {
 
-			var instancetype *instancetypev1alpha2.VirtualMachineInstancetype
+			var instancetype *instancetypev1beta1.VirtualMachineInstancetype
 
 			BeforeEach(func() {
-				instancetype = &instancetypev1alpha2.VirtualMachineInstancetype{
+				instancetype = &instancetypev1beta1.VirtualMachineInstancetype{
 					ObjectMeta: metav1.ObjectMeta{
 						GenerateName: "vm-instancetype-",
 						Namespace:    testsuite.GetTestNamespace(nil),
 					},
-					Spec: instancetypev1alpha2.VirtualMachineInstancetypeSpec{
-						CPU: instancetypev1alpha2.CPUInstancetype{
+					Spec: instancetypev1beta1.VirtualMachineInstancetypeSpec{
+						CPU: instancetypev1beta1.CPUInstancetype{
 							Guest: 1,
 						},
-						Memory: instancetypev1alpha2.MemoryInstancetype{
+						Memory: instancetypev1beta1.MemoryInstancetype{
 							Guest: resource.MustParse("128Mi"),
 						},
 					},
@@ -1414,16 +1455,25 @@ var _ = SIGDescribe("VirtualMachineSnapshot Tests", func() {
 				Expect(err).ToNot(HaveOccurred())
 
 				for _, dvt := range vm.Spec.DataVolumeTemplates {
-					libstorage.EventuallyDVWith(vm.Namespace, dvt.Name, 180, HaveSucceeded())
+					waitDataVolumePopulated(vm.Namespace, dvt.Name)
 				}
 			})
 
-			It("Bug #8435 - should create a snapshot successfully", func() {
+			DescribeTable("Bug #8435 - should create a snapshot successfully", func(toRunSourceVM bool) {
+				if toRunSourceVM {
+					By("Starting the VM and expecting it to run")
+					vm = tests.StartVMAndExpectRunning(virtClient, vm)
+				}
+
 				snapshot = newSnapshot()
 				snapshot, err = virtClient.VirtualMachineSnapshot(snapshot.Namespace).Create(context.Background(), snapshot, metav1.CreateOptions{})
 				Expect(err).ToNot(HaveOccurred())
+
 				waitSnapshotReady()
-			})
+			},
+				Entry("with running source VM", true),
+				Entry("with stopped source VM", false),
+			)
 		})
 	})
 })
@@ -1438,7 +1488,7 @@ func AddVolumeAndVerify(virtClient kubecli.KubevirtClient, storageClass string, 
 	dv, err = virtClient.CdiClient().CdiV1beta1().DataVolumes(vm.Namespace).Create(context.Background(), dv, metav1.CreateOptions{})
 	Expect(err).ToNot(HaveOccurred())
 
-	libstorage.EventuallyDV(dv, 240, HaveSucceeded())
+	libstorage.EventuallyDV(dv, 240, matcher.HaveSucceeded())
 	volumeSource := &v1.HotplugVolumeSource{
 		DataVolume: &v1.DataVolumeSource{
 			Name: dv.Name,

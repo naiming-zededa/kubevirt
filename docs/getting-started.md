@@ -133,6 +133,17 @@ export KUBEVIRT_MEMORY_SIZE=8192M # node has 8GB memory size
 make cluster-up
 ```
 
+You can use the `FEATURE_GATES` environment variable to enable one or more feature gates provided by KubeVirt. The 
+list of feature gates (which evolve in time) can be checked directly from the 
+[source code](https://github.com/kubevirt/kubevirt/blob/main/pkg/virt-config/feature-gates.go).
+
+```bash
+# export FEATURE_GATES=<feature-gate-1>,<feature-gate-2>
+# e.g. to enable Sidecar and HotplugNICs feature gates run below
+$ export FEATURE_GATES=Sidecar,HotplugNICs
+$ make cluster-sync
+```
+
 **Note:** If you see the error below, 
 check if the MTU of the container and the host are the same. 
 If not, try to adjust them to be the same. 
@@ -237,7 +248,7 @@ If you would like to run specific functional tests only, you can leverage `ginkg
 command line options as follows (run a specified suite):
 
 ```
-    FUNC_TEST_ARGS='-focus=vmi_networking_test -regexScansFilePath' make functest
+    FUNC_TEST_ARGS='-focus-file=vmi_networking_test' make functest
 ```
 
 In addition, if you want to run a specific test or tests you can prepend any `Describe`,
@@ -245,7 +256,7 @@ In addition, if you want to run a specific test or tests you can prepend any `De
 that are marked with the prefix. Remember to remove the prefix before issuing
 your pull request.
 
-For additional information check out the [Ginkgo focused specs documentation](http://onsi.github.io/ginkgo/#focused-specs)
+For additional information check out the [Ginkgo focused specs documentation](https://onsi.github.io/ginkgo/#focused-specs)
 
 ## Use
 
@@ -326,7 +337,7 @@ First make sure you have `remote-viewer` installed. On Fedora run:
 dnf install virt-viewer
 ```
 
-Windows users can [download remote-viewer from virt-manager.org](https://virt-manager.org/download/), and may need
+Windows users can [download remote-viewer from virt-manager.org](https://virt-manager.org/download.html), and may need
 to add virt-viewer installation folder to their `PATH`.
 
 Then, after you made sure that the VMI `vmi-ephemeral` is running, type:

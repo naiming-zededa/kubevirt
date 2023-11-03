@@ -33,12 +33,11 @@ import (
 	"syscall"
 	"time"
 
-	"kubevirt.io/kubevirt/pkg/storage/reservation"
 	kvtls "kubevirt.io/kubevirt/pkg/util/tls"
 	"kubevirt.io/kubevirt/pkg/virt-handler/seccomp"
 	"kubevirt.io/kubevirt/pkg/virt-handler/vsock"
 
-	"github.com/emicklei/go-restful"
+	"github.com/emicklei/go-restful/v3"
 	"github.com/golang/glog"
 	flag "github.com/spf13/pflag"
 	k8sv1 "k8s.io/api/core/v1"
@@ -83,6 +82,7 @@ import (
 	virthandler "kubevirt.io/kubevirt/pkg/virt-handler"
 	virtcache "kubevirt.io/kubevirt/pkg/virt-handler/cache"
 	cmdclient "kubevirt.io/kubevirt/pkg/virt-handler/cmd-client"
+	dmetricsmanager "kubevirt.io/kubevirt/pkg/virt-handler/dmetrics-manager"
 	"kubevirt.io/kubevirt/pkg/virt-handler/isolation"
 	migrationproxy "kubevirt.io/kubevirt/pkg/virt-handler/migration-proxy"
 	nodelabeller "kubevirt.io/kubevirt/pkg/virt-handler/node-labeller"
@@ -129,8 +129,6 @@ const (
 
 	// Default network-status downward API file path
 	defaultNetworkStatusFilePath = "/etc/podinfo/network-status"
-
-	unprivilegedContainerSELinuxLabel = "system_u:object_r:container_file_t:s0"
 )
 
 type virtHandlerApp struct {
@@ -188,7 +186,7 @@ func (app *virtHandlerApp) markNodeAsUnschedulable(logger *log.FilteredLogger) {
 	data := []byte(fmt.Sprintf(`{"metadata": { "labels": {"%s": "false"}}}`, v1.NodeSchedulable))
 	_, err := app.virtCli.CoreV1().Nodes().Patch(context.Background(), app.HostOverride, types.StrategicMergePatchType, data, metav1.PatchOptions{})
 	if err != nil {
-		logger.V(1).Level(log.ERROR).Log("Unable to mark node as unschedulable", err.Error())
+		logger.Reason(err).Error("Unable to mark node as unschedulable")
 	}
 }
 
@@ -207,7 +205,7 @@ func (app *virtHandlerApp) Run() {
 	}
 
 	logger := log.Log
-	logger.V(1).Level(log.INFO).Log("hostname", app.HostOverride)
+	logger.V(1).Infof("hostname %s", app.HostOverride)
 	var err error
 
 	// Copy container-disk binary
@@ -309,12 +307,14 @@ func (app *virtHandlerApp) Run() {
 		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 
 	podIsolationDetector := isolation.NewSocketBasedIsolationDetector(app.VirtShareDir)
-	app.clusterConfig = virtconfig.NewClusterConfig(factory.CRD(), factory.KubeVirt(), app.namespace)
+	app.clusterConfig, err = virtconfig.NewClusterConfig(factory.CRD(), factory.KubeVirt(), app.namespace)
+	if err != nil {
+		panic(err)
+	}
 	// set log verbosity
 	app.clusterConfig.SetConfigModifiedCallback(app.shouldChangeLogVerbosity)
 	app.clusterConfig.SetConfigModifiedCallback(app.shouldChangeRateLimiter)
 	app.clusterConfig.SetConfigModifiedCallback(app.shouldInstallKubevirtSeccompProfile)
-	app.clusterConfig.SetConfigModifiedCallback(app.shouldEnablePersistentReservation)
 
 	if err := app.setupTLS(factory); err != nil {
 		glog.Fatalf("Error constructing migration tls config: %v", err)
@@ -335,17 +335,17 @@ func (app *virtHandlerApp) Run() {
 
 	stop := make(chan struct{})
 	defer close(stop)
-	// Currently nodeLabeller only support x86_64
 	var capabilities *api.Capabilities
 	var hostCpuModel string
-	if virtconfig.IsAMD64(runtime.GOARCH) {
-		nodeLabellerrecorder := broadcaster.NewRecorder(scheme.Scheme, k8sv1.EventSource{Component: "node-labeller", Host: app.HostOverride})
-		nodeLabellerController, err := nodelabeller.NewNodeLabeller(app.clusterConfig, app.virtCli, app.HostOverride, app.namespace, nodeLabellerrecorder)
-		if err != nil {
-			panic(err)
-		}
-		capabilities = nodeLabellerController.HostCapabilities()
+	nodeLabellerrecorder := broadcaster.NewRecorder(scheme.Scheme, k8sv1.EventSource{Component: "node-labeller", Host: app.HostOverride})
+	nodeLabellerController, err := nodelabeller.NewNodeLabeller(app.clusterConfig, app.virtCli, app.HostOverride, app.namespace, nodeLabellerrecorder)
+	if err != nil {
+		panic(err)
+	}
+	capabilities = nodeLabellerController.HostCapabilities()
 
+	// Node labelling is only relevant on x86_64 arch.
+	if virtconfig.IsAMD64(runtime.GOARCH) {
 		hostCpuModel = nodeLabellerController.GetHostCpuModel().Name
 
 		go nodeLabellerController.Run(10, stop)
@@ -358,7 +358,9 @@ func (app *virtHandlerApp) Run() {
 		return
 	}
 
-	vmController := virthandler.NewController(
+	downwardMetricsManager := dmetricsmanager.NewDownwardMetricsManager(app.HostOverride)
+
+	vmController, err := virthandler.NewController(
 		recorder,
 		app.virtCli,
 		app.HostOverride,
@@ -375,9 +377,13 @@ func (app *virtHandlerApp) Run() {
 		app.clusterConfig,
 		podIsolationDetector,
 		migrationProxy,
+		downwardMetricsManager,
 		capabilities,
 		hostCpuModel,
 	)
+	if err != nil {
+		panic(err)
+	}
 
 	promErrCh := make(chan error)
 	go app.runPrometheusServer(promErrCh)
@@ -414,7 +420,7 @@ func (app *virtHandlerApp) Run() {
 		if err != nil {
 			panic(err)
 		}
-		err = selinux.RelabelFiles(unprivilegedContainerSELinuxLabel, se.IsPermissive(), devTun, devNull)
+		err = selinux.RelabelFiles(util.UnprivilegedContainerSELinuxLabel, se.IsPermissive(), devTun, devNull)
 		if err != nil {
 			panic(fmt.Errorf("error relabeling required files: %v", err))
 		}
@@ -544,34 +550,6 @@ func (app *virtHandlerApp) shouldInstallKubevirtSeccompProfile() {
 
 }
 
-func (app *virtHandlerApp) shouldEnablePersistentReservation() {
-	enabled := app.clusterConfig.PersistentReservationEnabled()
-	if !enabled {
-		log.DefaultLogger().Info("Persistent Reservation is not enabled")
-		return
-	}
-	prSockDir, err := safepath.JoinAndResolveWithRelativeRoot("/", reservation.GetPrHelperHostSocketDir())
-	if err != nil {
-		panic(err)
-	}
-	err = safepath.ChownAtNoFollow(prSockDir, util.NonRootUID, util.NonRootUID)
-	if err != nil {
-		panic(err)
-	}
-	se, exists, err := selinux.NewSELinux()
-	if err == nil && exists {
-		err = selinux.RelabelFiles(unprivilegedContainerSELinuxLabel, se.IsPermissive(), prSockDir)
-		if err != nil {
-			panic(fmt.Errorf("error relabeling required files: %v", err))
-		}
-	} else if err != nil {
-		panic(fmt.Errorf("failed to detect the presence of selinux: %v", err))
-	}
-
-	log.DefaultLogger().Infof("set permission for %s", reservation.GetPrHelperHostSocketDir())
-
-}
-
 func (app *virtHandlerApp) runPrometheusServer(errCh chan error) {
 	mux := restful.NewContainer()
 	webService := new(restful.WebService)
@@ -590,6 +568,9 @@ func (app *virtHandlerApp) runPrometheusServer(errCh chan error) {
 		Addr:      app.ServiceListen.Address(),
 		Handler:   mux,
 		TLSConfig: app.promTLSConfig,
+		// Disable HTTP/2
+		// See CVE-2023-44487
+		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
 	errCh <- server.ListenAndServeTLS("", "")
 }
@@ -608,6 +589,9 @@ func (app *virtHandlerApp) runServer(errCh chan error, consoleHandler *rest.Cons
 	ws.Route(ws.GET("/v1/namespaces/{namespace}/virtualmachineinstances/{name}/userlist").To(lifecycleHandler.GetUsers).Produces(restful.MIME_JSON).Consumes(restful.MIME_JSON).Returns(http.StatusOK, "OK", v1.VirtualMachineInstanceGuestOSUserList{}))
 	ws.Route(ws.GET("/v1/namespaces/{namespace}/virtualmachineinstances/{name}/filesystemlist").To(lifecycleHandler.GetFilesystems).Produces(restful.MIME_JSON).Consumes(restful.MIME_JSON).Returns(http.StatusOK, "OK", v1.VirtualMachineInstanceFileSystemList{}))
 	ws.Route(ws.GET("/v1/namespaces/{namespace}/virtualmachineinstances/{name}/vsock").Param(restful.QueryParameter("port", "Target VSOCK port")).To(consoleHandler.VSOCKHandler))
+	ws.Route(ws.GET("/v1/namespaces/{namespace}/virtualmachineinstances/{name}/sev/fetchcertchain").To(lifecycleHandler.SEVFetchCertChainHandler).Produces(restful.MIME_JSON).Consumes(restful.MIME_JSON).Returns(http.StatusOK, "OK", v1.SEVPlatformInfo{}))
+	ws.Route(ws.GET("/v1/namespaces/{namespace}/virtualmachineinstances/{name}/sev/querylaunchmeasurement").To(lifecycleHandler.SEVQueryLaunchMeasurementHandler).Produces(restful.MIME_JSON).Consumes(restful.MIME_JSON).Returns(http.StatusOK, "OK", v1.SEVMeasurementInfo{}))
+	ws.Route(ws.PUT("/v1/namespaces/{namespace}/virtualmachineinstances/{name}/sev/injectlaunchsecret").To(lifecycleHandler.SEVInjectLaunchSecretHandler))
 	restful.DefaultContainer.Add(ws)
 	server := &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", app.ServiceListen.BindAddress, app.consoleServerPort),

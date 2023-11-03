@@ -20,6 +20,7 @@
 package device_manager
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -32,7 +33,6 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
 	"kubevirt.io/client-go/log"
@@ -40,6 +40,7 @@ import (
 	"kubevirt.io/kubevirt/pkg/safepath"
 	"kubevirt.io/kubevirt/pkg/util"
 	pluginapi "kubevirt.io/kubevirt/pkg/virt-handler/device-manager/deviceplugin/v1beta1"
+	"kubevirt.io/kubevirt/pkg/virt-handler/selinux"
 )
 
 type SocketDevicePlugin struct {
@@ -64,6 +65,7 @@ func NewSocketDevicePlugin(socketName, socketDir, socket string, maxDevices int)
 		socket:           socket,
 		socketDir:        socketDir,
 		socketName:       socketName,
+		health:           make(chan deviceHealth),
 		resourceName:     fmt.Sprintf("%s/%s", DeviceNamespace, socketName),
 		initialized:      false,
 		lock:             &sync.Mutex{},
@@ -76,10 +78,6 @@ func NewSocketDevicePlugin(socketName, socketDir, socket string, maxDevices int)
 		})
 	}
 	return dpi
-}
-
-func (dpi *SocketDevicePlugin) GetDevicePath() string {
-	return dpi.socketDir
 }
 
 func (dpi *SocketDevicePlugin) GetDeviceName() string {
@@ -218,6 +216,13 @@ func (dpi *SocketDevicePlugin) Allocate(ctx context.Context, r *pluginapi.Alloca
 	if err != nil {
 		return nil, fmt.Errorf("error setting the permission the socket %s/%s:%v", dpi.socketDir, dpi.socket, err)
 	}
+	if se, exists, err := selinux.NewSELinux(); err == nil && exists {
+		if err := selinux.RelabelFiles(util.UnprivilegedContainerSELinuxLabel, se.IsPermissive(), prSock); err != nil {
+			return nil, fmt.Errorf("error relabeling required files: %v", err)
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to detect the presence of selinux: %v", err)
+	}
 
 	m := new(pluginapi.Mount)
 	m.HostPath = dpi.socketDir
@@ -258,13 +263,10 @@ func (dpi *SocketDevicePlugin) healthCheck() error {
 	}
 	defer watcher.Close()
 
-	// This way we don't have to mount /dev from the node
 	devicePath := filepath.Join(dpi.socketDir, dpi.socket)
 
 	// Start watching the files before we check for their existence to avoid races
-	dirName := filepath.Dir(devicePath)
-	err = watcher.Add(dirName)
-
+	err = watcher.Add(dpi.socketDir)
 	if err != nil {
 		return fmt.Errorf("failed to add the device root path to the watcher: %v", err)
 	}
@@ -277,15 +279,15 @@ func (dpi *SocketDevicePlugin) healthCheck() error {
 		logger.Warningf("device '%s' is not present, the device plugin can't expose it.", dpi.socketName)
 		dpi.health <- deviceHealth{Health: pluginapi.Unhealthy}
 	}
-	logger.Infof("device '%s' is present.", dpi.socketDir)
+	logger.Infof("device '%s' is present.", devicePath)
 
-	dirName = filepath.Dir(dpi.socketDir)
+	dirName := filepath.Dir(dpi.pluginSocketPath)
 	err = watcher.Add(dirName)
 
 	if err != nil {
 		return fmt.Errorf("failed to add the device-plugin kubelet path to the watcher: %v", err)
 	}
-	_, err = os.Stat(dpi.socketDir)
+	_, err = os.Stat(dpi.pluginSocketPath)
 	if err != nil {
 		return fmt.Errorf("failed to stat the device-plugin socket: %v", err)
 	}
@@ -307,7 +309,7 @@ func (dpi *SocketDevicePlugin) healthCheck() error {
 					logger.Infof("monitored device %s disappeared", dpi.socketName)
 					dpi.health <- deviceHealth{Health: pluginapi.Unhealthy}
 				}
-			} else if event.Name == dpi.socketDir && event.Op == fsnotify.Remove {
+			} else if event.Name == dpi.pluginSocketPath && event.Op == fsnotify.Remove {
 				logger.Infof("device socket file for device %s was removed, kubelet probably restarted.", dpi.socketName)
 				return nil
 			}

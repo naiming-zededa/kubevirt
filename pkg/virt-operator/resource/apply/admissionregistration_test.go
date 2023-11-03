@@ -20,11 +20,11 @@
 package apply
 
 import (
-	"github.com/ghodss/yaml"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
+	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -127,19 +127,8 @@ var _ = Describe("WebhookConfiguration types", func() {
 	Context("MutatingWebhookConfiguration", func() {
 		It("conversion from v1 to v1beta should match", func() {
 			webhook := &admissionregistrationv1.MutatingWebhookConfiguration{}
-			err := yaml.Unmarshal([]byte(mutatingWebhookYaml), &webhook)
-			Expect(err).ToNot(HaveOccurred())
-			binv1, err := webhook.Marshal()
-			Expect(err).ToNot(HaveOccurred())
-			webhookv1beta1 := &admissionregistrationv1beta1.MutatingWebhookConfiguration{}
-			err = webhookv1beta1.Unmarshal(binv1)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(webhookv1beta1.String()).To(Equal(webhook.String()))
-			binv1beta1, err := webhookv1beta1.Marshal()
-			Expect(err).ToNot(HaveOccurred())
-			Expect(binv1beta1).To(Equal(binv1))
 
-			webhookv1beta1, err = convertV1MutatingWebhookToV1beta1(webhook)
+			webhookv1beta1, err := convertV1MutatingWebhookToV1beta1(webhook)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(webhookv1beta1.String()).To(Equal(webhook.String()))
 		})

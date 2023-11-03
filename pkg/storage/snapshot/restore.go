@@ -564,16 +564,15 @@ func (t *vmRestoreTarget) reconcileSpec() (bool, error) {
 	newVM.Spec.Template.Spec.Volumes = newVolumes
 	setLastRestoreAnnotation(t.vmRestore, newVM)
 
-	newVM, err = patchVM(newVM, t.vmRestore.Spec.Patches)
-	if err != nil {
-		return false, fmt.Errorf("error patching VM %s: %v", newVM.Name, err)
-	}
-
 	if err = t.restoreInstancetypeControllerRevisions(newVM); err != nil {
 		return false, err
 	}
 
 	if !t.doesTargetVMExist() {
+		newVM, err = patchVM(newVM, t.vmRestore.Spec.Patches)
+		if err != nil {
+			return false, fmt.Errorf("error patching VM %s: %v", newVM.Name, err)
+		}
 		newVM, err = t.controller.Client.VirtualMachine(t.vmRestore.Namespace).Create(context.Background(), newVM)
 	} else {
 		newVM, err = t.controller.Client.VirtualMachine(newVM.Namespace).Update(context.Background(), newVM)
@@ -599,15 +598,17 @@ func (t *vmRestoreTarget) reconcileDataVolumes() (bool, error) {
 			return false, err
 		}
 		if dv != nil {
-			waitingDV = dv.Status.Phase != v1beta1.Succeeded && dv.Status.Phase != v1beta1.WaitForFirstConsumer
+			waitingDV = waitingDV ||
+				(dv.Status.Phase != v1beta1.Succeeded &&
+					dv.Status.Phase != v1beta1.WaitForFirstConsumer &&
+					dv.Status.Phase != v1beta1.PendingPopulation)
 			continue
 		}
-		if createdDV, err = t.createDataVolume(dvt); err != nil {
+		created, err := t.createDataVolume(dvt)
+		if err != nil {
 			return false, err
 		}
-		if !createdDV {
-			continue
-		}
+		createdDV = createdDV || created
 	}
 	return createdDV || waitingDV, nil
 }
@@ -646,6 +647,7 @@ func (t *vmRestoreTarget) restoreInstancetypeControllerRevision(vmSnapshotRevisi
 	restoredCRName := strings.Replace(vmSnapshotRevisionName, vmSnapshotName, vm.Name, 1)
 	restoredCR := snapshotCR.DeepCopy()
 	restoredCR.ObjectMeta.Reset()
+	restoredCR.ObjectMeta.SetLabels(snapshotCR.Labels)
 	restoredCR.Name = restoredCRName
 
 	// If the target VirtualMachine already exists it's likely that the original ControllerRevision is already present.
@@ -1023,10 +1025,15 @@ func CreateRestorePVCDef(restorePVCName string, volumeSnapshot *vsv1.VolumeSnaps
 		Kind:     "VolumeSnapshot",
 		Name:     *volumeBackup.VolumeSnapshotName,
 	}
+	dataSourceRef := corev1.TypedObjectReference{
+		APIGroup: &apiGroup,
+		Kind:     "VolumeSnapshot",
+		Name:     *volumeBackup.VolumeSnapshotName,
+	}
 
 	// We need to overwrite both dataSource and dataSourceRef to avoid incompatibilities between the two
 	pvc.Spec.DataSource = &dataSource
-	pvc.Spec.DataSourceRef = &dataSource
+	pvc.Spec.DataSourceRef = &dataSourceRef
 
 	pvc.Spec.VolumeName = ""
 	return pvc

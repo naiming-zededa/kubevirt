@@ -248,63 +248,92 @@ var initCert = func(ctrl *VMExportController) {
 }
 
 // Init initializes the export controller
-func (ctrl *VMExportController) Init() {
-	ctrl.clusterConfig = virtconfig.NewClusterConfig(ctrl.CRDInformer, ctrl.KubeVirtInformer, ctrl.KubevirtNamespace)
+func (ctrl *VMExportController) Init() error {
+	var err error
+	ctrl.clusterConfig, err = virtconfig.NewClusterConfig(ctrl.CRDInformer, ctrl.KubeVirtInformer, ctrl.KubevirtNamespace)
+	if err != nil {
+		return err
+	}
 	ctrl.vmExportQueue = workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "virt-controller-export-vmexport")
 
-	ctrl.VMExportInformer.AddEventHandler(
+	_, err = ctrl.VMExportInformer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    ctrl.handleVMExport,
 			UpdateFunc: func(oldObj, newObj interface{}) { ctrl.handleVMExport(newObj) },
 		},
 	)
-	ctrl.PodInformer.AddEventHandler(
+	if err != nil {
+		return err
+	}
+
+	_, err = ctrl.PodInformer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    ctrl.handlePod,
 			UpdateFunc: func(oldObj, newObj interface{}) { ctrl.handlePod(newObj) },
 			DeleteFunc: ctrl.handlePod,
 		},
 	)
-	ctrl.ServiceInformer.AddEventHandler(
+	if err != nil {
+		return err
+	}
+	_, err = ctrl.ServiceInformer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    ctrl.handleService,
 			UpdateFunc: func(oldObj, newObj interface{}) { ctrl.handleService(newObj) },
 			DeleteFunc: ctrl.handleService,
 		},
 	)
-	ctrl.PVCInformer.AddEventHandler(
+	if err != nil {
+		return err
+	}
+	_, err = ctrl.PVCInformer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    ctrl.handlePVC,
 			UpdateFunc: func(oldObj, newObj interface{}) { ctrl.handlePVC(newObj) },
 			DeleteFunc: ctrl.handlePVC,
 		},
 	)
-	ctrl.VMSnapshotInformer.AddEventHandler(
+	if err != nil {
+		return err
+	}
+	_, err = ctrl.VMSnapshotInformer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    ctrl.handleVMSnapshot,
 			UpdateFunc: func(oldObj, newObj interface{}) { ctrl.handleVMSnapshot(newObj) },
 			DeleteFunc: ctrl.handleVMSnapshot,
 		},
 	)
-	ctrl.VMIInformer.AddEventHandler(
+	if err != nil {
+		return err
+	}
+	_, err = ctrl.VMIInformer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    ctrl.handleVMI,
 			UpdateFunc: func(oldObj, newObj interface{}) { ctrl.handleVMI(newObj) },
 			DeleteFunc: ctrl.handleVMI,
 		},
 	)
-	ctrl.VMInformer.AddEventHandler(
+	if err != nil {
+		return err
+	}
+	_, err = ctrl.VMInformer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    ctrl.handleVM,
 			UpdateFunc: func(oldObj, newObj interface{}) { ctrl.handleVM(newObj) },
 			DeleteFunc: ctrl.handleVM,
 		},
 	)
-	ctrl.KubeVirtInformer.AddEventHandler(
+	if err != nil {
+		return err
+	}
+	_, err = ctrl.KubeVirtInformer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			UpdateFunc: ctrl.handleKubeVirt,
 		},
 	)
+	if err != nil {
+		return err
+	}
 	ctrl.instancetypeMethods = &instancetype.InstancetypeMethods{
 		InstancetypeStore:        ctrl.InstancetypeInformer.GetStore(),
 		ClusterInstancetypeStore: ctrl.ClusterInstancetypeInformer.GetStore(),
@@ -315,6 +344,7 @@ func (ctrl *VMExportController) Init() {
 	}
 
 	initCert(ctrl)
+	return nil
 }
 
 // Run the controller
@@ -787,7 +817,7 @@ func (ctrl *VMExportController) createServiceManifest(vmExport *exportv1.Virtual
 func (ctrl *VMExportController) getExporterPod(vmExport *exportv1.VirtualMachineExport) (*corev1.Pod, bool, error) {
 	key := controller.NamespacedKey(vmExport.Namespace, ctrl.getExportPodName(vmExport))
 	if obj, exists, err := ctrl.PodInformer.GetStore().GetByKey(key); err != nil {
-		log.Log.V(3).Errorf("error %v", err)
+		log.Log.Errorf("error %v", err)
 		return nil, false, err
 	} else if !exists {
 		return nil, exists, nil
@@ -801,7 +831,7 @@ func (ctrl *VMExportController) createExporterPod(vmExport *exportv1.VirtualMach
 	log.Log.V(3).Infof("Checking if pod exists: %s/%s", vmExport.Namespace, ctrl.getExportPodName(vmExport))
 	key := controller.NamespacedKey(vmExport.Namespace, ctrl.getExportPodName(vmExport))
 	if obj, exists, err := ctrl.PodInformer.GetStore().GetByKey(key); err != nil {
-		log.Log.V(3).Errorf("error %v", err)
+		log.Log.Errorf("error %v", err)
 		return nil, err
 	} else if !exists {
 		manifest, err := ctrl.createExporterPodManifest(vmExport, service, pvcs)
@@ -1298,7 +1328,7 @@ func (ctrl *VMExportController) expandVirtualMachine(vm *virtv1.VirtualMachine) 
 		return vm, nil
 	}
 
-	conflicts := ctrl.instancetypeMethods.ApplyToVmi(field.NewPath("spec", "template", "spec"), instancetypeSpec, preferenceSpec, &vm.Spec.Template.Spec)
+	conflicts := ctrl.instancetypeMethods.ApplyToVmi(field.NewPath("spec", "template", "spec"), instancetypeSpec, preferenceSpec, &vm.Spec.Template.Spec, &vm.Spec.Template.ObjectMeta)
 	if len(conflicts) > 0 {
 		return nil, fmt.Errorf("cannot expand instancetype to VM, due to %d conflicts", len(conflicts))
 	}
@@ -1399,6 +1429,9 @@ func (ctrl *VMExportController) createExportHttpDvFromPVC(namespace, name string
 	if pvc != nil {
 		pvc.Spec.VolumeName = ""
 		pvc.Spec.StorageClassName = nil
+		// Don't copy datasources, will be populated by CDI with the datavolume
+		pvc.Spec.DataSource = nil
+		pvc.Spec.DataSourceRef = nil
 		return &cdiv1.DataVolume{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name,
