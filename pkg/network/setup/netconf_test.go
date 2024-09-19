@@ -101,9 +101,10 @@ var _ = Describe("netconf", func() {
 		Expect(netConf.Setup(vmi, vmi.Spec.Networks, launcherPid, netPreSetupDummyNoop)).To(Succeed())
 		Expect(stateCache.stateCache).To(BeEmpty())
 	},
-		Entry("binding", v1.InterfaceBindingMethod{}),
 		Entry("SR-IOV", v1.InterfaceBindingMethod{SRIOV: &v1.InterfaceSRIOV{}}),
-		Entry("macvtap", v1.InterfaceBindingMethod{Macvtap: &v1.InterfaceMacvtap{}}),
+
+		// Macvtap is removed in v1.3. This scenario is tracking old VMIs that are still processed in the reconcile loop.
+		Entry("macvtap", v1.InterfaceBindingMethod{DeprecatedMacvtap: &v1.DeprecatedInterfaceMacvtap{}}),
 	)
 
 	It("fails the pre-setup run", func() {

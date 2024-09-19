@@ -175,17 +175,17 @@ var _ = Describe("Resource pod spec renderer", func() {
 		userSpecifiedCPU := kubev1.ResourceList{kubev1.ResourceCPU: userCPURequest}
 
 		It("the user requested CPU configs are *not* overriden", func() {
-			rr = NewResourceRenderer(nil, userSpecifiedCPU, WithCPUPinning(&v1.CPU{Cores: 5}))
+			rr = NewResourceRenderer(nil, userSpecifiedCPU, WithCPUPinning(&v1.CPU{Cores: 5}, map[string]string{}))
 			Expect(rr.Requests()).To(HaveKeyWithValue(kubev1.ResourceCPU, userCPURequest))
 		})
 
 		It("carries over the CPU limits as requests when no CPUs are requested", func() {
-			rr = NewResourceRenderer(userSpecifiedCPU, nil, WithCPUPinning(&v1.CPU{}))
+			rr = NewResourceRenderer(userSpecifiedCPU, nil, WithCPUPinning(&v1.CPU{}, map[string]string{}))
 			Expect(rr.Requests()).To(HaveKeyWithValue(kubev1.ResourceCPU, userCPURequest))
 		})
 
 		It("carries over the CPU requests as limits when no CPUs are requested", func() {
-			rr = NewResourceRenderer(nil, userSpecifiedCPU, WithCPUPinning(&v1.CPU{}))
+			rr = NewResourceRenderer(nil, userSpecifiedCPU, WithCPUPinning(&v1.CPU{}, map[string]string{}))
 			Expect(rr.Requests()).To(HaveKeyWithValue(kubev1.ResourceCPU, userCPURequest))
 		})
 
@@ -195,41 +195,47 @@ var _ = Describe("Resource pod spec renderer", func() {
 				kubev1.ResourceCPU:    userCPURequest,
 				kubev1.ResourceMemory: memoryRequest,
 			}
-			rr = NewResourceRenderer(nil, userSpecifiedCPU, WithCPUPinning(&v1.CPU{Cores: 5}))
+			rr = NewResourceRenderer(nil, userSpecifiedCPU, WithCPUPinning(&v1.CPU{Cores: 5}, map[string]string{}))
 			Expect(rr.Requests()).To(HaveKeyWithValue(kubev1.ResourceCPU, resource.MustParse("200m")))
 			Expect(rr.Limits()).To(HaveKeyWithValue(kubev1.ResourceMemory, memoryRequest))
 		})
 
 		When("an isolated emulator thread is requested", func() {
-			cpuIsolatedEmulatorThreadOverhead := resource.MustParse("1000m")
 			userSpecifiedCPURequest := kubev1.ResourceList{kubev1.ResourceCPU: userCPURequest}
 
-			DescribeTable("requires an additional 1000m CPU, and an additional CPU is added to the limits", func(defineUserSpecifiedCPULimit bool) {
+			DescribeTable("requires additional EmulatorThread CPUs overhead, and additional CPUs added to the limits",
+				func(vmiAnnotations map[string]string, defineUserSpecifiedCPULimit bool, cores uint32, expectedCPUOverhead string) {
+					cpuIsolatedEmulatorThreadOverhead := resource.MustParse(expectedCPUOverhead)
+					var userSpecifiedCPULimit kubev1.ResourceList
 
-				var userSpecifiedCPULimit kubev1.ResourceList
+					if defineUserSpecifiedCPULimit {
+						userSpecifiedCPULimit = kubev1.ResourceList{kubev1.ResourceCPU: userCPURequest}
+					}
 
-				if defineUserSpecifiedCPULimit {
-					userSpecifiedCPULimit = kubev1.ResourceList{kubev1.ResourceCPU: userCPURequest}
-				}
-				rr = NewResourceRenderer(
-					userSpecifiedCPULimit,
-					userSpecifiedCPURequest,
-					WithCPUPinning(&v1.CPU{
-						Cores:                 5,
-						IsolateEmulatorThread: true,
-					}),
-				)
-				Expect(rr.Limits()).To(HaveKeyWithValue(
-					kubev1.ResourceCPU,
-					*resource.NewQuantity(6, resource.BinarySI),
-				))
-				Expect(rr.Requests()).To(HaveKeyWithValue(
-					kubev1.ResourceCPU,
-					addResources(userCPURequest, cpuIsolatedEmulatorThreadOverhead),
-				))
-			},
-				Entry("only CPU requests set by the user", false),
-				Entry("request and limits set by the user", true),
+					rr = NewResourceRenderer(
+						userSpecifiedCPULimit,
+						userSpecifiedCPURequest,
+						WithCPUPinning(&v1.CPU{
+							Cores:                 cores,
+							IsolateEmulatorThread: true,
+						},
+							vmiAnnotations),
+					)
+					Expect(rr.Limits()).To(HaveKeyWithValue(
+						kubev1.ResourceCPU,
+						*resource.NewQuantity(cpuIsolatedEmulatorThreadOverhead.Value()+int64(cores), resource.BinarySI),
+					))
+					Expect(rr.Requests()).To(HaveKeyWithValue(
+						kubev1.ResourceCPU,
+						addResources(userCPURequest, cpuIsolatedEmulatorThreadOverhead),
+					))
+				},
+				Entry("EmulatorThreadCompleteToEvenParity mode is disabled, only CPU requests set by the user", map[string]string{}, false, uint32(5), "1000m"),
+				Entry("EmulatorThreadCompleteToEvenParity mode is disabled, request and limits set by the user", map[string]string{}, true, uint32(5), "1000m"),
+				Entry("EmulatorThreadCompleteToEvenParity mode is enabled, only CPU requests set by the user, odd amount of cores is requested", map[string]string{v1.EmulatorThreadCompleteToEvenParity: ""}, false, uint32(5), "1000m"),
+				Entry("EmulatorThreadCompleteToEvenParity mode is enabled, only CPU requests set by the user, even amount of cores is requested", map[string]string{v1.EmulatorThreadCompleteToEvenParity: ""}, false, uint32(6), "2000m"),
+				Entry("EmulatorThreadCompleteToEvenParity mode is enabled, request and limits set by the user, odd amount of cores is requested", map[string]string{v1.EmulatorThreadCompleteToEvenParity: ""}, true, uint32(5), "1000m"),
+				Entry("EmulatorThreadCompleteToEvenParity mode is enabled, request and limits set by the user, even amount of cores is requested", map[string]string{v1.EmulatorThreadCompleteToEvenParity: ""}, true, uint32(6), "2000m"),
 			)
 		})
 	})
@@ -328,6 +334,13 @@ var _ = Describe("Resource pod spec renderer", func() {
 
 	defaultRequest := func() kubev1.ResourceList {
 		return kubev1.ResourceList{
+			kubev1.ResourceCPU:    resource.MustParse("10m"),
+			kubev1.ResourceMemory: resource.MustParse("2M"),
+		}
+	}
+
+	defaultLimit := func() kubev1.ResourceList {
+		return kubev1.ResourceList{
 			kubev1.ResourceCPU:    resource.MustParse("100m"),
 			kubev1.ResourceMemory: resource.MustParse("80M"),
 		}
@@ -355,7 +368,7 @@ var _ = Describe("Resource pod spec renderer", func() {
 		Expect(res.Requests).To(BeEquivalentTo(expectedReq))
 		Expect(res.Limits).To(BeEquivalentTo(expectedLim))
 	},
-		Entry("empty request/limit", kubev1.ResourceList{}, kubev1.ResourceList{}, defaultRequest(), defaultRequest()),
+		Entry("empty request/limit", kubev1.ResourceList{}, kubev1.ResourceList{}, defaultRequest(), defaultLimit()),
 		Entry("empty request, set limit", kubev1.ResourceList{}, kubev1.ResourceList{
 			kubev1.ResourceCPU:    resource.MustParse("25m"),
 			kubev1.ResourceMemory: resource.MustParse("32M"),
@@ -369,7 +382,7 @@ var _ = Describe("Resource pod spec renderer", func() {
 		}, kubev1.ResourceList{}, kubev1.ResourceList{
 			kubev1.ResourceCPU:    resource.MustParse("140m"),
 			kubev1.ResourceMemory: resource.MustParse("1024M"),
-		}, defaultRequest()),
+		}, defaultLimit()),
 		Entry("set request, set limit", kubev1.ResourceList{
 			kubev1.ResourceCPU:    resource.MustParse("25m"),
 			kubev1.ResourceMemory: resource.MustParse("32M"),
@@ -389,7 +402,7 @@ var _ = Describe("Resource pod spec renderer", func() {
 			kubev1.ResourceCPU:    resource.MustParse("140m"),
 			kubev1.ResourceMemory: resource.MustParse("1024M"),
 		}, kubev1.ResourceList{
-			kubev1.ResourceCPU:    resource.MustParse("100m"),
+			kubev1.ResourceCPU:    resource.MustParse("10m"),
 			kubev1.ResourceMemory: resource.MustParse("32M"),
 		}, kubev1.ResourceList{
 			kubev1.ResourceCPU:    resource.MustParse("140m"),
@@ -402,7 +415,7 @@ var _ = Describe("Resource pod spec renderer", func() {
 			kubev1.ResourceMemory: resource.MustParse("1024M"),
 		}, kubev1.ResourceList{
 			kubev1.ResourceCPU:    resource.MustParse("25m"),
-			kubev1.ResourceMemory: resource.MustParse("80M"),
+			kubev1.ResourceMemory: resource.MustParse("2M"),
 		}, kubev1.ResourceList{
 			kubev1.ResourceCPU:    resource.MustParse("140m"),
 			kubev1.ResourceMemory: resource.MustParse("1024M"),
@@ -448,7 +461,6 @@ var _ = Describe("GetMemoryOverhead calculation", func() {
 		downwardmetricsOverhead *resource.Quantity
 		sevOverhead             *resource.Quantity
 		tpmOverhead             *resource.Quantity
-		passtOverhead           *resource.Quantity
 	)
 
 	BeforeEach(func() {
@@ -475,7 +487,6 @@ var _ = Describe("GetMemoryOverhead calculation", func() {
 		downwardmetricsOverhead = pointer.P(resource.MustParse("1Mi"))
 		sevOverhead = pointer.P(resource.MustParse("256Mi"))
 		tpmOverhead = pointer.P(resource.MustParse("53Mi"))
-		passtOverhead = pointer.P(resource.MustParse("800Mi"))
 	})
 
 	When("the vmi is not requesting any specific device or cpu or whatever", func() {
@@ -650,31 +661,6 @@ var _ = Describe("GetMemoryOverhead calculation", func() {
 			expected.Add(*videoRAMOverhead)
 			expected.Add(*coresOverhead)
 			expected.Add(*tpmOverhead)
-			overhead := GetMemoryOverhead(vmi, "amd64", nil)
-			Expect(overhead.Value()).To(BeEquivalentTo(expected.Value()))
-		})
-	})
-
-	When("the vmi requests interfaces with Passt binding", func() {
-		BeforeEach(func() {
-			vmi.Spec.Domain.Devices = v1.Devices{
-				Interfaces: []v1.Interface{
-					{Name: "passt1", InterfaceBindingMethod: v1.InterfaceBindingMethod{Passt: &v1.InterfacePasst{}}},
-					{Name: "passt2", InterfaceBindingMethod: v1.InterfaceBindingMethod{Passt: &v1.InterfacePasst{}}},
-					{Name: "passt3", InterfaceBindingMethod: v1.InterfaceBindingMethod{Passt: &v1.InterfacePasst{}}},
-					{Name: "nonpasst", InterfaceBindingMethod: v1.InterfaceBindingMethod{Bridge: &v1.InterfaceBridge{}}},
-				},
-			}
-		})
-
-		It("should add passt overhead for each interface", func() {
-			expected := resource.NewScaledQuantity(0, resource.Kilo)
-			expected.Add(*baseOverhead)
-			expected.Add(*staticOverhead)
-			expected.Add(*videoRAMOverhead)
-			expected.Add(*coresOverhead)
-			value := passtOverhead.Value() * 3
-			expected.Add(*resource.NewQuantity(value, passtOverhead.Format))
 			overhead := GetMemoryOverhead(vmi, "amd64", nil)
 			Expect(overhead.Value()).To(BeEquivalentTo(expected.Value()))
 		})

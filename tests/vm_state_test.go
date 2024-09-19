@@ -5,28 +5,29 @@ import (
 	"fmt"
 	"time"
 
-	"kubevirt.io/kubevirt/tests/libmigration"
-
-	"kubevirt.io/kubevirt/tests/testsuite"
-
-	"kubevirt.io/kubevirt/tests/libnet"
-
-	"kubevirt.io/kubevirt/tests/libvmi"
-
 	expect "github.com/google/goexpect"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/errors"
-	k8smetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/pointer"
 	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
 
+	"kubevirt.io/kubevirt/pkg/libvmi"
+	libvmici "kubevirt.io/kubevirt/pkg/libvmi/cloudinit"
 	backendstorage "kubevirt.io/kubevirt/pkg/storage/backend-storage"
-	"kubevirt.io/kubevirt/tests"
+
 	"kubevirt.io/kubevirt/tests/console"
 	"kubevirt.io/kubevirt/tests/decorators"
+	"kubevirt.io/kubevirt/tests/framework/matcher"
+	"kubevirt.io/kubevirt/tests/libmigration"
+	"kubevirt.io/kubevirt/tests/libnet"
+	"kubevirt.io/kubevirt/tests/libnet/cloudinit"
+	"kubevirt.io/kubevirt/tests/libvmifact"
+	"kubevirt.io/kubevirt/tests/libvmops"
 	"kubevirt.io/kubevirt/tests/libwait"
+	"kubevirt.io/kubevirt/tests/testsuite"
 )
 
 var _ = Describe("[sig-storage]VM state", decorators.SigStorage, decorators.RequiresRWXFilesystemStorage, func() {
@@ -39,29 +40,15 @@ var _ = Describe("[sig-storage]VM state", decorators.SigStorage, decorators.Requ
 	})
 
 	Context("with persistent TPM VM option enabled", func() {
-		stopVM := func(vm *v1.VirtualMachine) {
-			By("Stopping the VM")
-			err = virtClient.VirtualMachine(vm.Namespace).Stop(context.Background(), vm.Name, &v1.StopOptions{})
-			ExpectWithOffset(1, err).ToNot(HaveOccurred())
-			EventuallyWithOffset(1, func() error {
-				_, err = virtClient.VirtualMachineInstance(vm.Namespace).Get(context.Background(), vm.Name, &k8smetav1.GetOptions{})
-				return err
-			}, 300*time.Second, 1*time.Second).ShouldNot(Succeed())
-		}
 		startVM := func(vm *v1.VirtualMachine) {
 			By("Starting the VM")
-			err = virtClient.VirtualMachine(vm.Namespace).Start(context.Background(), vm.Name, &v1.StartOptions{})
-			ExpectWithOffset(1, err).ToNot(HaveOccurred())
-			var vmi *v1.VirtualMachineInstance
-			EventuallyWithOffset(1, func() error {
-				vmi, err = virtClient.VirtualMachineInstance(vm.Namespace).Get(context.Background(), vm.Name, &k8smetav1.GetOptions{})
-				return err
-			}, 300*time.Second, 1*time.Second).Should(Succeed())
-			libwait.WaitForSuccessfulVMIStart(vmi)
+			vm = libvmops.StartVirtualMachine(vm)
+			vmi, err := virtClient.VirtualMachineInstance(vm.Namespace).Get(context.Background(), vm.Name, metav1.GetOptions{})
+			Expect(err).ToNot(HaveOccurred())
 
 			By("Ensuring the firmware is done so we don't send any keystroke to it")
-			err = console.LinuxExpecter(vmi)
-			Expect(err).ToNot(HaveOccurred())
+			// Wait for cloud init to finish and start the agent inside the vmi.
+			Eventually(matcher.ThisVMI(vmi)).WithTimeout(4 * time.Minute).WithPolling(2 * time.Second).Should(matcher.HaveConditionTrue(v1.VirtualMachineInstanceAgentConnected))
 
 			By("Logging in as root")
 			err = console.LoginToFedora(vmi)
@@ -70,7 +57,7 @@ var _ = Describe("[sig-storage]VM state", decorators.SigStorage, decorators.Requ
 
 		migrateVMI := func(vmi *v1.VirtualMachineInstance) {
 			By("Migrating the VMI")
-			migration := tests.NewRandomMigration(vmi.Name, vmi.Namespace)
+			migration := libmigration.New(vmi.Name, vmi.Namespace)
 			libmigration.RunMigrationAndExpectToCompleteWithDefaultTimeout(virtClient, migration)
 
 		}
@@ -118,12 +105,11 @@ var _ = Describe("[sig-storage]VM state", decorators.SigStorage, decorators.Requ
 
 		DescribeTable("should persist VM state of", decorators.RequiresTwoSchedulableNodes, func(withTPM, withEFI bool, ops ...string) {
 			By("Creating a migratable Fedora VM with UEFI")
-			vmi := libvmi.NewFedora(
+			vmi := libvmifact.NewFedora(
 				libvmi.WithInterface(libvmi.InterfaceDeviceWithMasqueradeBinding()),
 				libvmi.WithNetwork(v1.DefaultPodNetwork()),
-				libvmi.WithCloudInitNoCloudNetworkData(libnet.CreateDefaultCloudInitNetworkData()),
+				libvmi.WithCloudInitNoCloud(libvmici.WithNoCloudNetworkData(cloudinit.CreateDefaultCloudInitNetworkData())),
 				libvmi.WithUefi(false),
-				libvmi.WithResourceMemory("1Gi"),
 			)
 			if withTPM {
 				By("with persistent TPM enabled")
@@ -139,8 +125,8 @@ var _ = Describe("[sig-storage]VM state", decorators.SigStorage, decorators.Requ
 					},
 				}
 			}
-			vm := tests.NewRandomVirtualMachine(vmi, false)
-			vm, err = virtClient.VirtualMachine(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vm)
+			vm := libvmi.NewVirtualMachine(vmi)
+			vm, err = virtClient.VirtualMachine(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vm, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 			vmi.Namespace = vm.Namespace
 
@@ -158,7 +144,7 @@ var _ = Describe("[sig-storage]VM state", decorators.SigStorage, decorators.Requ
 				case "migrate":
 					migrateVMI(vmi)
 				case "restart":
-					stopVM(vm)
+					vm = libvmops.StopVirtualMachine(vm)
 					startVM(vm)
 				}
 				if withTPM {
@@ -172,41 +158,41 @@ var _ = Describe("[sig-storage]VM state", decorators.SigStorage, decorators.Requ
 			By("Stopping and removing the VM")
 			err = virtClient.VirtualMachine(vm.Namespace).Stop(context.Background(), vm.Name, &v1.StopOptions{})
 			Expect(err).ToNot(HaveOccurred())
-			err = virtClient.VirtualMachine(testsuite.GetTestNamespace(vm)).Delete(context.Background(), vm.Name, &k8smetav1.DeleteOptions{})
+			err = virtClient.VirtualMachine(testsuite.GetTestNamespace(vm)).Delete(context.Background(), vm.Name, metav1.DeleteOptions{})
 			Expect(err).ToNot(HaveOccurred())
 		},
-			Entry("TPM across migration and restart", true, false, "migrate", "restart"),
-			Entry("TPM across restart and migration", true, false, "restart", "migrate"),
-			Entry("EFI across migration and restart", false, true, "migrate", "restart"),
-			Entry("TPM+EFI across migration and restart", true, true, "migrate", "restart"),
+			Entry("[test_id:10818]TPM across migration and restart", true, false, "migrate", "restart"),
+			Entry("[test_id:10819]TPM across restart and migration", true, false, "restart", "migrate"),
+			Entry("[test_id:10820]EFI across migration and restart", false, true, "migrate", "restart"),
+			Entry("[test_id:10821]TPM+EFI across migration and restart", true, true, "migrate", "restart"),
 		)
 		It("should remove persistent storage PVC if VMI is not owned by a VM", func() {
 			By("Creating a VMI with persistent TPM enabled")
-			vmi := tests.NewRandomFedoraVMI()
+			vmi := libvmifact.NewFedora(libnet.WithMasqueradeNetworking())
 			vmi.Spec.Domain.Devices.TPM = &v1.TPMDevice{
 				Persistent: pointer.BoolPtr(true),
 			}
-			vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vmi)
+			vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vmi, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
 			By("Waiting for the VMI to start")
 			Eventually(func() error {
-				vmi, err = virtClient.VirtualMachineInstance(vmi.Namespace).Get(context.Background(), vmi.Name, &k8smetav1.GetOptions{})
+				vmi, err = virtClient.VirtualMachineInstance(vmi.Namespace).Get(context.Background(), vmi.Name, metav1.GetOptions{})
 				return err
 			}, 300*time.Second, 1*time.Second).Should(Succeed())
 			libwait.WaitForSuccessfulVMIStart(vmi)
 
 			By("Removing the VMI")
-			err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Delete(context.Background(), vmi.Name, &k8smetav1.DeleteOptions{})
+			err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Delete(context.Background(), vmi.Name, metav1.DeleteOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
 			By("Ensuring the PVC gets deleted")
 			Eventually(func() error {
-				_, err = virtClient.VirtualMachineInstance(vmi.Namespace).Get(context.Background(), vmi.Name, &k8smetav1.GetOptions{})
+				_, err = virtClient.VirtualMachineInstance(vmi.Namespace).Get(context.Background(), vmi.Name, metav1.GetOptions{})
 				if !errors.IsNotFound(err) {
 					return fmt.Errorf("VM %s not removed: %v", vmi.Name, err)
 				}
-				_, err = virtClient.CoreV1().PersistentVolumeClaims(vmi.Namespace).Get(context.Background(), backendstorage.PVCForVMI(vmi), k8smetav1.GetOptions{})
+				_, err = virtClient.CoreV1().PersistentVolumeClaims(vmi.Namespace).Get(context.Background(), backendstorage.PVCForVMI(vmi), metav1.GetOptions{})
 				if !errors.IsNotFound(err) {
 					return fmt.Errorf("PVC %s not removed: %v", backendstorage.PVCForVMI(vmi), err)
 				}

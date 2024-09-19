@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 
+	"kubevirt.io/kubevirt/pkg/util/hardware"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter/vcpu"
 
 	"github.com/golang/mock/gomock"
@@ -55,6 +56,7 @@ import (
 
 	cmdv1 "kubevirt.io/kubevirt/pkg/handler-launcher-com/cmd/v1"
 	kubevirtpointer "kubevirt.io/kubevirt/pkg/pointer"
+	storagetypes "kubevirt.io/kubevirt/pkg/storage/types"
 	sev "kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/launchsecurity"
 )
 
@@ -157,7 +159,7 @@ var _ = Describe("Converter", func() {
 			}
 			Convert_v1_Disk_To_api_Disk(context, &v1Disk, &apiDisk, devicePerBus, &numQueues, volumeStatusMap)
 			Expect(apiDisk.Capacity).ToNot(BeNil())
-			Expect(*apiDisk.Capacity).To(Equal(min(capacity, requests)))
+			Expect(*apiDisk.Capacity).To(Equal(storagetypes.Min(capacity, requests)))
 		},
 			Entry("Higher request than capacity", int64(9999), int64(1111)),
 			Entry("Lower request than capacity", int64(1111), int64(9999)),
@@ -640,14 +642,15 @@ var _ = Describe("Converter", func() {
 						},
 					},
 				},
-				AllowEmulation:        true,
-				IsBlockPVC:            isBlockPVCMap,
-				IsBlockDV:             isBlockDVMap,
-				SMBios:                TestSmbios,
-				MemBalloonStatsPeriod: 10,
-				EphemeraldiskCreator:  EphemeralDiskImageCreator,
-				FreePageReporting:     true,
-				SerialConsoleLog:      true,
+				AllowEmulation:                  true,
+				IsBlockPVC:                      isBlockPVCMap,
+				IsBlockDV:                       isBlockDVMap,
+				SMBios:                          TestSmbios,
+				MemBalloonStatsPeriod:           10,
+				EphemeraldiskCreator:            EphemeralDiskImageCreator,
+				FreePageReporting:               true,
+				SerialConsoleLog:                true,
+				DomainAttachmentByInterfaceName: map[string]string{"default": string(v1.Tap)},
 			}
 		})
 
@@ -1013,7 +1016,7 @@ var _ = Describe("Converter", func() {
 			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
 			vmi.Spec.Domain.Devices.Disks[0].Disk.Bus = "scsi"
 			vmi.Spec.Domain.IOThreadsPolicy = nil
-			for i, _ := range vmi.Spec.Domain.Devices.Disks {
+			for i := range vmi.Spec.Domain.Devices.Disks {
 				vmi.Spec.Domain.Devices.Disks[i].DedicatedIOThread = nil
 			}
 			dom := &api.Domain{}
@@ -1088,6 +1091,28 @@ var _ = Describe("Converter", func() {
 			vmi.Spec.Domain.Devices.Inputs[0].Bus = ""
 			domain := vmiToDomain(vmi, c)
 			Expect(domain.Spec.Devices.Inputs[0].Bus).To(Equal(v1.InputBusUSB), "Expect usb bus")
+		})
+
+		It("should not overwrite the IO policy when when IO threads are enabled", func() {
+			ioPolicy := v1.IONative
+			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
+			vmi.Spec.Volumes[0] = v1.Volume{
+				Name: "disk",
+				VolumeSource: v1.VolumeSource{
+					Ephemeral: &v1.EphemeralVolumeSource{
+						PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{
+							ClaimName: "testclaim",
+						},
+					},
+				},
+			}
+			vmi.Spec.Domain.Devices.Disks[0] = v1.Disk{
+				Name:              "disk",
+				DedicatedIOThread: kubevirtpointer.P(true),
+				IO:                ioPolicy,
+			}
+			domain := vmiToDomain(vmi, c)
+			Expect(domain.Spec.Devices.Disks[0].Driver.IO).To(Equal(ioPolicy))
 		})
 
 		It("should not enable sound cards emulation by default", func() {
@@ -1360,6 +1385,9 @@ var _ = Describe("Converter", func() {
 		var vmi *v1.VirtualMachineInstance
 		var c *ConverterContext
 
+		const netName1 = "red1"
+		const netName2 = "red2"
+
 		BeforeEach(func() {
 			vmi = &v1.VirtualMachineInstance{
 				ObjectMeta: k8smeta.ObjectMeta{
@@ -1379,6 +1407,11 @@ var _ = Describe("Converter", func() {
 				},
 				AllowEmulation: true,
 				SMBios:         TestSmbios,
+				DomainAttachmentByInterfaceName: map[string]string{
+					"default": string(v1.Tap),
+					netName1:  string(v1.Tap),
+					netName2:  string(v1.Tap),
+				},
 			}
 		})
 
@@ -1389,18 +1422,18 @@ var _ = Describe("Converter", func() {
 				*v1.DefaultBridgeNetworkInterface(),
 				*v1.DefaultBridgeNetworkInterface(),
 			}
-			vmi.Spec.Domain.Devices.Interfaces[0].Name = "red1"
-			vmi.Spec.Domain.Devices.Interfaces[1].Name = "red2"
+			vmi.Spec.Domain.Devices.Interfaces[0].Name = netName1
+			vmi.Spec.Domain.Devices.Interfaces[1].Name = netName2
 			// 3rd network is the default pod network, name is "default"
 			vmi.Spec.Networks = []v1.Network{
 				{
-					Name: "red1",
+					Name: netName1,
 					NetworkSource: v1.NetworkSource{
 						Multus: &v1.MultusNetwork{NetworkName: "red"},
 					},
 				},
 				{
-					Name: "red2",
+					Name: netName2,
 					NetworkSource: v1.NetworkSource{
 						Multus: &v1.MultusNetwork{NetworkName: "red"},
 					},
@@ -1426,17 +1459,17 @@ var _ = Describe("Converter", func() {
 				*v1.DefaultBridgeNetworkInterface(),
 				*v1.DefaultBridgeNetworkInterface(),
 			}
-			vmi.Spec.Domain.Devices.Interfaces[0].Name = "red1"
-			vmi.Spec.Domain.Devices.Interfaces[1].Name = "red2"
+			vmi.Spec.Domain.Devices.Interfaces[0].Name = netName1
+			vmi.Spec.Domain.Devices.Interfaces[1].Name = netName2
 			vmi.Spec.Networks = []v1.Network{
 				{
-					Name: "red1",
+					Name: netName1,
 					NetworkSource: v1.NetworkSource{
 						Multus: &v1.MultusNetwork{NetworkName: "red", Default: true},
 					},
 				},
 				{
-					Name: "red2",
+					Name: netName2,
 					NetworkSource: v1.NetworkSource{
 						Multus: &v1.MultusNetwork{NetworkName: "red"},
 					},
@@ -1451,18 +1484,16 @@ var _ = Describe("Converter", func() {
 		})
 		It("should allow setting boot order", func() {
 			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
-			name1 := "Name1"
-			name2 := "Name2"
 			iface1 := v1.DefaultBridgeNetworkInterface()
 			iface2 := v1.DefaultBridgeNetworkInterface()
 			net1 := v1.DefaultPodNetwork()
 			net2 := v1.DefaultPodNetwork()
-			iface1.Name = name1
-			iface2.Name = name2
+			iface1.Name = netName1
+			iface2.Name = netName2
 			bootOrder := uint(1)
 			iface1.BootOrder = &bootOrder
-			net1.Name = name1
-			net2.Name = name2
+			net1.Name = netName1
+			net2.Name = netName2
 			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{*iface1, *iface2}
 			vmi.Spec.Networks = []v1.Network{*net1, *net2}
 			domain := vmiToDomain(vmi, c)
@@ -1474,11 +1505,10 @@ var _ = Describe("Converter", func() {
 		})
 		It("Should create network configuration for masquerade interface", func() {
 			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
-			name1 := "Name"
 
-			iface1 := v1.Interface{Name: name1, InterfaceBindingMethod: v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}}}
+			iface1 := v1.Interface{Name: netName1, InterfaceBindingMethod: v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}}}
 			net1 := v1.DefaultPodNetwork()
-			net1.Name = name1
+			net1.Name = netName1
 
 			vmi.Spec.Networks = []v1.Network{*net1}
 			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{iface1}
@@ -1490,11 +1520,10 @@ var _ = Describe("Converter", func() {
 		})
 		It("Should create network configuration for masquerade interface and the pod network and a secondary network using multus", func() {
 			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
-			name1 := "Name"
 
-			iface1 := v1.Interface{Name: name1, InterfaceBindingMethod: v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}}}
+			iface1 := v1.Interface{Name: netName1, InterfaceBindingMethod: v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}}}
 			net1 := v1.DefaultPodNetwork()
-			net1.Name = name1
+			net1.Name = netName1
 
 			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{iface1, *v1.DefaultBridgeNetworkInterface()}
 			vmi.Spec.Domain.Devices.Interfaces[1].Name = "red1"
@@ -1513,96 +1542,38 @@ var _ = Describe("Converter", func() {
 			Expect(domain.Spec.Devices.Interfaces[0].Type).To(Equal("ethernet"))
 			Expect(domain.Spec.Devices.Interfaces[1].Type).To(Equal("ethernet"))
 		})
-		It("Should create network configuration for macvtap interface and a multus network", func() {
+		It("Should create network configuration for an interface using a binding plugin with tap domain attachment", func() {
+			bindingName := "BindingName"
 			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
-			multusNetworkName := "multusNet"
-			networkName := "net1"
 
-			iface1 := v1.Interface{Name: networkName, InterfaceBindingMethod: v1.InterfaceBindingMethod{Macvtap: &v1.InterfaceMacvtap{}}}
+			iface1 := v1.Interface{Name: netName1, Binding: &v1.PluginBinding{Name: bindingName}}
+			net1 := v1.DefaultPodNetwork()
+			net1.Name = netName1
 
-			multusNetwork := v1.Network{
-				Name: networkName,
-				NetworkSource: v1.NetworkSource{
-					Multus: &v1.MultusNetwork{NetworkName: multusNetworkName},
-				},
-			}
-			vmi.Spec.Networks = []v1.Network{multusNetwork}
+			vmi.Spec.Networks = []v1.Network{*net1}
 			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{iface1}
 
 			domain := vmiToDomain(vmi, c)
-			Expect(domain).NotTo(BeNil(), "domain should not be nil")
-			Expect(domain.Spec.Devices.Interfaces).To(HaveLen(1), "should have a single interface")
-			Expect(domain.Spec.Devices.Interfaces[0].Type).To(Equal("ethernet"), "Macvtap interfaces must be of type `ethernet`")
+			Expect(domain).ToNot(BeNil())
+			Expect(domain.Spec.Devices.Interfaces).To(HaveLen(1))
+			Expect(domain.Spec.Devices.Interfaces[0].Type).To(Equal("ethernet"))
 		})
-		It("Should create network configuration for the default pod network plus a secondary macvtap network interface using multus", func() {
+		It("Shouldn't create network configuration for an interface using a binding plugin with non-tap domain attachment", func() {
+			bindingName := "BindingName"
+			c.DomainAttachmentByInterfaceName[bindingName] = "non-tap"
 			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
-			secondaryNetworkName := "net1"
+			name1 := "Name"
 
-			iface1 := v1.Interface{Name: secondaryNetworkName, InterfaceBindingMethod: v1.InterfaceBindingMethod{Macvtap: &v1.InterfaceMacvtap{}}}
+			iface1 := v1.Interface{Name: name1, Binding: &v1.PluginBinding{Name: bindingName}}
+			net1 := v1.DefaultPodNetwork()
+			net1.Name = name1
 
-			defaultPodNetwork := v1.DefaultPodNetwork()
-			multusNetwork := v1.Network{
-				Name: secondaryNetworkName,
-				NetworkSource: v1.NetworkSource{
-					Multus: &v1.MultusNetwork{NetworkName: secondaryNetworkName},
-				},
-			}
-			vmi.Spec.Networks = []v1.Network{*defaultPodNetwork, multusNetwork}
-			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{*v1.DefaultBridgeNetworkInterface(), iface1}
-
-			domain := vmiToDomain(vmi, c)
-			Expect(domain).NotTo(BeNil(), "domain should not be nil")
-			Expect(domain.Spec.Devices.Interfaces).To(HaveLen(2), "the VMI spec should feature 2 interfaces")
-			Expect(domain.Spec.Devices.Interfaces[1].Type).To(Equal("ethernet"), "Macvtap interfaces must be of type `ethernet`")
-		})
-		It("Macvtap interfaces should allow setting boot order", func() {
-			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
-			firstMacvtapNetworkName := "net1"
-			secondMacvtapNetworkName := "net2"
-
-			firstToBoot := uint(1)
-			lastToBoot := uint(2)
-			iface1 := v1.Interface{Name: firstMacvtapNetworkName, InterfaceBindingMethod: v1.InterfaceBindingMethod{Macvtap: &v1.InterfaceMacvtap{}}, BootOrder: &lastToBoot}
-			iface2 := v1.Interface{Name: secondMacvtapNetworkName, InterfaceBindingMethod: v1.InterfaceBindingMethod{Macvtap: &v1.InterfaceMacvtap{}}, BootOrder: &firstToBoot}
-
-			firstMacvtapNetwork := v1.Network{
-				Name: firstMacvtapNetworkName,
-				NetworkSource: v1.NetworkSource{
-					Multus: &v1.MultusNetwork{NetworkName: firstMacvtapNetworkName},
-				},
-			}
-			secondMacvtapNetwork := v1.Network{
-				Name: secondMacvtapNetworkName,
-				NetworkSource: v1.NetworkSource{
-					Multus: &v1.MultusNetwork{NetworkName: secondMacvtapNetworkName},
-				},
-			}
-			vmi.Spec.Networks = []v1.Network{firstMacvtapNetwork, secondMacvtapNetwork}
-			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{iface1, iface2}
-
-			domain := vmiToDomain(vmi, c)
-			Expect(domain).NotTo(BeNil(), "domain should not be nil")
-			Expect(domain.Spec.Devices.Interfaces).To(HaveLen(2), "the VMI spec should feature 2 interfaces")
-			Expect(domain.Spec.Devices.Interfaces[0].BootOrder.Order).To(Equal(lastToBoot), "the interface whose boot order is higher should be the last to boot")
-			Expect(domain.Spec.Devices.Interfaces[1].BootOrder.Order).To(Equal(firstToBoot), "the interface whose boot order is lower should be the first to boot")
-		})
-		Specify("macvtap interface binding must be used on a multus network", func() {
-			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
-			name1 := "net1"
-
-			iface1 := v1.Interface{Name: name1, InterfaceBindingMethod: v1.InterfaceBindingMethod{Macvtap: &v1.InterfaceMacvtap{}}}
-
-			podNetwork := v1.Network{
-				Name: name1,
-				NetworkSource: v1.NetworkSource{
-					Pod: &v1.PodNetwork{},
-				},
-			}
-			vmi.Spec.Networks = []v1.Network{podNetwork}
+			vmi.Spec.Networks = []v1.Network{*net1}
 			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{iface1}
 
-			domain := &api.Domain{}
-			Expect(Convert_v1_VirtualMachineInstance_To_api_Domain(vmi, domain, c)).To(HaveOccurred(), "conversion should fail because a macvtap interface requires a multus network attachment")
+			domain := vmiToDomain(vmi, c)
+			Expect(domain).ToNot(BeNil())
+			Expect(domain.Spec.Devices.Interfaces).To(BeEmpty())
 		})
 		It("creates SRIOV hostdev", func() {
 			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
@@ -1663,7 +1634,7 @@ var _ = Describe("Converter", func() {
 		)
 	})
 
-	Context("HyperV features", func() {
+	Context("HyperV", func() {
 		DescribeTable("should convert hyperv features", func(hyperV *v1.FeatureHyperv, result *api.FeatureHyperv) {
 			vmi := v1.VirtualMachineInstance{
 				ObjectMeta: k8smeta.ObjectMeta{
@@ -1715,6 +1686,26 @@ var _ = Describe("Converter", func() {
 				VAPIC: &api.FeatureState{State: "on"},
 			}),
 		)
+
+		It("should convert hyperv passthrough", func() {
+			vmi := v1.VirtualMachineInstance{
+				ObjectMeta: k8smeta.ObjectMeta{
+					Name:      "testvmi",
+					Namespace: "default",
+					UID:       "1234",
+				},
+				Spec: v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						Features: &v1.Features{
+							HypervPassthrough: &v1.HyperVPassthrough{Enabled: kubevirtpointer.P(true)},
+						},
+					},
+				},
+			}
+
+			domain := vmiToDomain(&vmi, &ConverterContext{AllowEmulation: true})
+			Expect(domain.Spec.Features.Hyperv.Mode).To(Equal(api.HypervModePassthrough))
+		})
 	})
 
 	Context("serial console", func() {
@@ -1926,6 +1917,97 @@ var _ = Describe("Converter", func() {
 			Entry("using an auto policy with 5 CPUs", v1.IOThreadsPolicyAuto, 5, 7, []int{7, 1, 2, 3, 4, 5, 6}),
 		)
 
+		It("Should not add IOThreads to non-virtio disks", func() {
+			dedicatedDiskName := "dedicated"
+			sharedDiskName := "shared"
+			incompatibleDiskName := "incompatible"
+			claimName := "claimName"
+			vmi := v1.VirtualMachineInstance{
+				ObjectMeta: k8smeta.ObjectMeta{
+					Name:      "testvmi",
+					Namespace: "default",
+					UID:       "1234",
+				},
+				Spec: v1.VirtualMachineInstanceSpec{
+					Domain: v1.DomainSpec{
+						Devices: v1.Devices{
+							Disks: []v1.Disk{
+								{
+									Name: dedicatedDiskName,
+									DiskDevice: v1.DiskDevice{
+										Disk: &v1.DiskTarget{
+											Bus: v1.VirtIO,
+										},
+									},
+									DedicatedIOThread: True(),
+								},
+								{
+									Name: sharedDiskName,
+									DiskDevice: v1.DiskDevice{
+										Disk: &v1.DiskTarget{
+											Bus: v1.VirtIO,
+										},
+									},
+									DedicatedIOThread: False(),
+								},
+								{
+									Name: incompatibleDiskName,
+									DiskDevice: v1.DiskDevice{
+										Disk: &v1.DiskTarget{
+											Bus: v1.DiskBusSATA,
+										},
+									},
+								},
+							},
+						},
+					},
+					Volumes: []v1.Volume{
+						{
+							Name: dedicatedDiskName,
+							VolumeSource: v1.VolumeSource{
+								Ephemeral: &v1.EphemeralVolumeSource{
+									PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{
+										ClaimName: claimName,
+									},
+								},
+							},
+						},
+						{
+							Name: sharedDiskName,
+							VolumeSource: v1.VolumeSource{
+								Ephemeral: &v1.EphemeralVolumeSource{
+									PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{
+										ClaimName: claimName,
+									},
+								},
+							},
+						},
+						{
+							Name: incompatibleDiskName,
+							VolumeSource: v1.VolumeSource{
+								Ephemeral: &v1.EphemeralVolumeSource{
+									PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{
+										ClaimName: claimName,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			domain := vmiToDomain(&vmi, &ConverterContext{AllowEmulation: true, EphemeraldiskCreator: EphemeralDiskImageCreator})
+			Expect(domain.Spec.IOThreads).ToNot(BeNil())
+			Expect(domain.Spec.IOThreads.IOThreads).To(Equal(uint(2)))
+			// Disk with dedicated IOThread (2)
+			Expect(domain.Spec.Devices.Disks[0].Driver.IOThread).ToNot(BeNil())
+			Expect(*domain.Spec.Devices.Disks[0].Driver.IOThread).To(Equal(uint(2)))
+			// Disk with shared IOThread
+			Expect(domain.Spec.Devices.Disks[1].Driver.IOThread).ToNot(BeNil())
+			Expect(*domain.Spec.Devices.Disks[1].Driver.IOThread).To(Equal(uint(1)))
+			// Disk incompatible with IOThreads
+			Expect(domain.Spec.Devices.Disks[2].Driver.IOThread).To(BeNil())
+		})
 	})
 
 	Context("virtio block multi-queue", func() {
@@ -2001,6 +2083,24 @@ var _ = Describe("Converter", func() {
 			Expect(apiDisk.Driver.Queues).To(BeNil(), "expected no queues to be requested")
 		})
 
+		It("should assign correct number of queues with CPU hotplug topology", func() {
+			vmi.Spec.Domain.Resources.Requests = k8sv1.ResourceList{}
+			vmi.Spec.Domain.CPU = &v1.CPU{
+				Cores:      2,
+				Threads:    2,
+				Sockets:    2,
+				MaxSockets: 8,
+			}
+			expectedNumOfBlkQueues :=
+				vmi.Spec.Domain.CPU.Cores * vmi.Spec.Domain.CPU.Threads * vmi.Spec.Domain.CPU.Sockets
+
+			domain := vmiToDomain(vmi, &ConverterContext{AllowEmulation: true, SMBios: &cmdv1.SMBios{}})
+			Expect(domain.Spec.Devices.Disks).To(HaveLen(1))
+			disk := domain.Spec.Devices.Disks[0]
+			Expect(disk.Driver.Queues).ToNot(BeNil())
+			Expect(*disk.Driver.Queues).To(Equal(uint(expectedNumOfBlkQueues)))
+		})
+
 		It("should honor multiQueue setting", func() {
 			var expectedQueues uint = 2
 			vmi.Spec.Domain.CPU = &v1.CPU{
@@ -2012,6 +2112,139 @@ var _ = Describe("Converter", func() {
 				"expected number of queues to equal number of requested vCPUs")
 		})
 	})
+
+	Context("Correctly handle IsolateEmulatorThread with dedicated cpus", func() {
+		DescribeTable("should succeed assigning CPUs to emulatorThread",
+			func(cpu v1.CPU, converterContext *ConverterContext, vmiAnnotations map[string]string, expectedEmulatorThreads int) {
+				var err error
+				domain := &api.Domain{}
+
+				cpuPool := vcpu.NewRelaxedCPUPool(
+					&api.CPUTopology{Sockets: cpu.Sockets, Cores: cpu.Cores, Threads: cpu.Threads},
+					converterContext.Topology,
+					converterContext.CPUSet,
+				)
+				domain.Spec.CPUTune, err = cpuPool.FitCores()
+				Expect(err).ToNot(HaveOccurred())
+
+				vCPUs := hardware.GetNumberOfVCPUs(&cpu)
+				emulatorThreadsCPUSet, err := vcpu.FormatEmulatorThreadPin(cpuPool, vmiAnnotations, vCPUs)
+				Expect(err).ToNot(HaveOccurred())
+				By("checking that the housekeeping CPUSet has the expected amount of CPUs")
+				housekeepingCPUs, err := hardware.ParseCPUSetLine(emulatorThreadsCPUSet, 100)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(housekeepingCPUs).To(HaveLen(expectedEmulatorThreads))
+				By("checking that the housekeeping CPUSet does not overlap with the VCPUs CPUSet")
+				for _, VCPUPin := range domain.Spec.CPUTune.VCPUPin {
+					CPUTuneCPUs, err := hardware.ParseCPUSetLine(VCPUPin.CPUSet, 100)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(CPUTuneCPUs).ToNot(ContainElements(housekeepingCPUs))
+				}
+			},
+			Entry("when EmulatorThreadCompleteToEvenParity is disabled and there is one extra CPU assigned for emulatorThread",
+				v1.CPU{Sockets: 1, Cores: 2, Threads: 1},
+				&ConverterContext{CPUSet: []int{5, 6, 7},
+					Topology: &cmdv1.Topology{
+						NumaCells: []*cmdv1.Cell{{
+							Cpus: []*cmdv1.CPU{
+								{Id: 5}, {Id: 6},
+								{Id: 7},
+							},
+						}},
+					},
+				},
+				map[string]string{},
+				1),
+			Entry("when EmulatorThreadCompleteToEvenParity is enabled and there is one extra CPU assigned for emulatorThread (odd CPUs)",
+				v1.CPU{Sockets: 1, Cores: 5, Threads: 1},
+				&ConverterContext{CPUSet: []int{5, 6, 7, 8, 9, 10},
+					Topology: &cmdv1.Topology{
+						NumaCells: []*cmdv1.Cell{{
+							Cpus: []*cmdv1.CPU{
+								{Id: 5}, {Id: 6}, {Id: 7}, {Id: 8}, {Id: 9},
+								{Id: 10},
+							},
+						}},
+					},
+				},
+				map[string]string{v1.EmulatorThreadCompleteToEvenParity: ""},
+				1),
+			Entry("when EmulatorThreadCompleteToEvenParity is enabled and there are two extra CPUs assigned for emulatorThread (even CPUs)",
+				v1.CPU{Sockets: 1, Cores: 6, Threads: 1},
+				&ConverterContext{CPUSet: []int{5, 6, 7, 8, 9, 10, 11, 12},
+					Topology: &cmdv1.Topology{
+						NumaCells: []*cmdv1.Cell{{
+							Cpus: []*cmdv1.CPU{
+								{Id: 5}, {Id: 6}, {Id: 7}, {Id: 8}, {Id: 9}, {Id: 10},
+								{Id: 11}, {Id: 12},
+							},
+						}},
+					},
+				},
+				map[string]string{v1.EmulatorThreadCompleteToEvenParity: ""},
+				2),
+		)
+		DescribeTable("should fail assigning CPUs to emulatorThread",
+			func(cpu v1.CPU, converterContext *ConverterContext, vmiAnnotations map[string]string, expectedErrorString string) {
+				var err error
+				domain := &api.Domain{}
+
+				cpuPool := vcpu.NewRelaxedCPUPool(
+					&api.CPUTopology{Sockets: cpu.Sockets, Cores: cpu.Cores, Threads: cpu.Threads},
+					converterContext.Topology,
+					converterContext.CPUSet,
+				)
+				domain.Spec.CPUTune, err = cpuPool.FitCores()
+				Expect(err).ToNot(HaveOccurred())
+
+				vCPUs := hardware.GetNumberOfVCPUs(&cpu)
+				_, err = vcpu.FormatEmulatorThreadPin(cpuPool, vmiAnnotations, vCPUs)
+				Expect(err).To(MatchError(ContainSubstring(expectedErrorString)))
+			},
+			Entry("when EmulatorThreadCompleteToEvenParity is disabled and there are not enough CPUs to allocate emulator threads",
+				v1.CPU{Sockets: 1, Cores: 2, Threads: 1},
+				&ConverterContext{CPUSet: []int{5, 6},
+					Topology: &cmdv1.Topology{
+						NumaCells: []*cmdv1.Cell{{
+							Cpus: []*cmdv1.CPU{
+								{Id: 5}, {Id: 6},
+							},
+						}},
+					},
+				},
+				map[string]string{},
+				"no CPU allocated for the emulation thread"),
+			Entry("when EmulatorThreadCompleteToEvenParity is enabled and there are not enough Cores to allocate emulator threads (odd CPUs)",
+				v1.CPU{Sockets: 1, Cores: 3, Threads: 1},
+				&ConverterContext{CPUSet: []int{5, 6, 7},
+					Topology: &cmdv1.Topology{
+						NumaCells: []*cmdv1.Cell{{
+							Cpus: []*cmdv1.CPU{
+								{Id: 5}, {Id: 6},
+								{Id: 7},
+							},
+						}},
+					},
+				},
+				map[string]string{v1.EmulatorThreadCompleteToEvenParity: ""},
+				"no CPU allocated for the emulation thread"),
+			Entry("when EmulatorThreadCompleteToEvenParity is enabled and there are not enough Cores to allocate emulator threads (even CPUs)",
+				v1.CPU{Sockets: 1, Cores: 2, Threads: 1},
+				&ConverterContext{CPUSet: []int{5, 6, 7},
+					Topology: &cmdv1.Topology{
+						NumaCells: []*cmdv1.Cell{{
+							Cpus: []*cmdv1.CPU{
+								{Id: 5}, {Id: 6},
+								{Id: 7},
+							},
+						}},
+					},
+				},
+				map[string]string{v1.EmulatorThreadCompleteToEvenParity: ""},
+				"no second CPU allocated for the emulation thread"),
+		)
+	})
+
 	Context("Correctly handle iothreads with dedicated cpus", func() {
 		var vmi *v1.VirtualMachineInstance
 
@@ -2068,7 +2301,7 @@ var _ = Describe("Converter", func() {
 			domain.Spec.IOThreads = &api.IOThreads{}
 			domain.Spec.IOThreads.IOThreads = uint(6)
 
-			Expect(vcpu.FormatDomainIOThreadPin(vmi, domain, 0, c.CPUSet)).To(Succeed())
+			Expect(vcpu.FormatDomainIOThreadPin(vmi, domain, "0", c.CPUSet)).To(Succeed())
 			expectedLayout := []api.CPUTuneIOThreadPin{
 				{IOThread: 1, CPUSet: "5,6,7"},
 				{IOThread: 2, CPUSet: "8,9,10"},
@@ -2100,7 +2333,7 @@ var _ = Describe("Converter", func() {
 			domain.Spec.IOThreads = &api.IOThreads{}
 			domain.Spec.IOThreads.IOThreads = uint(6)
 
-			Expect(vcpu.FormatDomainIOThreadPin(vmi, domain, 0, c.CPUSet)).To(Succeed())
+			Expect(vcpu.FormatDomainIOThreadPin(vmi, domain, "0", c.CPUSet)).To(Succeed())
 			expectedLayout := []api.CPUTuneIOThreadPin{
 				{IOThread: 1, CPUSet: "6"},
 				{IOThread: 2, CPUSet: "5"},
@@ -2309,7 +2542,7 @@ var _ = Describe("Converter", func() {
 			vmi.Spec.Domain.Firmware = &v1.Firmware{
 				Bootloader: &v1.Bootloader{
 					EFI: &v1.EFI{
-						SecureBoot: pointer.BoolPtr(false),
+						SecureBoot: kubevirtpointer.P(false),
 					},
 				},
 			}
@@ -2553,23 +2786,7 @@ var _ = Describe("Converter", func() {
 
 				Expect(domain.Spec.Memory).ToNot(BeNil())
 				Expect(domain.Spec.Memory.Unit).To(Equal("b"))
-				Expect(domain.Spec.Memory.Value).To(Equal(uint64(maxGuestMemory.Value())))
-
-				Expect(domain.Spec.CPU.NUMA).ToNot(BeNil())
-				Expect(domain.Spec.CPU.NUMA.Cells).To(HaveLen(1))
-				Expect(domain.Spec.CPU.NUMA.Cells[0].Unit).To(Equal("b"))
-				Expect(domain.Spec.CPU.NUMA.Cells[0].Memory).To(Equal(uint64(guestMemory.Value())))
-
-				pluggableMemory := uint64(maxGuestMemory.Value() - guestMemory.Value())
-
-				Expect(domain.Spec.Devices.Memory).ToNot(BeNil())
-				Expect(domain.Spec.Devices.Memory.Model).To(Equal("virtio-mem"))
-				Expect(domain.Spec.Devices.Memory.Target).ToNot(BeNil())
-				Expect(domain.Spec.Devices.Memory.Target.Node).To(Equal("0"))
-				Expect(domain.Spec.Devices.Memory.Target.Size.Value).To(Equal(pluggableMemory))
-				Expect(domain.Spec.Devices.Memory.Target.Size.Unit).To(Equal("b"))
-				Expect(domain.Spec.Devices.Memory.Target.Block.Value).To(Equal(uint64(MemoryHotplugBlockAlignmentBytes)))
-				Expect(domain.Spec.Devices.Memory.Target.Block.Unit).To(Equal("b"))
+				Expect(domain.Spec.Memory.Value).To(Equal(uint64(guestMemory.Value())))
 			})
 		})
 	})
@@ -2584,7 +2801,7 @@ var _ = Describe("Converter", func() {
 			vmi = kvapi.NewMinimalVMI("testvmi")
 			v1.SetObjectDefaults_VirtualMachineInstance(vmi)
 			vmi.Spec.Domain.Devices.Rng = &v1.Rng{}
-			vmi.Spec.Domain.Devices.AutoattachMemBalloon = pointer.BoolPtr(true)
+			vmi.Spec.Domain.Devices.AutoattachMemBalloon = kubevirtpointer.P(true)
 			nonVirtioIface := v1.Interface{Name: "red", Model: "e1000"}
 			secondaryNetwork := v1.Network{Name: "red"}
 			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{
@@ -2598,13 +2815,13 @@ var _ = Describe("Converter", func() {
 			}
 			vmi.Spec.Domain.Features = &v1.Features{
 				SMM: &v1.FeatureState{
-					Enabled: pointer.BoolPtr(false),
+					Enabled: kubevirtpointer.P(false),
 				},
 			}
 			vmi.Spec.Domain.Firmware = &v1.Firmware{
 				Bootloader: &v1.Bootloader{
 					EFI: &v1.EFI{
-						SecureBoot: pointer.BoolPtr(false),
+						SecureBoot: kubevirtpointer.P(false),
 					},
 				},
 			}

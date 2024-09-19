@@ -25,7 +25,9 @@ import (
 	"fmt"
 	"strings"
 
-	"kubevirt.io/api/snapshot/v1alpha1"
+	"kubevirt.io/kubevirt/pkg/network/link"
+
+	snapshotv1 "kubevirt.io/api/snapshot/v1beta1"
 
 	"kubevirt.io/kubevirt/pkg/storage/snapshot"
 
@@ -43,13 +45,18 @@ import (
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 )
 
+const (
+	virtualMachineKind         = "VirtualMachine"
+	virtualMachineSnapshotKind = "VirtualMachineSnapshot"
+)
+
 // VirtualMachineCloneAdmitter validates VirtualMachineClones
 type VirtualMachineCloneAdmitter struct {
 	Config *virtconfig.ClusterConfig
 	Client kubecli.KubevirtClient
 }
 
-// NewMigrationPolicyAdmitter creates a MigrationPolicyAdmitter
+// NewVMCloneAdmitter creates a VM Clone Admitter
 func NewVMCloneAdmitter(config *virtconfig.ClusterConfig, client kubecli.KubevirtClient) *VirtualMachineCloneAdmitter {
 	return &VirtualMachineCloneAdmitter{
 		Config: config,
@@ -58,7 +65,7 @@ func NewVMCloneAdmitter(config *virtconfig.ClusterConfig, client kubecli.Kubevir
 }
 
 // Admit validates an AdmissionReview
-func (admitter *VirtualMachineCloneAdmitter) Admit(ar *admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
+func (admitter *VirtualMachineCloneAdmitter) Admit(ctx context.Context, ar *admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 	if ar.Request.Resource.Group != clonev1alpha1.VirtualMachineCloneKind.Group {
 		return webhookutils.ToAdmissionResponseError(fmt.Errorf("unexpected group: %+v. Expected group: %+v", ar.Request.Resource.Group, clonev1alpha1.VirtualMachineCloneKind.Group))
 	}
@@ -78,10 +85,16 @@ func (admitter *VirtualMachineCloneAdmitter) Admit(ar *admissionv1.AdmissionRevi
 
 	var causes []metav1.StatusCause
 
-	if newCauses := validateFilters(vmClone.Spec.AnnotationFilters, "Annotations"); newCauses != nil {
+	if newCauses := validateFilters(vmClone.Spec.AnnotationFilters, "spec.annotations"); newCauses != nil {
 		causes = append(causes, newCauses...)
 	}
-	if newCauses := validateFilters(vmClone.Spec.LabelFilters, "Labels"); newCauses != nil {
+	if newCauses := validateFilters(vmClone.Spec.LabelFilters, "spec.labels"); newCauses != nil {
+		causes = append(causes, newCauses...)
+	}
+	if newCauses := validateFilters(vmClone.Spec.Template.AnnotationFilters, "spec.template.annotations"); newCauses != nil {
+		causes = append(causes, newCauses...)
+	}
+	if newCauses := validateFilters(vmClone.Spec.Template.LabelFilters, "spec.template.labels"); newCauses != nil {
 		causes = append(causes, newCauses...)
 	}
 
@@ -89,7 +102,15 @@ func (admitter *VirtualMachineCloneAdmitter) Admit(ar *admissionv1.AdmissionRevi
 		causes = append(causes, newCauses...)
 	}
 
-	if newCauses := validateSource(admitter.Client, vmClone); newCauses != nil {
+	if newCauses := validateSource(ctx, admitter.Client, vmClone); newCauses != nil {
+		causes = append(causes, newCauses...)
+	}
+
+	if newCauses := validateTarget(vmClone); newCauses != nil {
+		causes = append(causes, newCauses...)
+	}
+
+	if newCauses := validateNewMacAddresses(vmClone); newCauses != nil {
 		causes = append(causes, newCauses...)
 	}
 
@@ -112,7 +133,7 @@ func validateFilters(filters []string, fieldName string) (causes []metav1.Status
 		causes = append(causes, metav1.StatusCause{
 			Type:    metav1.CauseTypeFieldValueInvalid,
 			Message: message,
-			Field:   k8sfield.NewPath("spec").Child(fieldName).String(),
+			Field:   fieldName,
 		})
 	}
 	const negationChar = "!"
@@ -126,14 +147,14 @@ func validateFilters(filters []string, fieldName string) (causes []metav1.Status
 			continue
 		}
 
-		const errPattern = "filter %s is invalid: cannot contain a %s character (%s) at any place that is not the beginning"
+		const errPattern = "%s filter %s is invalid: cannot contain a %s character (%s); FilterRules: %s"
 
 		if filterWithoutFirstChar := filter[1:]; strings.Contains(filterWithoutFirstChar, negationChar) {
-			addCause(fmt.Sprintf(errPattern, filter, "negation", negationChar))
+			addCause(fmt.Sprintf(errPattern, fieldName, filter, "negation", negationChar, "NegationChar can be only used at the beginning of the filter"))
 		}
 
 		if filterWithoutLastChar := filter[:len(filter)-1]; strings.Contains(filterWithoutLastChar, wildcardChar) {
-			addCause(fmt.Sprintf(errPattern, filter, "wildcard", wildcardChar))
+			addCause(fmt.Sprintf(errPattern, fieldName, filter, "wildcard", wildcardChar, "WildcardChar can be only at the end of the filter"))
 		}
 	}
 
@@ -144,8 +165,8 @@ func validateSourceAndTargetKind(vmClone *clonev1alpha1.VirtualMachineClone) []m
 	var causes []metav1.StatusCause = nil
 	sourceField := k8sfield.NewPath("spec")
 
-	supportedSourceTypes := []string{"VirtualMachine", "VirtualMachineSnapshot"}
-	supportedTargetTypes := []string{"VirtualMachine"}
+	supportedSourceTypes := []string{virtualMachineKind, virtualMachineSnapshotKind}
+	supportedTargetTypes := []string{virtualMachineKind}
 
 	if !doesSliceContainStr(supportedSourceTypes, vmClone.Spec.Source.Kind) {
 		causes = []metav1.StatusCause{{
@@ -169,7 +190,7 @@ func validateSourceAndTargetKind(vmClone *clonev1alpha1.VirtualMachineClone) []m
 	return causes
 }
 
-func validateSource(client kubecli.KubevirtClient, vmClone *clonev1alpha1.VirtualMachineClone) []metav1.StatusCause {
+func validateSource(ctx context.Context, client kubecli.KubevirtClient, vmClone *clonev1alpha1.VirtualMachineClone) []metav1.StatusCause {
 	var causes []metav1.StatusCause = nil
 	sourceField := k8sfield.NewPath("spec")
 	source := vmClone.Spec.Source
@@ -205,10 +226,10 @@ func validateSource(client kubecli.KubevirtClient, vmClone *clonev1alpha1.Virtua
 	}
 	if source.Kind != "" && source.Name != "" {
 		switch source.Kind {
-		case "VirtualMachine":
-			causes = append(causes, validateCloneSourceVM(client, source.Name, vmClone.Namespace, sourceField.Child("Source"))...)
-		case "VirtualMachineSnapshot":
-			causes = append(causes, validateCloneSourceSnapshot(client, source.Name, vmClone.Namespace, sourceField.Child("Source"))...)
+		case virtualMachineKind:
+			causes = append(causes, validateCloneSourceVM(ctx, client, source.Name, vmClone.Namespace, sourceField.Child("Source"))...)
+		case virtualMachineSnapshotKind:
+			causes = append(causes, validateCloneSourceSnapshot(ctx, client, source.Name, vmClone.Namespace, sourceField.Child("Source"))...)
 		default:
 			causes = append(causes, metav1.StatusCause{
 				Type:    metav1.CauseTypeFieldValueInvalid,
@@ -217,6 +238,45 @@ func validateSource(client kubecli.KubevirtClient, vmClone *clonev1alpha1.Virtua
 			})
 		}
 	}
+	return causes
+}
+
+func validateTarget(vmClone *clonev1alpha1.VirtualMachineClone) []metav1.StatusCause {
+	var causes []metav1.StatusCause
+
+	source := vmClone.Spec.Source
+	target := vmClone.Spec.Target
+
+	if source != nil &&
+		target != nil &&
+		source.Kind == virtualMachineKind &&
+		target.Kind == virtualMachineKind &&
+		target.Name == source.Name {
+		causes = append(causes, metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: "Target name cannot be equal to source name when both are VirtualMachines",
+			Field:   k8sfield.NewPath("spec").Child("target").Child("name").String(),
+		})
+	}
+
+	return causes
+}
+
+func validateNewMacAddresses(vmClone *clonev1alpha1.VirtualMachineClone) []metav1.StatusCause {
+	var causes []metav1.StatusCause
+
+	for ifaceName, ifaceMac := range vmClone.Spec.NewMacAddresses {
+		if ifaceMac != "" {
+			if err := link.ValidateMacAddress(ifaceMac); err != nil {
+				causes = append(causes, metav1.StatusCause{
+					Type:    metav1.CauseTypeFieldValueInvalid,
+					Message: fmt.Sprintf("interface %s has malformed MAC address (%s).", ifaceName, ifaceMac),
+					Field:   k8sfield.NewPath("spec").Child("newMacAddresses").Child(ifaceName).String(),
+				})
+			}
+		}
+	}
+
 	return causes
 }
 
@@ -253,9 +313,9 @@ func validateCloneSourceExists(clientGetErr error, sourceField *k8sfield.Path, k
 	return nil
 }
 
-func validateCloneSourceVM(client kubecli.KubevirtClient, name, namespace string, sourceField *k8sfield.Path) []metav1.StatusCause {
-	vm, err := client.VirtualMachine(namespace).Get(context.Background(), name, &metav1.GetOptions{})
-	causes := validateCloneSourceExists(err, sourceField, "VirtualMachine", name, namespace)
+func validateCloneSourceVM(ctx context.Context, client kubecli.KubevirtClient, name, namespace string, sourceField *k8sfield.Path) []metav1.StatusCause {
+	vm, err := client.VirtualMachine(namespace).Get(ctx, name, metav1.GetOptions{})
+	causes := validateCloneSourceExists(err, sourceField, virtualMachineKind, name, namespace)
 
 	if causes != nil {
 		return causes
@@ -270,9 +330,9 @@ func validateCloneSourceVM(client kubecli.KubevirtClient, name, namespace string
 	return causes
 }
 
-func validateCloneSourceSnapshot(client kubecli.KubevirtClient, name, namespace string, sourceField *k8sfield.Path) []metav1.StatusCause {
-	vmSnapshot, err := client.VirtualMachineSnapshot(namespace).Get(context.Background(), name, metav1.GetOptions{})
-	causes := validateCloneSourceExists(err, sourceField, "VirtualMachineSnapshot", name, namespace)
+func validateCloneSourceSnapshot(ctx context.Context, client kubecli.KubevirtClient, name, namespace string, sourceField *k8sfield.Path) []metav1.StatusCause {
+	vmSnapshot, err := client.VirtualMachineSnapshot(namespace).Get(ctx, name, metav1.GetOptions{})
+	causes := validateCloneSourceExists(err, sourceField, virtualMachineSnapshotKind, name, namespace)
 	if causes != nil {
 		return causes
 	}
@@ -327,7 +387,7 @@ func validateCloneVolumeSnapshotSupportVM(vm *v1.VirtualMachine, sourceField *k8
 	return result
 }
 
-func validateCloneVolumeSnapshotSupportVMSnapshotContent(snapshotContents *v1alpha1.VirtualMachineSnapshotContent, sourceField *k8sfield.Path) []metav1.StatusCause {
+func validateCloneVolumeSnapshotSupportVMSnapshotContent(snapshotContents *snapshotv1.VirtualMachineSnapshotContent, sourceField *k8sfield.Path) []metav1.StatusCause {
 	var result []metav1.StatusCause
 
 	if snapshotContents.Spec.VirtualMachineSnapshotName == nil {

@@ -17,19 +17,21 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
 
+	"kubevirt.io/kubevirt/pkg/libvmi"
 	"kubevirt.io/kubevirt/pkg/storage/reservation"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
+
 	"kubevirt.io/kubevirt/tests"
 	"kubevirt.io/kubevirt/tests/console"
 	"kubevirt.io/kubevirt/tests/exec"
 	"kubevirt.io/kubevirt/tests/flags"
 	"kubevirt.io/kubevirt/tests/framework/checks"
 	"kubevirt.io/kubevirt/tests/libnode"
+	"kubevirt.io/kubevirt/tests/libpod"
 	"kubevirt.io/kubevirt/tests/libstorage"
-	"kubevirt.io/kubevirt/tests/libvmi"
+	"kubevirt.io/kubevirt/tests/libvmifact"
 	"kubevirt.io/kubevirt/tests/libwait"
 	"kubevirt.io/kubevirt/tests/testsuite"
-	"kubevirt.io/kubevirt/tests/util"
 )
 
 // The SCSI persistent reservation tests require to run serially because of the
@@ -71,7 +73,7 @@ var _ = SIGDescribe("[Serial]SCSI persistent reservation", Serial, func() {
 		pod, err := virtClient.CoreV1().Pods(testsuite.NamespacePrivileged).Get(context.Background(), podName, metav1.GetOptions{})
 		Expect(err).ToNot(HaveOccurred())
 
-		stdout, stderr, err := exec.ExecuteCommandOnPodWithResults(virtClient, pod, "targetcli", cmd)
+		stdout, stderr, err := exec.ExecuteCommandOnPodWithResults(pod, "targetcli", cmd)
 		Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("command='targetcli %v' stdout='%s' stderr='%s'", args, stdout, stderr))
 	}
 
@@ -86,13 +88,14 @@ var _ = SIGDescribe("[Serial]SCSI persistent reservation", Serial, func() {
 		libstorage.CreateFSPVC(pvc, testsuite.NamespacePrivileged, diskSize, nil)
 		// Create targetcli container
 		By("Create targetcli pod")
-		pod := tests.RunPodInNamespace(tests.RenderTargetcliPod(podName, pvc), testsuite.NamespacePrivileged)
+		pod, err := libpod.Run(libpod.RenderTargetcliPod(podName, pvc), testsuite.NamespacePrivileged)
+		Expect(err).ToNot(HaveOccurred())
 		node = pod.Spec.NodeName
 		// The vm-killer image is built with bazel and the /etc/ld.so.cache isn't built
 		// at the package installation. The targetcli utility relies on ctype python package that
 		// uses it to find shared library.
 		// To fix this issue, we run ldconfig before targetcli
-		stdout, stderr, err := exec.ExecuteCommandOnPodWithResults(virtClient, pod, "targetcli", []string{"ldconfig"})
+		stdout, stderr, err := exec.ExecuteCommandOnPodWithResults(pod, "targetcli", []string{"ldconfig"})
 		By(fmt.Sprintf("ldconfig: stdout: %v stderr: %v", stdout, stderr))
 		Expect(err).ToNot(HaveOccurred())
 
@@ -121,7 +124,7 @@ var _ = SIGDescribe("[Serial]SCSI persistent reservation", Serial, func() {
 		pod, err := virtClient.CoreV1().Pods(testsuite.NamespacePrivileged).Get(context.Background(), podName, metav1.GetOptions{})
 		Expect(err).ToNot(HaveOccurred())
 
-		stdout, stderr, err := exec.ExecuteCommandOnPodWithResults(virtClient, pod, "targetcli",
+		stdout, stderr, err := exec.ExecuteCommandOnPodWithResults(pod, "targetcli",
 			[]string{"/bin/lsblk", "--scsi", "-o", "NAME,MODEL", "-p", "-n"})
 		Expect(err).ToNot(HaveOccurred(), stdout, stderr)
 		lines := strings.Split(stdout, "\n")
@@ -208,7 +211,7 @@ var _ = SIGDescribe("[Serial]SCSI persistent reservation", Serial, func() {
 			device = findSCSIdisk(targetCliPod, backendDisk)
 			Expect(device).ToNot(BeEmpty())
 			By(fmt.Sprintf("Create PVC with SCSI disk %s", device))
-			pv, pvc, err = tests.CreatePVandPVCwithSCSIDisk(node, device, util.NamespaceTestDefault, "scsi-disks", "scsipv", "scsipvc")
+			pv, pvc, err = tests.CreatePVandPVCwithSCSIDisk(node, device, testsuite.NamespaceTestDefault, "scsi-disks", "scsipv", "scsipvc")
 			Expect(err).ToNot(HaveOccurred())
 			waitForVirtHandlerWithPrHelperReadyOnNode(node)
 			// Switching the PersistentReservation feature gate on/off
@@ -229,11 +232,13 @@ var _ = SIGDescribe("[Serial]SCSI persistent reservation", Serial, func() {
 
 		It("Should successfully start a VM with persistent reservation", func() {
 			By("Create VMI with the SCSI disk")
-			vmi := libvmi.NewFedora(
+			vmi := libvmifact.NewFedora(
+				libvmi.WithNamespace(testsuite.NamespaceTestDefault),
 				libvmi.WithPersistentVolumeClaimLun("lun0", pvc.Name, true),
+				libvmi.WithNodeAffinityFor(node),
 			)
-			vmi.Namespace = util.NamespaceTestDefault
-			vmi = tests.CreateVmiOnNode(vmi, node)
+			vmi, err := virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vmi, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
 			libwait.WaitForSuccessfulVMIStart(vmi,
 				libwait.WithFailOnWarnings(false),
 				libwait.WithTimeout(180),
@@ -256,21 +261,25 @@ var _ = SIGDescribe("[Serial]SCSI persistent reservation", Serial, func() {
 
 		It("Should successfully start 2 VMs with persistent reservation on the same LUN", func() {
 			By("Create 2 VMs with the SCSI disk")
-			vmi := libvmi.NewFedora(
+			vmi := libvmifact.NewFedora(
+				libvmi.WithNamespace(testsuite.NamespaceTestDefault),
 				libvmi.WithPersistentVolumeClaimLun("lun0", pvc.Name, true),
+				libvmi.WithNodeAffinityFor(node),
 			)
-			vmi.Namespace = util.NamespaceTestDefault
-			vmi = tests.CreateVmiOnNode(vmi, node)
+			vmi, err := virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vmi, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
 			libwait.WaitForSuccessfulVMIStart(vmi,
 				libwait.WithFailOnWarnings(false),
 				libwait.WithTimeout(180),
 			)
 
-			vmi2 := libvmi.NewFedora(
+			vmi2 := libvmifact.NewFedora(
+				libvmi.WithNamespace(testsuite.NamespaceTestDefault),
 				libvmi.WithPersistentVolumeClaimLun("lun0", pvc.Name, true),
+				libvmi.WithNodeAffinityFor(node),
 			)
-			vmi2.Namespace = util.NamespaceTestDefault
-			vmi2 = tests.CreateVmiOnNode(vmi2, node)
+			vmi2, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi2)).Create(context.Background(), vmi2, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
 			libwait.WaitForSuccessfulVMIStart(vmi2,
 				libwait.WithFailOnWarnings(false),
 				libwait.WithTimeout(180),

@@ -29,6 +29,7 @@ mkdir -p ${CMD_OUT_DIR}/dump
 mkdir -p ${CMD_OUT_DIR}/perfscale-audit
 mkdir -p ${CMD_OUT_DIR}/perfscale-load-generator
 mkdir -p ${CMD_OUT_DIR}/cluster-profiler
+mkdir -p ${CMD_OUT_DIR}/cniplugins
 
 # Build all binaries for amd64
 bazel build \
@@ -62,7 +63,13 @@ bazel run \
 
 # build platform native virtctl explicitly
 bazel run \
+    --config="$(uname -m)" \
     :build-virtctl -- ${CMD_OUT_DIR}/virtctl/virtctl
+
+# Copy kubevirt-passt-binding binary to a reachable place outside of the build container
+bazel run \
+    --config=${ARCHITECTURE} \
+    :build-cni-passt-binding -- ${CMD_OUT_DIR}/cniplugins/kubevirt-passt-binding
 
 # compile virtctl for amd64 and arm64
 
@@ -73,6 +80,9 @@ if [[ "${KUBEVIRT_RELEASE}" == "true" || "${CI}" == "true" ]]; then
 
     bazel run \
         :build-virtctl-arm64 -- ${CMD_OUT_DIR}/virtctl/virtctl-${KUBEVIRT_VERSION}-linux-arm64
+
+    bazel run \
+        :build-virtctl-s390x -- ${CMD_OUT_DIR}/virtctl/virtctl-${KUBEVIRT_VERSION}-linux-s390x
 
     # darwin
     bazel run \

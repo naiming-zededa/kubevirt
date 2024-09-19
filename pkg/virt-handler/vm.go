@@ -20,6 +20,7 @@
 package virthandler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	goerror "errors"
@@ -29,14 +30,21 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	backendstorage "kubevirt.io/kubevirt/pkg/storage/backend-storage"
+
+	cmdv1 "kubevirt.io/kubevirt/pkg/handler-launcher-com/cmd/v1"
+	pvctypes "kubevirt.io/kubevirt/pkg/storage/types"
+
 	"golang.org/x/sys/unix"
 	"k8s.io/apimachinery/pkg/util/errors"
 
+	"kubevirt.io/kubevirt/pkg/network/domainspec"
 	"kubevirt.io/kubevirt/pkg/pointer"
 
 	"kubevirt.io/kubevirt/pkg/virt-controller/services"
@@ -64,7 +72,6 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	netcache "kubevirt.io/kubevirt/pkg/network/cache"
-	netsetup "kubevirt.io/kubevirt/pkg/network/setup"
 	netvmispec "kubevirt.io/kubevirt/pkg/network/vmispec"
 	"kubevirt.io/kubevirt/pkg/util"
 
@@ -90,7 +97,6 @@ import (
 	hostdisk "kubevirt.io/kubevirt/pkg/host-disk"
 	neterrors "kubevirt.io/kubevirt/pkg/network/errors"
 	"kubevirt.io/kubevirt/pkg/storage/reservation"
-	pvctypes "kubevirt.io/kubevirt/pkg/storage/types"
 	virtutil "kubevirt.io/kubevirt/pkg/util"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 	virtcache "kubevirt.io/kubevirt/pkg/virt-handler/cache"
@@ -98,7 +104,6 @@ import (
 	"kubevirt.io/kubevirt/pkg/virt-handler/isolation"
 	migrationproxy "kubevirt.io/kubevirt/pkg/virt-handler/migration-proxy"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
-	"kubevirt.io/kubevirt/pkg/watchdog"
 )
 
 type netconf interface {
@@ -153,6 +158,9 @@ const (
 	VMIGracefulShutdown = "Signaled Graceful Shutdown"
 	//VMISignalDeletion is the reason set when the VMI has signal deletion
 	VMISignalDeletion = "Signaled Deletion"
+
+	// MemoryHotplugFailedReason is the reason set when the VM cannot hotplug memory
+	memoryHotplugFailedReason = "Memory Hotplug Failed"
 )
 
 var RequiredGuestAgentCommands = []string{
@@ -169,6 +177,12 @@ var RequiredGuestAgentCommands = []string{
 }
 
 var SSHRelatedGuestAgentCommands = []string{
+	"guest-ssh-get-authorized-keys",
+	"guest-ssh-add-authorized-keys",
+	"guest-ssh-remove-authorized-keys",
+}
+
+var OldSSHRelatedGuestAgentCommands = []string{
 	"guest-exec-status",
 	"guest-exec",
 	"guest-file-open",
@@ -179,6 +193,10 @@ var SSHRelatedGuestAgentCommands = []string{
 
 var PasswordRelatedGuestAgentCommands = []string{
 	"guest-set-user-password",
+}
+
+var getCgroupManager = func(vmi *v1.VirtualMachineInstance) (cgroup.Manager, error) {
+	return cgroup.NewManagerFromVM(vmi)
 }
 
 func NewController(
@@ -192,8 +210,6 @@ func NewController(
 	vmiSourceInformer cache.SharedIndexInformer,
 	vmiTargetInformer cache.SharedIndexInformer,
 	domainInformer cache.SharedInformer,
-	gracefulShutdownInformer cache.SharedIndexInformer,
-	watchdogTimeoutSeconds int,
 	maxDevices int,
 	clusterConfig *virtconfig.ClusterConfig,
 	podIsolationDetector isolation.PodIsolationDetector,
@@ -201,34 +217,52 @@ func NewController(
 	downwardMetricsManager downwardMetricsManager,
 	capabilities *nodelabellerapi.Capabilities,
 	hostCpuModel string,
+	netConf netconf,
+	netStat netstat,
+	netBindingPluginMemoryCalculator netBindingPluginMemoryCalculator,
 ) (*VirtualMachineController, error) {
 
 	queue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "virt-handler-vm")
 
+	containerDiskState := filepath.Join(virtPrivateDir, "container-disk-mount-state")
+	if err := os.MkdirAll(containerDiskState, 0700); err != nil {
+		return nil, err
+	}
+
+	hotplugState := filepath.Join(virtPrivateDir, "hotplug-volume-mount-state")
+	if err := os.MkdirAll(hotplugState, 0700); err != nil {
+		return nil, err
+	}
+
 	c := &VirtualMachineController{
-		Queue:                       queue,
-		recorder:                    recorder,
-		clientset:                   clientset,
-		host:                        host,
-		migrationIpAddress:          migrationIpAddress,
-		virtShareDir:                virtShareDir,
-		vmiSourceInformer:           vmiSourceInformer,
-		vmiTargetInformer:           vmiTargetInformer,
-		domainInformer:              domainInformer,
-		gracefulShutdownInformer:    gracefulShutdownInformer,
-		heartBeatInterval:           1 * time.Minute,
-		watchdogTimeoutSeconds:      watchdogTimeoutSeconds,
-		migrationProxy:              migrationProxy,
-		podIsolationDetector:        podIsolationDetector,
-		containerDiskMounter:        container_disk.NewMounter(podIsolationDetector, filepath.Join(virtPrivateDir, "container-disk-mount-state"), clusterConfig),
-		hotplugVolumeMounter:        hotplug_volume.NewVolumeMounter(filepath.Join(virtPrivateDir, "hotplug-volume-mount-state"), kubeletPodsDir),
-		clusterConfig:               clusterConfig,
-		virtLauncherFSRunDirPattern: "/proc/%d/root/var/run",
-		capabilities:                capabilities,
-		hostCpuModel:                hostCpuModel,
-		vmiExpectations:             controller.NewUIDTrackingControllerExpectations(controller.NewControllerExpectations()),
-		sriovHotplugExecutorPool:    executor.NewRateLimitedExecutorPool(executor.NewExponentialLimitedBackoffCreator()),
-		ioErrorRetryManager:         NewFailRetryManager("io-error-retry", 10*time.Second, 3*time.Minute, 30*time.Second),
+		queue:                            queue,
+		recorder:                         recorder,
+		clientset:                        clientset,
+		host:                             host,
+		migrationIpAddress:               migrationIpAddress,
+		virtShareDir:                     virtShareDir,
+		vmiSourceStore:                   vmiSourceInformer.GetStore(),
+		vmiTargetStore:                   vmiTargetInformer.GetStore(),
+		domainStore:                      domainInformer.GetStore(),
+		heartBeatInterval:                1 * time.Minute,
+		migrationProxy:                   migrationProxy,
+		podIsolationDetector:             podIsolationDetector,
+		containerDiskMounter:             container_disk.NewMounter(podIsolationDetector, containerDiskState, clusterConfig),
+		hotplugVolumeMounter:             hotplug_volume.NewVolumeMounter(hotplugState, kubeletPodsDir),
+		clusterConfig:                    clusterConfig,
+		virtLauncherFSRunDirPattern:      "/proc/%d/root/var/run",
+		capabilities:                     capabilities,
+		hostCpuModel:                     hostCpuModel,
+		vmiExpectations:                  controller.NewUIDTrackingControllerExpectations(controller.NewControllerExpectations()),
+		sriovHotplugExecutorPool:         executor.NewRateLimitedExecutorPool(executor.NewExponentialLimitedBackoffCreator()),
+		ioErrorRetryManager:              NewFailRetryManager("io-error-retry", 10*time.Second, 3*time.Minute, 30*time.Second),
+		netConf:                          netConf,
+		netStat:                          netStat,
+		netBindingPluginMemoryCalculator: netBindingPluginMemoryCalculator,
+	}
+
+	c.hasSynced = func() bool {
+		return domainInformer.HasSynced() && vmiSourceInformer.HasSynced() && vmiTargetInformer.HasSynced()
 	}
 
 	_, err := vmiSourceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -258,19 +292,7 @@ func NewController(
 		return nil, err
 	}
 
-	_, err = gracefulShutdownInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    c.addFunc,
-		DeleteFunc: c.deleteFunc,
-		UpdateFunc: c.updateFunc,
-	})
-	if err != nil {
-		return nil, err
-	}
-
 	c.launcherClients = virtcache.LauncherClientInfoByVMI{}
-
-	c.netConf = netsetup.NewNetConf()
-	c.netStat = netsetup.NewNetStat()
 
 	c.downwardMetricsManager = downwardMetricsManager
 
@@ -300,6 +322,10 @@ func NewController(
 	return c, nil
 }
 
+type netBindingPluginMemoryCalculator interface {
+	Calculate(vmi *v1.VirtualMachineInstance, registeredPlugins map[string]v1.InterfaceBindingPlugin) resource.Quantity
+}
+
 type VirtualMachineController struct {
 	recorder                 record.EventRecorder
 	clientset                kubecli.KubevirtClient
@@ -307,14 +333,12 @@ type VirtualMachineController struct {
 	migrationIpAddress       string
 	virtShareDir             string
 	virtPrivateDir           string
-	Queue                    workqueue.RateLimitingInterface
-	vmiSourceInformer        cache.SharedIndexInformer
-	vmiTargetInformer        cache.SharedIndexInformer
-	domainInformer           cache.SharedInformer
-	gracefulShutdownInformer cache.SharedIndexInformer
+	queue                    workqueue.RateLimitingInterface
+	vmiSourceStore           cache.Store
+	vmiTargetStore           cache.Store
+	domainStore              cache.Store
 	launcherClients          virtcache.LauncherClientInfoByVMI
 	heartBeatInterval        time.Duration
-	watchdogTimeoutSeconds   int
 	deviceManagerController  *device_manager.DeviceController
 	migrationProxy           migrationproxy.ProxyManager
 	podIsolationDetector     isolation.PodIsolationDetector
@@ -324,8 +348,9 @@ type VirtualMachineController struct {
 	sriovHotplugExecutorPool *executor.RateLimitedExecutorPool
 	downwardMetricsManager   downwardMetricsManager
 
-	netConf netconf
-	netStat netstat
+	netConf                          netconf
+	netStat                          netstat
+	netBindingPluginMemoryCalculator netBindingPluginMemoryCalculator
 
 	domainNotifyPipes           map[string]string
 	virtLauncherFSRunDirPattern string
@@ -334,6 +359,7 @@ type VirtualMachineController struct {
 	hostCpuModel                string
 	vmiExpectations             *controller.UIDTrackingControllerExpectations
 	ioErrorRetryManager         *FailRetryManager
+	hasSynced                   func() bool
 }
 
 type virtLauncherCriticalSecurebootError struct {
@@ -341,6 +367,20 @@ type virtLauncherCriticalSecurebootError struct {
 }
 
 func (e *virtLauncherCriticalSecurebootError) Error() string { return e.msg }
+
+type vmiIrrecoverableError struct {
+	msg string
+}
+
+func (e *vmiIrrecoverableError) Error() string { return e.msg }
+
+func formatIrrecoverableErrorMessage(domain *api.Domain) string {
+	msg := "unknown reason"
+	if domainPausedFailedPostCopy(domain) {
+		msg = "VMI is irrecoverable due to failed post-copy migration"
+	}
+	return msg
+}
 
 func handleDomainNotifyPipe(domainPipeStopChan chan struct{}, ln net.Listener, virtShareDir string, vmi *v1.VirtualMachineInstance) {
 
@@ -537,7 +577,7 @@ func (d *VirtualMachineController) hasTargetDetectedReadyDomain(vmi *v1.VirtualM
 	}
 
 	// re-enqueue the key to ensure it gets processed again within the right time.
-	d.Queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Duration(enqueueTime)*time.Second)
+	d.queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Duration(enqueueTime)*time.Second)
 
 	return false, timeLeft
 }
@@ -582,11 +622,12 @@ func (d *VirtualMachineController) setupNetwork(vmi *v1.VirtualMachineInstance, 
 	})
 }
 
+func domainPausedFailedPostCopy(domain *api.Domain) bool {
+	return domain != nil && domain.Status.Status == api.Paused && domain.Status.Reason == api.ReasonPausedPostcopyFailed
+}
+
 func domainMigrated(domain *api.Domain) bool {
-	if domain != nil && domain.Status.Status == api.Shutoff && domain.Status.Reason == api.ReasonMigrated {
-		return true
-	}
-	return false
+	return domain != nil && domain.Status.Status == api.Shutoff && domain.Status.Reason == api.ReasonMigrated
 }
 
 func canUpdateToMounted(currentPhase v1.VolumePhase) bool {
@@ -598,7 +639,6 @@ func canUpdateToUnmounted(currentPhase v1.VolumePhase) bool {
 }
 
 func (d *VirtualMachineController) setMigrationProgressStatus(vmi *v1.VirtualMachineInstance, domain *api.Domain) {
-
 	if domain == nil ||
 		domain.Spec.Metadata.KubeVirt.Migration == nil ||
 		vmi.Status.MigrationState == nil ||
@@ -613,6 +653,7 @@ func (d *VirtualMachineController) setMigrationProgressStatus(vmi *v1.VirtualMac
 
 	if vmi.Status.MigrationState.EndTimestamp == nil && migrationMetadata.EndTimestamp != nil {
 		if migrationMetadata.Failed {
+			vmi.Status.MigrationState.FailureReason = migrationMetadata.FailureReason
 			d.recorder.Event(vmi, k8sv1.EventTypeWarning, v1.Migrated.String(), fmt.Sprintf("VirtualMachineInstance migration uid %s failed. reason:%s", string(migrationMetadata.UID), migrationMetadata.FailureReason))
 		}
 	}
@@ -707,19 +748,13 @@ func (d *VirtualMachineController) migrationSourceUpdateVMIStatus(origVMI *v1.Vi
 	if !equality.Semantic.DeepEqual(oldStatus, vmi.Status) {
 		key := controller.VirtualMachineInstanceKey(vmi)
 		d.vmiExpectations.SetExpectations(key, 1, 0)
-		_, err := d.clientset.VirtualMachineInstance(vmi.ObjectMeta.Namespace).Update(context.Background(), vmi)
+		_, err := d.clientset.VirtualMachineInstance(vmi.ObjectMeta.Namespace).Update(context.Background(), vmi, metav1.UpdateOptions{})
 		if err != nil {
 			d.vmiExpectations.LowerExpectations(key, 1, 0)
 			return err
 		}
 	}
 	return nil
-}
-
-type NetworkStatus struct {
-	Name      string   `yaml:"name"`
-	Ips       []string `yaml:"ips"`
-	Interface string   `yaml:"interface"`
 }
 
 func domainIsActiveOnTarget(domain *api.Domain) bool {
@@ -822,7 +857,7 @@ func (d *VirtualMachineController) migrationTargetUpdateVMIStatus(vmi *v1.Virtua
 	if !equality.Semantic.DeepEqual(vmi.Status, vmiCopy.Status) {
 		key := controller.VirtualMachineInstanceKey(vmi)
 		d.vmiExpectations.SetExpectations(key, 1, 0)
-		_, err := d.clientset.VirtualMachineInstance(vmi.ObjectMeta.Namespace).Update(context.Background(), vmiCopy)
+		_, err := d.clientset.VirtualMachineInstance(vmi.ObjectMeta.Namespace).Update(context.Background(), vmiCopy, metav1.UpdateOptions{})
 		if err != nil {
 			d.vmiExpectations.LowerExpectations(key, 1, 0)
 			return err
@@ -890,6 +925,99 @@ func (d *VirtualMachineController) updateHotplugVolumeStatus(vmi *v1.VirtualMach
 	return volumeStatus, needsRefresh
 }
 
+func needToComputeChecksums(vmi *v1.VirtualMachineInstance) bool {
+	containerDisks := map[string]*v1.Volume{}
+	for _, volume := range vmi.Spec.Volumes {
+		if volume.VolumeSource.ContainerDisk != nil {
+			containerDisks[volume.Name] = &volume
+		}
+	}
+
+	for i := range vmi.Status.VolumeStatus {
+		_, isContainerDisk := containerDisks[vmi.Status.VolumeStatus[i].Name]
+		if !isContainerDisk {
+			continue
+		}
+
+		if vmi.Status.VolumeStatus[i].ContainerDiskVolume == nil ||
+			vmi.Status.VolumeStatus[i].ContainerDiskVolume.Checksum == 0 {
+			return true
+		}
+	}
+
+	if util.HasKernelBootContainerImage(vmi) {
+		if vmi.Status.KernelBootStatus == nil {
+			return true
+		}
+
+		kernelBootContainer := vmi.Spec.Domain.Firmware.KernelBoot.Container
+
+		if kernelBootContainer.KernelPath != "" &&
+			(vmi.Status.KernelBootStatus.KernelInfo == nil ||
+				vmi.Status.KernelBootStatus.KernelInfo.Checksum == 0) {
+			return true
+
+		}
+
+		if kernelBootContainer.InitrdPath != "" &&
+			(vmi.Status.KernelBootStatus.InitrdInfo == nil ||
+				vmi.Status.KernelBootStatus.InitrdInfo.Checksum == 0) {
+			return true
+
+		}
+	}
+
+	return false
+}
+
+func (d *VirtualMachineController) updateChecksumInfo(vmi *v1.VirtualMachineInstance, syncError error) error {
+
+	if syncError != nil || vmi.DeletionTimestamp != nil || !needToComputeChecksums(vmi) {
+		return nil
+	}
+
+	diskChecksums, err := d.containerDiskMounter.ComputeChecksums(vmi)
+	if goerror.Is(err, container_disk.ErrDiskContainerGone) {
+		log.Log.Errorf("cannot compute checksums as containerdisk/kernelboot containers seem to have been terminated")
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	// containerdisks
+	for i := range vmi.Status.VolumeStatus {
+		checksum, exists := diskChecksums.ContainerDiskChecksums[vmi.Status.VolumeStatus[i].Name]
+		if !exists {
+			// not a containerdisk
+			continue
+		}
+
+		vmi.Status.VolumeStatus[i].ContainerDiskVolume = &v1.ContainerDiskInfo{
+			Checksum: checksum,
+		}
+	}
+
+	// kernelboot
+	if util.HasKernelBootContainerImage(vmi) {
+		vmi.Status.KernelBootStatus = &v1.KernelBootStatus{}
+
+		if diskChecksums.KernelBootChecksum.Kernel != nil {
+			vmi.Status.KernelBootStatus.KernelInfo = &v1.KernelInfo{
+				Checksum: *diskChecksums.KernelBootChecksum.Kernel,
+			}
+		}
+
+		if diskChecksums.KernelBootChecksum.Initrd != nil {
+			vmi.Status.KernelBootStatus.InitrdInfo = &v1.InitrdInfo{
+				Checksum: *diskChecksums.KernelBootChecksum.Initrd,
+			}
+		}
+	}
+
+	return nil
+}
+
 func (d *VirtualMachineController) updateVolumeStatusesFromDomain(vmi *v1.VirtualMachineInstance, domain *api.Domain) bool {
 	// used by unit test
 	hasHotplug := false
@@ -931,7 +1059,7 @@ func (d *VirtualMachineController) updateVolumeStatusesFromDomain(vmi *v1.Virtua
 			return strings.Compare(newStatuses[i].Name, newStatuses[j].Name) == -1
 		})
 		if needsRefresh {
-			d.Queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second)
+			d.queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second)
 		}
 		d.generateEventsForVolumeStatusChange(vmi, newStatusMap)
 		vmi.Status.VolumeStatus = newStatuses
@@ -947,11 +1075,12 @@ func (d *VirtualMachineController) updateGuestInfoFromDomain(vmi *v1.VirtualMach
 
 	if vmi.Status.GuestOSInfo.Name != domain.Status.OSInfo.Name {
 		vmi.Status.GuestOSInfo.Name = domain.Status.OSInfo.Name
-		vmi.Status.GuestOSInfo.Version = domain.Status.OSInfo.VersionId
+		vmi.Status.GuestOSInfo.Version = domain.Status.OSInfo.Version
 		vmi.Status.GuestOSInfo.KernelRelease = domain.Status.OSInfo.KernelRelease
 		vmi.Status.GuestOSInfo.PrettyName = domain.Status.OSInfo.PrettyName
 		vmi.Status.GuestOSInfo.VersionID = domain.Status.OSInfo.VersionId
 		vmi.Status.GuestOSInfo.KernelVersion = domain.Status.OSInfo.KernelVersion
+		vmi.Status.GuestOSInfo.Machine = domain.Status.OSInfo.Machine
 		vmi.Status.GuestOSInfo.ID = domain.Status.OSInfo.Id
 	}
 }
@@ -994,8 +1123,7 @@ func (d *VirtualMachineController) updateAccessCredentialConditions(vmi *v1.Virt
 }
 
 func (d *VirtualMachineController) updateLiveMigrationConditions(vmi *v1.VirtualMachineInstance, condManager *controller.VirtualMachineInstanceConditionManager) {
-
-	// Cacluate whether the VM is migratable
+	// Calculate whether the VM is migratable
 	liveMigrationCondition, isBlockMigration := d.calculateLiveMigrationCondition(vmi)
 	if !condManager.HasCondition(vmi, v1.VirtualMachineInstanceIsMigratable) {
 		vmi.Status.Conditions = append(vmi.Status.Conditions, *liveMigrationCondition)
@@ -1012,7 +1140,8 @@ func (d *VirtualMachineController) updateLiveMigrationConditions(vmi *v1.Virtual
 			vmi.Status.Conditions = append(vmi.Status.Conditions, *liveMigrationCondition)
 		}
 	}
-
+	storageLiveMigCond := d.calculateLiveStorageMigrationCondition(vmi)
+	condManager.UpdateCondition(vmi, storageLiveMigCond)
 	evictable := migrations.VMIMigratableOnEviction(d.clusterConfig, vmi)
 	if evictable && liveMigrationCondition.Status == k8sv1.ConditionFalse {
 		d.recorder.Eventf(vmi, k8sv1.EventTypeWarning, v1.Migrated.String(), "EvictionStrategy is set but vmi is not migratable; %s", liveMigrationCondition.Message)
@@ -1166,29 +1295,26 @@ func (d *VirtualMachineController) updateFSFreezeStatus(vmi *v1.VirtualMachineIn
 
 }
 
-func IsoGuestVolumePath(vmi *v1.VirtualMachineInstance, volume *v1.Volume) (string, bool) {
-	var volPath string
-
-	basepath := "/var/run"
-	if volume.CloudInitNoCloud != nil {
-		volPath = filepath.Join(basepath, "kubevirt-ephemeral-disks", "cloud-init-data", vmi.Namespace, vmi.Name, "noCloud.iso")
-	} else if volume.CloudInitConfigDrive != nil {
-		volPath = filepath.Join(basepath, "kubevirt-ephemeral-disks", "cloud-init-data", vmi.Namespace, vmi.Name, "configdrive.iso")
-	} else if volume.ConfigMap != nil {
-		volPath = config.GetConfigMapDiskPath(volume.Name)
-	} else if volume.DownwardAPI != nil {
-		volPath = config.GetDownwardAPIDiskPath(volume.Name)
-	} else if volume.Secret != nil {
-		volPath = config.GetSecretDiskPath(volume.Name)
-	} else if volume.ServiceAccount != nil {
-		volPath = config.GetServiceAccountDiskPath()
-	} else if volume.Sysprep != nil {
-		volPath = config.GetSysprepDiskPath(volume.Name)
-	} else {
-		return "", false
+func IsoGuestVolumePath(namespace, name string, volume *v1.Volume) string {
+	const basepath = "/var/run"
+	switch {
+	case volume.CloudInitNoCloud != nil:
+		return filepath.Join(basepath, "kubevirt-ephemeral-disks", "cloud-init-data", namespace, name, "noCloud.iso")
+	case volume.CloudInitConfigDrive != nil:
+		return filepath.Join(basepath, "kubevirt-ephemeral-disks", "cloud-init-data", namespace, name, "configdrive.iso")
+	case volume.ConfigMap != nil:
+		return config.GetConfigMapDiskPath(volume.Name)
+	case volume.DownwardAPI != nil:
+		return config.GetDownwardAPIDiskPath(volume.Name)
+	case volume.Secret != nil:
+		return config.GetSecretDiskPath(volume.Name)
+	case volume.ServiceAccount != nil:
+		return config.GetServiceAccountDiskPath()
+	case volume.Sysprep != nil:
+		return config.GetSysprepDiskPath(volume.Name)
+	default:
+		return ""
 	}
-
-	return volPath, true
 }
 
 func (d *VirtualMachineController) updateIsoSizeStatus(vmi *v1.VirtualMachineInstance) {
@@ -1220,8 +1346,8 @@ func (d *VirtualMachineController) updateIsoSizeStatus(vmi *v1.VirtualMachineIns
 			continue
 		}
 
-		volPath, found := IsoGuestVolumePath(vmi, &volume)
-		if !found {
+		volPath := IsoGuestVolumePath(vmi.Namespace, vmi.Name, &volume)
+		if volPath == "" {
 			continue
 		}
 
@@ -1248,7 +1374,7 @@ func (d *VirtualMachineController) updateIsoSizeStatus(vmi *v1.VirtualMachineIns
 			continue
 		}
 
-		for i, _ := range vmi.Status.VolumeStatus {
+		for i := range vmi.Status.VolumeStatus {
 			if vmi.Status.VolumeStatus[i].Name == volume.Name {
 				vmi.Status.VolumeStatus[i].Size = fileInfo.Size()
 				continue
@@ -1340,6 +1466,11 @@ func (d *VirtualMachineController) updateVMIStatus(origVMI *v1.VirtualMachineIns
 		return err
 	}
 
+	// Store containerdisks and kernelboot checksums
+	if err := d.updateChecksumInfo(vmi, syncError); err != nil {
+		return err
+	}
+
 	// Handle sync error
 	handleSyncError(vmi, condManager, syncError)
 
@@ -1349,7 +1480,7 @@ func (d *VirtualMachineController) updateVMIStatus(origVMI *v1.VirtualMachineIns
 	if !equality.Semantic.DeepEqual(oldStatus, vmi.Status) {
 		key := controller.VirtualMachineInstanceKey(vmi)
 		d.vmiExpectations.SetExpectations(key, 1, 0)
-		_, err = d.clientset.VirtualMachineInstance(vmi.ObjectMeta.Namespace).Update(context.Background(), vmi)
+		_, err = d.clientset.VirtualMachineInstance(vmi.ObjectMeta.Namespace).Update(context.Background(), vmi, metav1.UpdateOptions{})
 		if err != nil {
 			d.vmiExpectations.LowerExpectations(key, 1, 0)
 			return err
@@ -1372,6 +1503,11 @@ func handleSyncError(vmi *v1.VirtualMachineInstance, condManager *controller.Vir
 	}
 	if _, ok := syncError.(*virtLauncherCriticalSecurebootError); ok {
 		log.Log.Errorf("virt-launcher does not support the Secure Boot setting. Updating VMI %s status to Failed", vmi.Name)
+		vmi.Status.Phase = v1.Failed
+	}
+
+	if _, ok := syncError.(*vmiIrrecoverableError); ok {
+		log.Log.Errorf("virt-launcher reached an irrecoverable error. Updating VMI %s status to Failed", vmi.Name)
 		vmi.Status.Phase = v1.Failed
 	}
 	condManager.CheckFailure(vmi, syncError, "Synchronizing with the Domain failed.")
@@ -1430,7 +1566,7 @@ func isGuestAgentSupported(vmi *v1.VirtualMachineInstance, commands []v1.GuestAg
 		}
 	}
 
-	if checkSSH && !_guestAgentCommandSubsetSupported(SSHRelatedGuestAgentCommands, commands) {
+	if checkSSH && !sshRelatedCommandsSupported(commands) {
 		return false, "This guest agent doesn't support required public key commands"
 	}
 
@@ -1439,6 +1575,11 @@ func isGuestAgentSupported(vmi *v1.VirtualMachineInstance, commands []v1.GuestAg
 	}
 
 	return true, "This guest agent is supported"
+}
+
+func sshRelatedCommandsSupported(commands []v1.GuestAgentCommandInfo) bool {
+	return _guestAgentCommandSubsetSupported(SSHRelatedGuestAgentCommands, commands) ||
+		_guestAgentCommandSubsetSupported(OldSSHRelatedGuestAgentCommands, commands)
 }
 
 func calculatePausedCondition(vmi *v1.VirtualMachineInstance, reason api.StateChangeReason) {
@@ -1514,6 +1655,10 @@ func (d *VirtualMachineController) calculateLiveMigrationCondition(vmi *v1.Virtu
 		return newNonMigratableCondition(tscRequirement.Reason, v1.VirtualMachineInstanceReasonNoTSCFrequencyMigratable), isBlockMigration
 	}
 
+	if vmiFeatures := vmi.Spec.Domain.Features; vmiFeatures != nil && vmiFeatures.HypervPassthrough != nil && *vmiFeatures.HypervPassthrough.Enabled {
+		return newNonMigratableCondition("VMI uses hyperv passthrough", v1.VirtualMachineInstanceReasonHypervPassthroughNotMigratable), isBlockMigration
+	}
+
 	return &v1.VirtualMachineInstanceCondition{
 		Type:   v1.VirtualMachineInstanceIsMigratable,
 		Status: k8sv1.ConditionTrue,
@@ -1524,19 +1669,99 @@ func vmiContainsPCIHostDevice(vmi *v1.VirtualMachineInstance) bool {
 	return len(vmi.Spec.Domain.Devices.HostDevices) > 0 || len(vmi.Spec.Domain.Devices.GPUs) > 0
 }
 
+type multipleNonMigratableCondition struct {
+	reasons []string
+	msgs    []string
+}
+
+func newMultipleNonMigratableCondition() *multipleNonMigratableCondition {
+	return &multipleNonMigratableCondition{}
+}
+
+func (cond *multipleNonMigratableCondition) addNonMigratableCondition(reason, msg string) {
+	cond.reasons = append(cond.reasons, reason)
+	cond.msgs = append(cond.msgs, msg)
+}
+
+func (cond *multipleNonMigratableCondition) String() string {
+	var buffer bytes.Buffer
+	for i, c := range cond.reasons {
+		if i > 0 {
+			buffer.WriteString(", ")
+		}
+		buffer.WriteString(fmt.Sprintf("%s: %s", c, cond.msgs[i]))
+	}
+	return buffer.String()
+}
+
+func (cond *multipleNonMigratableCondition) generateStorageLiveMigrationCondition() *v1.VirtualMachineInstanceCondition {
+	switch len(cond.reasons) {
+	case 0:
+		return &v1.VirtualMachineInstanceCondition{
+			Type:   v1.VirtualMachineInstanceIsStorageLiveMigratable,
+			Status: k8sv1.ConditionTrue,
+		}
+	default:
+		return &v1.VirtualMachineInstanceCondition{
+			Type:    v1.VirtualMachineInstanceIsStorageLiveMigratable,
+			Status:  k8sv1.ConditionFalse,
+			Message: cond.String(),
+			Reason:  v1.VirtualMachineInstanceReasonNotMigratable,
+		}
+	}
+}
+
+func (d *VirtualMachineController) calculateLiveStorageMigrationCondition(vmi *v1.VirtualMachineInstance) *v1.VirtualMachineInstanceCondition {
+	multiCond := newMultipleNonMigratableCondition()
+
+	if err := d.checkNetworkInterfacesForMigration(vmi); err != nil {
+		multiCond.addNonMigratableCondition(v1.VirtualMachineInstanceReasonInterfaceNotMigratable, err.Error())
+	}
+
+	if err := d.isHostModelMigratable(vmi); err != nil {
+		multiCond.addNonMigratableCondition(v1.VirtualMachineInstanceReasonCPUModeNotMigratable, err.Error())
+	}
+
+	if util.IsVMIVirtiofsEnabled(vmi) {
+		multiCond.addNonMigratableCondition(v1.VirtualMachineInstanceReasonVirtIOFSNotMigratable, "VMI uses virtiofs")
+	}
+
+	if vmiContainsPCIHostDevice(vmi) {
+		multiCond.addNonMigratableCondition(v1.VirtualMachineInstanceReasonHostDeviceNotMigratable, "VMI uses a PCI host devices")
+	}
+
+	if util.IsSEVVMI(vmi) {
+		multiCond.addNonMigratableCondition(v1.VirtualMachineInstanceReasonSEVNotMigratable, "VMI uses SEV")
+	}
+
+	if reservation.HasVMIPersistentReservation(vmi) {
+		multiCond.addNonMigratableCondition(v1.VirtualMachineInstanceReasonPRNotMigratable, "VMI uses SCSI persitent reservation")
+	}
+
+	if tscRequirement := topology.GetTscFrequencyRequirement(vmi); !topology.AreTSCFrequencyTopologyHintsDefined(vmi) && tscRequirement.Type == topology.RequiredForMigration {
+		multiCond.addNonMigratableCondition(v1.VirtualMachineInstanceReasonNoTSCFrequencyMigratable, tscRequirement.Reason)
+	}
+
+	if vmiFeatures := vmi.Spec.Domain.Features; vmiFeatures != nil && vmiFeatures.HypervPassthrough != nil && *vmiFeatures.HypervPassthrough.Enabled {
+		multiCond.addNonMigratableCondition(v1.VirtualMachineInstanceReasonHypervPassthroughNotMigratable, "VMI uses hyperv passthrough")
+	}
+
+	return multiCond.generateStorageLiveMigrationCondition()
+}
+
 func (c *VirtualMachineController) Run(threadiness int, stopCh chan struct{}) {
-	defer c.Queue.ShutDown()
+	defer c.queue.ShutDown()
 	log.Log.Info("Starting virt-handler controller.")
 
 	go c.deviceManagerController.Run(stopCh)
 
 	go c.downwardMetricsManager.Run(stopCh)
 
-	cache.WaitForCacheSync(stopCh, c.domainInformer.HasSynced, c.vmiSourceInformer.HasSynced, c.vmiTargetInformer.HasSynced, c.gracefulShutdownInformer.HasSynced)
+	cache.WaitForCacheSync(stopCh, c.hasSynced)
 
-	// Queue keys for previous Domains on the host that no longer exist
+	// queue keys for previous Domains on the host that no longer exist
 	// in the cache. This ensures we perform local cleanup of deleted VMs.
-	for _, domain := range c.domainInformer.GetStore().List() {
+	for _, domain := range c.domainStore.List() {
 		d := domain.(*api.Domain)
 		vmiRef := v1.NewVMIReferenceWithUUID(
 			d.ObjectMeta.Namespace,
@@ -1545,9 +1770,9 @@ func (c *VirtualMachineController) Run(threadiness int, stopCh chan struct{}) {
 
 		key := controller.VirtualMachineInstanceKey(vmiRef)
 
-		_, exists, _ := c.vmiSourceInformer.GetStore().GetByKey(key)
+		_, exists, _ := c.vmiSourceStore.GetByKey(key)
 		if !exists {
-			c.Queue.Add(key)
+			c.queue.Add(key)
 		}
 	}
 
@@ -1575,17 +1800,17 @@ func (c *VirtualMachineController) runWorker() {
 }
 
 func (c *VirtualMachineController) Execute() bool {
-	key, quit := c.Queue.Get()
+	key, quit := c.queue.Get()
 	if quit {
 		return false
 	}
-	defer c.Queue.Done(key)
+	defer c.queue.Done(key)
 	if err := c.execute(key.(string)); err != nil {
 		log.Log.Reason(err).Infof("re-enqueuing VirtualMachineInstance %v", key)
-		c.Queue.AddRateLimited(key)
+		c.queue.AddRateLimited(key)
 	} else {
 		log.Log.V(4).Infof("processed VirtualMachineInstance %v", key)
-		c.Queue.Forget(key)
+		c.queue.Forget(key)
 	}
 	return true
 }
@@ -1593,13 +1818,13 @@ func (c *VirtualMachineController) Execute() bool {
 func (d *VirtualMachineController) getVMIFromCache(key string) (vmi *v1.VirtualMachineInstance, exists bool, err error) {
 
 	// Fetch the latest Vm state from cache
-	obj, exists, err := d.vmiSourceInformer.GetStore().GetByKey(key)
+	obj, exists, err := d.vmiSourceStore.GetByKey(key)
 	if err != nil {
 		return nil, false, err
 	}
 
 	if !exists {
-		obj, exists, err = d.vmiTargetInformer.GetStore().GetByKey(key)
+		obj, exists, err = d.vmiTargetStore.GetByKey(key)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1621,7 +1846,7 @@ func (d *VirtualMachineController) getVMIFromCache(key string) (vmi *v1.VirtualM
 
 func (d *VirtualMachineController) getDomainFromCache(key string) (domain *api.Domain, exists bool, cachedUID types.UID, err error) {
 
-	obj, exists, err := d.domainInformer.GetStore().GetByKey(key)
+	obj, exists, err := d.domainStore.GetByKey(key)
 
 	if err != nil {
 		return nil, false, "", err
@@ -1712,7 +1937,7 @@ func (d *VirtualMachineController) migrationTargetExecute(vmi *v1.VirtualMachine
 
 		// if we're still the migration target, we need to keep trying until the migration fails.
 		// it's possible we're simply waiting for another target pod to come online.
-		d.Queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*1)
+		d.queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*1)
 
 	} else if shouldUpdate {
 		log.Log.Object(vmi).Info("Processing vmi migration target update")
@@ -1732,41 +1957,16 @@ func (d *VirtualMachineController) migrationTargetExecute(vmi *v1.VirtualMachine
 	return nil
 }
 
-// Legacy, remove once we're certain we are no longer supporting
-// VMIs running with the old graceful shutdown trigger logic
-func gracefulShutdownTriggerFromNamespaceName(baseDir string, namespace string, name string) string {
-	triggerFile := namespace + "_" + name
-	return filepath.Join(baseDir, "graceful-shutdown-trigger", triggerFile)
-}
-
-// Legacy, remove once we're certain we are no longer supporting
-// VMIs running with the old graceful shutdown trigger logic
-func vmGracefulShutdownTriggerClear(baseDir string, vmi *v1.VirtualMachineInstance) error {
-	triggerFile := gracefulShutdownTriggerFromNamespaceName(baseDir, vmi.Namespace, vmi.Name)
-	return diskutils.RemoveFilesIfExist(triggerFile)
-}
-
-// Legacy, remove once we're certain we are no longer supporting
-// VMIs running with the old graceful shutdown trigger logic
-func vmHasGracefulShutdownTrigger(baseDir string, vmi *v1.VirtualMachineInstance) (bool, error) {
-	triggerFile := gracefulShutdownTriggerFromNamespaceName(baseDir, vmi.Namespace, vmi.Name)
-	return diskutils.FileExists(triggerFile)
-}
-
 // Determine if gracefulShutdown has been triggered by virt-launcher
-func (d *VirtualMachineController) hasGracefulShutdownTrigger(vmi *v1.VirtualMachineInstance, domain *api.Domain) (bool, error) {
-
-	// This is the new way of reporting GracefulShutdown, via domain metadata.
-	if domain != nil &&
-		domain.Spec.Metadata.KubeVirt.GracePeriod != nil &&
-		domain.Spec.Metadata.KubeVirt.GracePeriod.MarkedForGracefulShutdown != nil &&
-		*domain.Spec.Metadata.KubeVirt.GracePeriod.MarkedForGracefulShutdown == true {
-		return true, nil
+func (d *VirtualMachineController) hasGracefulShutdownTrigger(domain *api.Domain) bool {
+	if domain == nil {
+		return false
 	}
+	gracePeriod := domain.Spec.Metadata.KubeVirt.GracePeriod
 
-	// Fallback to detecting the old way of reporting gracefulshutdown, via file.
-	// We keep this around in order to ensure backwards compatibility
-	return vmHasGracefulShutdownTrigger(d.virtShareDir, vmi)
+	return gracePeriod != nil &&
+		gracePeriod.MarkedForGracefulShutdown != nil &&
+		*gracePeriod.MarkedForGracefulShutdown
 }
 
 func (d *VirtualMachineController) defaultExecute(key string,
@@ -1785,6 +1985,8 @@ func (d *VirtualMachineController) defaultExecute(key string,
 	shouldUpdate := false
 	// set true to ensure that no updates to the current VirtualMachineInstance state will occur
 	forceIgnoreSync := false
+	// set to true when unrecoverable domain needs to be destroyed non-gracefully.
+	forceShutdownIrrecoverable := false
 
 	log.Log.V(3).Infof("Processing event %v", key)
 
@@ -1805,11 +2007,10 @@ func (d *VirtualMachineController) defaultExecute(key string,
 		domain.Status.Status != ""
 
 	domainMigrated := domainExists && domainMigrated(domain)
+	forceShutdownIrrecoverable = domainExists && domainPausedFailedPostCopy(domain)
 
-	gracefulShutdown, err := d.hasGracefulShutdownTrigger(vmi, domain)
-	if err != nil {
-		return err
-	} else if gracefulShutdown && vmi.IsRunning() {
+	gracefulShutdown := d.hasGracefulShutdownTrigger(domain)
+	if gracefulShutdown && vmi.IsRunning() {
 		if domainAlive {
 			log.Log.Object(vmi).V(3).Info("Shutting down due to graceful shutdown signal.")
 			shouldShutdown = true
@@ -1881,7 +2082,7 @@ func (d *VirtualMachineController) defaultExecute(key string,
 		}); shouldDelay {
 			shouldUpdate = false
 			log.Log.Object(vmi).Infof("Delay vm update for %f seconds", delay.Seconds())
-			d.Queue.AddAfter(key, delay)
+			d.queue.AddAfter(key, delay)
 		}
 	}
 
@@ -1919,6 +2120,13 @@ func (d *VirtualMachineController) defaultExecute(key string,
 	case shouldShutdown:
 		log.Log.Object(vmi).V(3).Info("Processing shutdown.")
 		syncErr = d.processVmShutdown(vmi, domain)
+	case forceShutdownIrrecoverable:
+		msg := formatIrrecoverableErrorMessage(domain)
+		log.Log.Object(vmi).V(3).Infof("Processing a destruction of an irrecoverable domain - %s.", msg)
+		syncErr = d.processVmDestroy(vmi, domain)
+		if syncErr == nil {
+			syncErr = &vmiIrrecoverableError{msg}
+		}
 	case shouldDelete:
 		log.Log.Object(vmi).V(3).Info("Processing deletion.")
 		syncErr = d.processVmDelete(vmi)
@@ -1942,8 +2150,7 @@ func (d *VirtualMachineController) defaultExecute(key string,
 
 	// Update the VirtualMachineInstance status, if the VirtualMachineInstance exists
 	if vmiExists {
-		err = d.updateVMIStatus(vmi, domain, syncErr)
-		if err != nil {
+		if err := d.updateVMIStatus(vmi, domain, syncErr); err != nil {
 			log.Log.Object(vmi).Reason(err).Error("Updating the VirtualMachineInstance status failed.")
 			return err
 		}
@@ -1989,13 +2196,6 @@ func (d *VirtualMachineController) execute(key string) error {
 		if uid != "" {
 			log.Log.Object(vmi).V(3).Infof("ghost record cache provided %s as UID", uid)
 			vmi.UID = uid
-		} else {
-			// legacy support, attempt to find UID from watchdog file it exists.
-			uid := watchdog.WatchdogFileGetUID(d.virtShareDir, vmi)
-			if uid != "" {
-				log.Log.Object(vmi).V(3).Infof("watchdog file provided %s as UID", uid)
-				vmi.UID = types.UID(uid)
-			}
 		}
 	}
 
@@ -2008,7 +2208,7 @@ func (d *VirtualMachineController) execute(key string) error {
 		}
 		// If we found an outdated domain which is also not alive anymore, clean up
 		if !initialized {
-			d.Queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*1)
+			d.queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*1)
 			return nil
 		} else if expired {
 			log.Log.Object(oldVMI).Infof("Detected stale vmi %s that still needs cleanup before new vmi %s with identical name/namespace can be processed", oldVMI.UID, vmi.UID)
@@ -2018,7 +2218,7 @@ func (d *VirtualMachineController) execute(key string) error {
 			}
 			// Make sure we re-enqueue the key to ensure this new VMI is processed
 			// after the stale domain is removed
-			d.Queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*5)
+			d.queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*5)
 		}
 
 		return nil
@@ -2056,12 +2256,6 @@ func (d *VirtualMachineController) processVmCleanup(vmi *v1.VirtualMachineInstan
 	vmiId := string(vmi.UID)
 
 	log.Log.Object(vmi).Infof("Performing final local cleanup for vmi with uid %s", vmiId)
-	// If the VMI is using the old graceful shutdown trigger on
-	// a hostmount, make sure to clear that file still.
-	err := vmGracefulShutdownTriggerClear(d.virtShareDir, vmi)
-	if err != nil {
-		return err
-	}
 
 	d.migrationProxy.StopTargetListener(vmiId)
 	d.migrationProxy.StopSourceListener(vmiId)
@@ -2072,7 +2266,11 @@ func (d *VirtualMachineController) processVmCleanup(vmi *v1.VirtualMachineInstan
 	if err := d.containerDiskMounter.Unmount(vmi); err != nil {
 		return err
 	}
-	if err := d.hotplugVolumeMounter.UnmountAll(vmi); err != nil {
+
+	// UnmountAll does the cleanup on the "best effort" basis: it is
+	// safe to pass a nil cgroupManager.
+	cgroupManager, _ := getCgroupManager(vmi)
+	if err := d.hotplugVolumeMounter.UnmountAll(vmi, cgroupManager); err != nil {
 		return err
 	}
 
@@ -2081,8 +2279,7 @@ func (d *VirtualMachineController) processVmCleanup(vmi *v1.VirtualMachineInstan
 	d.sriovHotplugExecutorPool.Delete(vmi.UID)
 
 	// Watch dog file and command client must be the last things removed here
-	err = d.closeLauncherClient(vmi)
-	if err != nil {
+	if err := d.closeLauncherClient(vmi); err != nil {
 		return err
 	}
 
@@ -2092,7 +2289,7 @@ func (d *VirtualMachineController) processVmCleanup(vmi *v1.VirtualMachineInstan
 	// "DELETE"
 	domain := api.NewDomainReferenceFromName(vmi.Namespace, vmi.Name)
 	log.Log.Object(domain).Infof("Removing domain from cache during final cleanup")
-	return d.domainInformer.GetStore().Delete(domain)
+	return d.domainStore.Delete(domain)
 }
 
 func (d *VirtualMachineController) closeLauncherClient(vmi *v1.VirtualMachineInstance) error {
@@ -2106,21 +2303,6 @@ func (d *VirtualMachineController) closeLauncherClient(vmi *v1.VirtualMachineIns
 	if exists && clientInfo.Client != nil {
 		clientInfo.Client.Close()
 		close(clientInfo.DomainPipeStopChan)
-
-		// With legacy sockets on hostpaths, we have to cleanup the sockets ourselves.
-		if cmdclient.IsLegacySocket(clientInfo.SocketFile) {
-			err := os.RemoveAll(clientInfo.SocketFile)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	// for legacy support, ensure watchdog is removed when client is removed
-	// in the event that watchdog VMIs are still in use
-	err := watchdog.WatchdogFileRemove(d.virtShareDir, vmi)
-	if err != nil {
-		return err
 	}
 
 	virtcache.DeleteGhostRecord(vmi.Namespace, vmi.Name)
@@ -2179,18 +2361,7 @@ func (d *VirtualMachineController) isLauncherClientUnresponsive(vmi *v1.VirtualM
 		clientInfo.Ready = true
 		clientInfo.SocketFile = socketFile
 	}
-	// The new way of detecting unresponsive VMIs monitors the
-	// cmd socket. This requires an updated VMI image. Old VMIs
-	// still use the watchdog method.
-	watchDogExists, _ := watchdog.WatchdogFileExists(d.virtShareDir, vmi)
-	if cmdclient.SocketMonitoringEnabled(socketFile) && !watchDogExists {
-		isUnresponsive := cmdclient.IsSocketUnresponsive(socketFile)
-		return isUnresponsive, true, nil
-	}
-
-	// fall back to legacy watchdog support for backwards compatibility
-	isUnresponsive, err := watchdog.WatchdogFileIsExpired(d.watchdogTimeoutSeconds, d.virtShareDir, vmi)
-	return isUnresponsive, true, err
+	return cmdclient.IsSocketUnresponsive(socketFile), true, nil
 }
 
 func (d *VirtualMachineController) getLauncherClient(vmi *v1.VirtualMachineInstance) (cmdclient.LauncherClient, error) {
@@ -2217,15 +2388,12 @@ func (d *VirtualMachineController) getLauncherClient(vmi *v1.VirtualMachineInsta
 	}
 
 	domainPipeStopChan := make(chan struct{})
-	// if this isn't a legacy socket, we need to
-	// pipe in the domain socket into the VMI's filesystem
-	if !cmdclient.IsLegacySocket(socketFile) {
-		err = d.startDomainNotifyPipe(domainPipeStopChan, vmi)
-		if err != nil {
-			client.Close()
-			close(domainPipeStopChan)
-			return nil, err
-		}
+	//we pipe in the domain socket into the VMI's filesystem
+	err = d.startDomainNotifyPipe(domainPipeStopChan, vmi)
+	if err != nil {
+		client.Close()
+		close(domainPipeStopChan)
+		return nil, err
 	}
 
 	d.launcherClients.Store(vmi.UID, &virtcache.LauncherClientInfo{
@@ -2239,7 +2407,17 @@ func (d *VirtualMachineController) getLauncherClient(vmi *v1.VirtualMachineInsta
 	return client, nil
 }
 
+func (d *VirtualMachineController) processVmDestroy(vmi *v1.VirtualMachineInstance, domain *api.Domain) error {
+	tryGracefully := false
+	return d.helperVmShutdown(vmi, domain, tryGracefully)
+}
+
 func (d *VirtualMachineController) processVmShutdown(vmi *v1.VirtualMachineInstance, domain *api.Domain) error {
+	tryGracefully := true
+	return d.helperVmShutdown(vmi, domain, tryGracefully)
+}
+
+func (d *VirtualMachineController) helperVmShutdown(vmi *v1.VirtualMachineInstance, domain *api.Domain, tryGracefully bool) error {
 
 	// Only attempt to shutdown/destroy if we still have a connection established with the pod.
 	client, err := d.getVerifiedLauncherClient(vmi)
@@ -2248,7 +2426,7 @@ func (d *VirtualMachineController) processVmShutdown(vmi *v1.VirtualMachineInsta
 	}
 
 	// Only attempt to gracefully shutdown if the domain has the ACPI feature enabled
-	if isACPIEnabled(vmi, domain) {
+	if isACPIEnabled(vmi, domain) && tryGracefully {
 		if expired, timeLeft := d.hasGracePeriodExpired(domain); !expired {
 			return d.handleVMIShutdown(vmi, domain, client, timeLeft)
 		}
@@ -2309,7 +2487,7 @@ func (d *VirtualMachineController) shutdownVMI(vmi *v1.VirtualMachineInstance, c
 	}
 
 	// pending graceful shutdown.
-	d.Queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Duration(timeLeft)*time.Second)
+	d.queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Duration(timeLeft)*time.Second)
 	d.recorder.Event(vmi, k8sv1.EventTypeNormal, v1.ShuttingDown.String(), VMIGracefulShutdown)
 	return nil
 }
@@ -2396,28 +2574,22 @@ func (d *VirtualMachineController) isPreMigrationTarget(vmi *v1.VirtualMachineIn
 }
 
 func (d *VirtualMachineController) checkNetworkInterfacesForMigration(vmi *v1.VirtualMachineInstance) error {
-	ifaces := vmi.Spec.Domain.Devices.Interfaces
-	if len(ifaces) == 0 {
-		return nil
-	}
-
-	_, allowPodBridgeNetworkLiveMigration := vmi.Annotations[v1.AllowPodBridgeNetworkLiveMigrationAnnotation]
-	if allowPodBridgeNetworkLiveMigration && netvmispec.IsPodNetworkWithBridgeBindingInterface(vmi.Spec.Networks, ifaces) {
-		return nil
-	}
-	if netvmispec.IsPodNetworkWithMasqueradeBindingInterface(vmi.Spec.Networks, ifaces) {
-		return nil
-	}
-
-	return fmt.Errorf("cannot migrate VMI which does not use masquerade to connect to the pod network or bridge with %s VM annotation", v1.AllowPodBridgeNetworkLiveMigrationAnnotation)
+	return netvmispec.VerifyVMIMigratable(vmi, d.clusterConfig.GetNetworkBindings())
 }
 
 func (d *VirtualMachineController) checkVolumesForMigration(vmi *v1.VirtualMachineInstance) (blockMigrate bool, err error) {
-
 	volumeStatusMap := make(map[string]v1.VolumeStatus)
 
 	for _, volumeStatus := range vmi.Status.VolumeStatus {
+		if volumeStatus.Name == backendstorage.PVCForVMI(vmi) && volumeStatus.PersistentVolumeClaimInfo != nil &&
+			!pvctypes.HasSharedAccessMode(volumeStatus.PersistentVolumeClaimInfo.AccessModes) {
+			return true, fmt.Errorf("cannot migrate VMI: Backend storage PVC is not RWX")
+		}
 		volumeStatusMap[volumeStatus.Name] = volumeStatus
+	}
+
+	if len(vmi.Status.MigratedVolumes) > 0 {
+		blockMigrate = true
 	}
 
 	// Check if all VMI volumes can be shared between the source and the destination
@@ -2440,7 +2612,7 @@ func (d *VirtualMachineController) checkVolumesForMigration(vmi *v1.VirtualMachi
 
 			if !ok || volumeStatus.PersistentVolumeClaimInfo == nil {
 				return true, fmt.Errorf("cannot migrate VMI: Unable to determine if PVC %v is shared, live migration requires that all PVCs must be shared (using ReadWriteMany access mode)", claimName)
-			} else if !pvctypes.HasSharedAccessMode(volumeStatus.PersistentVolumeClaimInfo.AccessModes) {
+			} else if !pvctypes.HasSharedAccessMode(volumeStatus.PersistentVolumeClaimInfo.AccessModes) && !pvctypes.IsMigratedVolume(volumeStatus.Name, vmi) {
 				return true, fmt.Errorf("cannot migrate VMI: PVC %v is not shared, live migration requires that all PVCs must be shared (using ReadWriteMany access mode)", claimName)
 			}
 
@@ -2499,8 +2671,7 @@ func (d *VirtualMachineController) handleTargetMigrationProxy(vmi *v1.VirtualMac
 	baseDir := fmt.Sprintf(filepath.Join(d.virtLauncherFSRunDirPattern, "kubevirt"), res.Pid())
 	migrationTargetSockets = append(migrationTargetSockets, socketFile)
 
-	isBlockMigration := vmi.Status.MigrationMethod == v1.BlockMigration
-	migrationPortsRange := migrationproxy.GetMigrationPortsList(isBlockMigration)
+	migrationPortsRange := migrationproxy.GetMigrationPortsList(vmi.IsBlockMigration())
 	for _, port := range migrationPortsRange {
 		key := migrationproxy.ConstructProxyKey(string(vmi.UID), port)
 		// a proxy between the target direct qemu channel and the connector in the destination pod
@@ -2638,9 +2809,25 @@ func (d *VirtualMachineController) vmUpdateHelperMigrationSource(origVMI *v1.Vir
 		if err != nil {
 			return err
 		}
-		d.recorder.Event(vmi, k8sv1.EventTypeNormal, v1.Migrating.String(), "VirtualMachineInstance is migrating.")
+		d.recorder.Event(vmi, k8sv1.EventTypeNormal, v1.Migrating.String(), VMIMigrating)
 	}
 	return nil
+}
+
+func replaceMigratedVolumesStatus(vmi *v1.VirtualMachineInstance) {
+	replaceVolsStatus := make(map[string]*v1.PersistentVolumeClaimInfo)
+	for _, v := range vmi.Status.MigratedVolumes {
+		replaceVolsStatus[v.SourcePVCInfo.ClaimName] = v.DestinationPVCInfo
+	}
+	for i, v := range vmi.Status.VolumeStatus {
+		if v.PersistentVolumeClaimInfo == nil {
+			continue
+		}
+		if status, ok := replaceVolsStatus[v.PersistentVolumeClaimInfo.ClaimName]; ok {
+			vmi.Status.VolumeStatus[i].PersistentVolumeClaimInfo = status
+		}
+	}
+
 }
 
 func (d *VirtualMachineController) vmUpdateHelperMigrationTarget(origVMI *v1.VirtualMachineInstance) error {
@@ -2665,7 +2852,11 @@ func (d *VirtualMachineController) vmUpdateHelperMigrationTarget(origVMI *v1.Vir
 		// then there's nothing left to prepare on the target side
 		return nil
 	}
-
+	// The VolumeStatus is used to retrive additional information for the volume handling.
+	// For example, for filesystem PVC, the information are used to create a right size image.
+	// In the case of migrated volumes, we need to replace the original volume information with the
+	// destination volume properties.
+	replaceMigratedVolumesStatus(vmi)
 	err = hostdisk.ReplacePVCByHostDisk(vmi)
 	if err != nil {
 		return err
@@ -2677,8 +2868,22 @@ func (d *VirtualMachineController) vmUpdateHelperMigrationTarget(origVMI *v1.Vir
 		if err != nil {
 			return err
 		}
-		d.Queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*1)
+		d.queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*1)
 		return nil
+	}
+
+	// Verify container disks checksum
+	err = container_disk.VerifyChecksums(d.containerDiskMounter, vmi)
+	switch {
+	case goerror.Is(err, container_disk.ErrChecksumMissing):
+		// wait for checksum to be computed by the source virt-handler
+		return err
+	case goerror.Is(err, container_disk.ErrChecksumMismatch):
+		log.Log.Object(vmi).Infof("Containerdisk checksum mismatch, terminating target pod: %s", err)
+		d.recorder.Event(vmi, k8sv1.EventTypeNormal, "ContainerDiskFailedChecksum", "Aborting migration as the source and target containerdisks/kernelboot do not match")
+		return client.SignalTargetPodCleanup(vmi)
+	case err != nil:
+		return err
 	}
 
 	// Mount container disks
@@ -2689,7 +2894,11 @@ func (d *VirtualMachineController) vmUpdateHelperMigrationTarget(origVMI *v1.Vir
 
 	// Mount hotplug disks
 	if attachmentPodUID := vmi.Status.MigrationState.TargetAttachmentPodUID; attachmentPodUID != types.UID("") {
-		if err := d.hotplugVolumeMounter.MountFromPod(vmi, attachmentPodUID); err != nil {
+		cgroupManager, err := getCgroupManager(vmi)
+		if err != nil {
+			return err
+		}
+		if err := d.hotplugVolumeMounter.MountFromPod(vmi, attachmentPodUID, cgroupManager); err != nil {
 			return fmt.Errorf("failed to mount hotplug volumes: %v", err)
 		}
 	}
@@ -2735,10 +2944,12 @@ func (d *VirtualMachineController) vmUpdateHelperMigrationTarget(origVMI *v1.Vir
 	}
 
 	options := virtualMachineOptions(nil, 0, nil, d.capabilities, disksInfo, d.clusterConfig)
+	options.InterfaceDomainAttachment = domainspec.DomainAttachmentByInterfaceName(vmi.Spec.Domain.Devices.Interfaces, d.clusterConfig.GetNetworkBindings())
+
 	if err := client.SyncMigrationTarget(vmi, options); err != nil {
 		return fmt.Errorf("syncing migration target failed: %v", err)
 	}
-	d.recorder.Event(vmi, k8sv1.EventTypeNormal, v1.PreparingTarget.String(), "VirtualMachineInstance Migration Target Prepared.")
+	d.recorder.Event(vmi, k8sv1.EventTypeNormal, v1.PreparingTarget.String(), VMIMigrationTargetPrepared)
 
 	err = d.handleTargetMigrationProxy(vmi)
 	if err != nil {
@@ -2799,14 +3010,8 @@ func (d *VirtualMachineController) affinePitThread(vmi *v1.VirtualMachineInstanc
 	return unix.SchedSetaffinity(pitpid, &Mask)
 }
 
-func (d *VirtualMachineController) configureHousekeepingCgroup(vmi *v1.VirtualMachineInstance) error {
-	cgroupManager, err := cgroup.NewManagerFromVM(vmi)
-	if err != nil {
-		return err
-	}
-
-	err = cgroupManager.CreateChildCgroup("housekeeping", "cpuset")
-	if err != nil {
+func (d *VirtualMachineController) configureHousekeepingCgroup(vmi *v1.VirtualMachineInstance, cgroupManager cgroup.Manager) error {
+	if err := cgroupManager.CreateChildCgroup("housekeeping", "cpuset"); err != nil {
 		log.Log.Reason(err).Error("CreateChildCgroup ")
 		return err
 	}
@@ -2825,14 +3030,14 @@ func (d *VirtualMachineController) configureHousekeepingCgroup(vmi *v1.VirtualMa
 		return nil
 	}
 
-	hkcpu, err := strconv.Atoi(domain.Spec.CPUTune.EmulatorPin.CPUSet)
+	hkcpus, err := hardware.ParseCPUSetLine(domain.Spec.CPUTune.EmulatorPin.CPUSet, 100)
 	if err != nil {
 		return err
 	}
 
-	log.Log.V(3).Object(vmi).Infof("housekeeping cpu: %v", hkcpu)
+	log.Log.V(3).Object(vmi).Infof("housekeeping cpu: %v", hkcpus)
 
-	err = cgroupManager.SetCpuSet("housekeeping", []int{hkcpu})
+	err = cgroupManager.SetCpuSet("housekeeping", hkcpus)
 	if err != nil {
 		return err
 	}
@@ -2888,6 +3093,10 @@ func (d *VirtualMachineController) vmUpdateHelperDefault(origVMI *v1.VirtualMach
 		return err
 	}
 
+	cgroupManager, err := getCgroupManager(vmi)
+	if err != nil {
+		return err
+	}
 	var errorTolerantFeaturesError []error
 	disksInfo := map[string]*containerdisk.DiskInfo{}
 	if !vmi.IsRunning() && !vmi.IsFinal() {
@@ -2897,7 +3106,7 @@ func (d *VirtualMachineController) vmUpdateHelperDefault(origVMI *v1.VirtualMach
 			if err != nil {
 				return err
 			}
-			d.Queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*1)
+			d.queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*1)
 			return nil
 		}
 
@@ -2907,7 +3116,7 @@ func (d *VirtualMachineController) vmUpdateHelperDefault(origVMI *v1.VirtualMach
 		}
 
 		// Try to mount hotplug volume if there is any during startup.
-		if err := d.hotplugVolumeMounter.Mount(vmi); err != nil {
+		if err := d.hotplugVolumeMounter.Mount(vmi, cgroupManager); err != nil {
 			return err
 		}
 
@@ -2992,7 +3201,7 @@ func (d *VirtualMachineController) vmUpdateHelperDefault(origVMI *v1.VirtualMach
 			log.Log.Object(vmi).Error(err.Error())
 		}
 
-		if err := d.hotplugVolumeMounter.Mount(vmi); err != nil {
+		if err := d.hotplugVolumeMounter.Mount(vmi, cgroupManager); err != nil {
 			return err
 		}
 
@@ -3034,6 +3243,7 @@ func (d *VirtualMachineController) vmUpdateHelperDefault(origVMI *v1.VirtualMach
 	period := d.clusterConfig.GetMemBalloonStatsPeriod()
 
 	options := virtualMachineOptions(smbios, period, preallocatedVolumes, d.capabilities, disksInfo, d.clusterConfig)
+	options.InterfaceDomainAttachment = domainspec.DomainAttachmentByInterfaceName(vmi.Spec.Domain.Devices.Interfaces, d.clusterConfig.GetNetworkBindings())
 
 	err = client.SyncVirtualMachine(vmi, options)
 	if err != nil {
@@ -3045,7 +3255,7 @@ func (d *VirtualMachineController) vmUpdateHelperDefault(origVMI *v1.VirtualMach
 	}
 
 	if vmi.IsCPUDedicated() && vmi.Spec.Domain.CPU.IsolateEmulatorThread {
-		err = d.configureHousekeepingCgroup(vmi)
+		err = d.configureHousekeepingCgroup(vmi, cgroupManager)
 		if err != nil {
 			return err
 		}
@@ -3068,7 +3278,7 @@ func (d *VirtualMachineController) vmUpdateHelperDefault(origVMI *v1.VirtualMach
 
 	if vmi.IsRunning() {
 		// Umount any disks no longer mounted
-		if err := d.hotplugVolumeMounter.Unmount(vmi); err != nil {
+		if err := d.hotplugVolumeMounter.Unmount(vmi, cgroupManager); err != nil {
 			return err
 		}
 	}
@@ -3157,7 +3367,7 @@ func (d *VirtualMachineController) processVmUpdate(vmi *v1.VirtualMachineInstanc
 		return err
 	}
 	if !isInitialized {
-		d.Queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*1)
+		d.queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*1)
 		return nil
 	} else if isUnresponsive {
 		return goerror.New(fmt.Sprintf("Can not update a VirtualMachineInstance with unresponsive command server."))
@@ -3193,7 +3403,7 @@ func (d *VirtualMachineController) calculateVmPhaseForStatusReason(domain *api.D
 				return vmi.Status.Phase, err
 			}
 			if !isInitialized {
-				d.Queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*1)
+				d.queue.AddAfter(controller.VirtualMachineInstanceKey(vmi), time.Second*1)
 				return vmi.Status.Phase, err
 			} else if isUnresponsive {
 				// virt-launcher is gone and VirtualMachineInstance never transitioned
@@ -3240,21 +3450,21 @@ func (d *VirtualMachineController) addFunc(obj interface{}) {
 	key, err := controller.KeyFunc(obj)
 	if err == nil {
 		d.vmiExpectations.LowerExpectations(key, 1, 0)
-		d.Queue.Add(key)
+		d.queue.Add(key)
 	}
 }
 func (d *VirtualMachineController) deleteFunc(obj interface{}) {
 	key, err := controller.KeyFunc(obj)
 	if err == nil {
 		d.vmiExpectations.LowerExpectations(key, 1, 0)
-		d.Queue.Add(key)
+		d.queue.Add(key)
 	}
 }
 func (d *VirtualMachineController) updateFunc(_, new interface{}) {
 	key, err := controller.KeyFunc(new)
 	if err == nil {
 		d.vmiExpectations.LowerExpectations(key, 1, 0)
-		d.Queue.Add(key)
+		d.queue.Add(key)
 	}
 }
 
@@ -3263,7 +3473,7 @@ func (d *VirtualMachineController) addDomainFunc(obj interface{}) {
 	log.Log.Object(domain).Infof("Domain is in state %s reason %s", domain.Status.Status, domain.Status.Reason)
 	key, err := controller.KeyFunc(obj)
 	if err == nil {
-		d.Queue.Add(key)
+		d.queue.Add(key)
 	}
 }
 func (d *VirtualMachineController) deleteDomainFunc(obj interface{}) {
@@ -3283,7 +3493,7 @@ func (d *VirtualMachineController) deleteDomainFunc(obj interface{}) {
 	log.Log.Object(domain).Info("Domain deleted")
 	key, err := controller.KeyFunc(obj)
 	if err == nil {
-		d.Queue.Add(key)
+		d.queue.Add(key)
 	}
 }
 func (d *VirtualMachineController) updateDomainFunc(old, new interface{}) {
@@ -3299,7 +3509,7 @@ func (d *VirtualMachineController) updateDomainFunc(old, new interface{}) {
 
 	key, err := controller.KeyFunc(new)
 	if err == nil {
-		d.Queue.Add(key)
+		d.queue.Add(key)
 	}
 }
 
@@ -3320,8 +3530,11 @@ func (d *VirtualMachineController) finalizeMigration(vmi *v1.VirtualMachineInsta
 		log.Log.Object(vmi).Reason(err).Error(errorMessage)
 		d.recorder.Event(vmi, k8sv1.EventTypeWarning, err.Error(), "failed to update guest memory")
 	}
+	removeMigratedVolumes(vmi)
 
-	if err := client.FinalizeVirtualMachineMigration(vmi); err != nil {
+	options := &cmdv1.VirtualMachineOptions{}
+	options.InterfaceMigration = domainspec.BindingMigrationByInterfaceName(vmi.Spec.Domain.Devices.Interfaces, d.clusterConfig.GetNetworkBindings())
+	if err := client.FinalizeVirtualMachineMigration(vmi, options); err != nil {
 		log.Log.Object(vmi).Reason(err).Error(errorMessage)
 		return fmt.Errorf("%s: %v", errorMessage, err)
 	}
@@ -3373,7 +3586,7 @@ func (d *VirtualMachineController) claimDeviceOwnership(virtLauncherRootMount *s
 }
 
 func (d *VirtualMachineController) reportDedicatedCPUSetForMigratingVMI(vmi *v1.VirtualMachineInstance) error {
-	cgroupManager, err := cgroup.NewManagerFromVM(vmi)
+	cgroupManager, err := getCgroupManager(vmi)
 	if err != nil {
 		return err
 	}
@@ -3415,7 +3628,7 @@ func (d *VirtualMachineController) handleMigrationAbort(vmi *v1.VirtualMachineIn
 		return err
 	}
 
-	d.recorder.Event(vmi, k8sv1.EventTypeNormal, v1.Migrating.String(), "VirtualMachineInstance is aborting migration.")
+	d.recorder.Event(vmi, k8sv1.EventTypeNormal, v1.Migrating.String(), VMIAbortingMigration)
 	return nil
 }
 
@@ -3488,12 +3701,11 @@ func (d *VirtualMachineController) hotplugCPU(vmi *v1.VirtualMachineInstance, cl
 func (d *VirtualMachineController) hotplugMemory(vmi *v1.VirtualMachineInstance, client cmdclient.LauncherClient) error {
 	vmiConditions := controller.NewVirtualMachineInstanceConditionManager()
 
-	removeVMIMemoryChangeConditionAndLabel := func() {
+	removeVMIMemoryChangeLabel := func() {
 		delete(vmi.Labels, v1.VirtualMachinePodMemoryRequestsLabel)
 		delete(vmi.Labels, v1.MemoryHotplugOverheadRatioLabel)
-		vmiConditions.RemoveCondition(vmi, v1.VirtualMachineInstanceMemoryChange)
 	}
-	defer removeVMIMemoryChangeConditionAndLabel()
+	defer removeVMIMemoryChangeLabel()
 
 	if !vmiConditions.HasCondition(vmi, v1.VirtualMachineInstanceMemoryChange) {
 		return nil
@@ -3502,25 +3714,45 @@ func (d *VirtualMachineController) hotplugMemory(vmi *v1.VirtualMachineInstance,
 	podMemReqStr := vmi.Labels[v1.VirtualMachinePodMemoryRequestsLabel]
 	podMemReq, err := resource.ParseQuantity(podMemReqStr)
 	if err != nil {
+		vmiConditions.RemoveCondition(vmi, v1.VirtualMachineInstanceMemoryChange)
 		return fmt.Errorf("cannot parse Memory requests from VMI label: %v", err)
 	}
 
 	overheadRatio := vmi.Labels[v1.MemoryHotplugOverheadRatioLabel]
-	requiredMemory := services.GetMemoryOverhead(vmi, d.clusterConfig.GetClusterCPUArch(), &overheadRatio)
+	requiredMemory := services.GetMemoryOverhead(vmi, runtime.GOARCH, &overheadRatio)
+	requiredMemory.Add(
+		d.netBindingPluginMemoryCalculator.Calculate(vmi, d.clusterConfig.GetNetworkBindings()),
+	)
+
 	requiredMemory.Add(*vmi.Spec.Domain.Resources.Requests.Memory())
 
 	if podMemReq.Cmp(requiredMemory) < 0 {
+		vmiConditions.RemoveCondition(vmi, v1.VirtualMachineInstanceMemoryChange)
 		return fmt.Errorf("amount of requested guest memory (%s) exceeds the launcher memory request (%s)", vmi.Spec.Domain.Memory.Guest.String(), podMemReqStr)
 	}
 
 	options := virtualMachineOptions(nil, 0, nil, d.capabilities, nil, d.clusterConfig)
 
 	if err := client.SyncVirtualMachineMemory(vmi, options); err != nil {
+		// mark hotplug as failed
+		vmiConditions.UpdateCondition(vmi, &v1.VirtualMachineInstanceCondition{
+			Type:    v1.VirtualMachineInstanceMemoryChange,
+			Status:  k8sv1.ConditionFalse,
+			Reason:  memoryHotplugFailedReason,
+			Message: "memory hotplug failed, the VM configuration is not supported",
+		})
 		return err
 	}
 
+	vmiConditions.RemoveCondition(vmi, v1.VirtualMachineInstanceMemoryChange)
 	vmi.Status.Memory.GuestRequested = vmi.Spec.Domain.Memory.Guest
 	return nil
+}
+
+func removeMigratedVolumes(vmi *v1.VirtualMachineInstance) {
+	vmiConditions := controller.NewVirtualMachineInstanceConditionManager()
+	vmiConditions.RemoveCondition(vmi, v1.VirtualMachineInstanceVolumesChange)
+	vmi.Status.MigratedVolumes = nil
 }
 
 func parseLibvirtQuantity(value int64, unit string) *resource.Quantity {

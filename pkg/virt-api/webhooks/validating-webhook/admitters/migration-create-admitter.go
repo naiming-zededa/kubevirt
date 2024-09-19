@@ -36,12 +36,10 @@ import (
 
 	webhookutils "kubevirt.io/kubevirt/pkg/util/webhooks"
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks"
-	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 )
 
 type MigrationCreateAdmitter struct {
-	ClusterConfig *virtconfig.ClusterConfig
-	VirtClient    kubecli.KubevirtClient
+	VirtClient kubecli.KubevirtClient
 }
 
 func isMigratable(vmi *v1.VirtualMachineInstance) error {
@@ -54,12 +52,12 @@ func isMigratable(vmi *v1.VirtualMachineInstance) error {
 	return nil
 }
 
-func EnsureNoMigrationConflict(virtClient kubecli.KubevirtClient, vmiName string, namespace string) error {
+func ensureNoMigrationConflict(ctx context.Context, virtClient kubecli.KubevirtClient, vmiName string, namespace string) error {
 	labelSelector, err := labels.Parse(fmt.Sprintf("%s in (%s)", v1.MigrationSelectorLabel, vmiName))
 	if err != nil {
 		return err
 	}
-	list, err := virtClient.VirtualMachineInstanceMigration(namespace).List(&metav1.ListOptions{
+	list, err := virtClient.VirtualMachineInstanceMigration(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labelSelector.String(),
 	})
 	if err != nil {
@@ -77,7 +75,7 @@ func EnsureNoMigrationConflict(virtClient kubecli.KubevirtClient, vmiName string
 	return nil
 }
 
-func (admitter *MigrationCreateAdmitter) Admit(ar *admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
+func (admitter *MigrationCreateAdmitter) Admit(ctx context.Context, ar *admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 	migration, _, err := getAdmissionReviewMigration(ar)
 	if err != nil {
 		return webhookutils.ToAdmissionResponseError(err)
@@ -92,7 +90,7 @@ func (admitter *MigrationCreateAdmitter) Admit(ar *admissionv1.AdmissionReview) 
 		return webhookutils.ToAdmissionResponse(causes)
 	}
 
-	vmi, err := admitter.VirtClient.VirtualMachineInstance(migration.Namespace).Get(context.Background(), migration.Spec.VMIName, &metav1.GetOptions{})
+	vmi, err := admitter.VirtClient.VirtualMachineInstance(migration.Namespace).Get(ctx, migration.Spec.VMIName, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		// ensure VMI exists for the migration
 		return webhookutils.ToAdmissionResponseError(fmt.Errorf("the VMI \"%s/%s\" does not exist", migration.Namespace, migration.Spec.VMIName))
@@ -113,7 +111,7 @@ func (admitter *MigrationCreateAdmitter) Admit(ar *admissionv1.AdmissionReview) 
 
 	// Don't allow new migration jobs to be introduced when previous migration jobs
 	// are already in flight.
-	err = EnsureNoMigrationConflict(admitter.VirtClient, migration.Spec.VMIName, migration.Namespace)
+	err = ensureNoMigrationConflict(ctx, admitter.VirtClient, migration.Spec.VMIName, migration.Namespace)
 	if err != nil {
 		return webhookutils.ToAdmissionResponseError(err)
 	}

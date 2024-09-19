@@ -47,9 +47,6 @@ function _deploy_infra_for_tests() {
 }
 
 function _ensure_cdi_deployment() {
-    # enable featuregate
-    _kubectl patch cdi ${cdi_namespace:?} --type merge -p '{"spec": {"config": {"featureGates": [ "HonorWaitForFirstConsumer" ]}}}'
-
     # add insecure registries
     _kubectl patch cdi ${cdi_namespace} --type merge -p '{"spec": {"config": {"insecureRegistries": [ "registry:5000", "fakeregistry:5000" ]}}}'
 
@@ -121,7 +118,7 @@ _kubectl create -n ${namespace} -f ${MANIFESTS_OUT_DIR}/release/kubevirt-cr.yaml
 
 # Ensure the KubeVirt CR is created
 count=0
-until _kubectl -n kubevirt get kv kubevirt; do
+until _kubectl -n ${namespace} get kv kubevirt; do
     ((count++)) && ((count == 30)) && echo "KubeVirt CR not found" && exit 1
     echo "waiting for KubeVirt CR"
     sleep 1
@@ -129,7 +126,7 @@ done
 
 # Wait until KubeVirt is ready
 count=0
-until _kubectl wait -n kubevirt kv kubevirt --for condition=Available --timeout 5m; do
+until _kubectl wait -n ${namespace} kv kubevirt --for condition=Available --timeout 5m; do
     ((count++)) && ((count == 5)) && echo "KubeVirt not ready in time" && exit 1
     echo "Error waiting for KubeVirt to be Available, sleeping 1m and retrying"
     sleep 1m

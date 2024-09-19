@@ -76,6 +76,8 @@ type NetPod struct {
 
 	cacheCreator cacheCreator
 	state        *State
+
+	log *log.FilteredLogger
 }
 
 type option func(*NetPod)
@@ -94,6 +96,8 @@ func NewNetPod(vmiNetworks []v1.Network, vmiIfaces []v1.Interface, vmiUID string
 		masqueradeAdapter: masquerade.New(),
 
 		cacheCreator: cache.CacheCreator{},
+
+		log: log.Log,
 	}
 	for _, opt := range opts {
 		opt(&n)
@@ -116,6 +120,12 @@ func WithMasqueradeAdapter(h masqueradeAdapter) option {
 func WithCacheCreator(c cacheCreator) option {
 	return func(n *NetPod) {
 		n.cacheCreator = c
+	}
+}
+
+func WithLogger(logger *log.FilteredLogger) option {
+	return func(n *NetPod) {
+		n.log = logger
 	}
 }
 
@@ -156,7 +166,7 @@ func (n NetPod) Setup() error {
 		if err != nil {
 			return err
 		}
-		log.Log.Infof("Current pod network: %s", currentStatusBytes)
+		n.log.Infof("Current pod network: %s", currentStatusBytes)
 
 		if derr := n.discover(currentStatus); derr != nil {
 			return derr
@@ -213,7 +223,7 @@ func (n NetPod) config(currentStatus *nmstate.Status) error {
 	if err != nil {
 		return err
 	}
-	log.Log.Infof("Desired pod network: %s", desiredSpecBytes)
+	n.log.Infof("Desired pod network: %s", desiredSpecBytes)
 
 	if err = n.nmstateAdapter.Apply(desiredSpec); err != nil {
 		return err
@@ -274,13 +284,16 @@ func (n NetPod) composeDesiredSpec(currentStatus *nmstate.Status) (*nmstate.Spec
 			if nmstate.AnyInterface(ifacesSpec, hasIP6GlobalUnicast) {
 				spec.LinuxStack.IPv6.Forwarding = pointer.P(true)
 			}
-		case iface.Passt != nil:
+		case iface.SRIOV != nil:
+		case iface.Binding != nil:
+		// Passt is removed in v1.3. This scenario is tracking old VMIs that are still processed in the reconcile loop.
+		case iface.DeprecatedPasst != nil:
 			spec.LinuxStack.IPv4.PingGroupRange = []int{107, 107}
 			spec.LinuxStack.IPv4.UnprivilegedPortStart = pointer.P(0)
-		case iface.Macvtap != nil:
-		case iface.SRIOV != nil:
-		case iface.Slirp != nil:
-		case iface.Binding != nil:
+		// Macvtap is removed in v1.3. This scenario is tracking old VMIs that are still processed in the reconcile loop.
+		case iface.DeprecatedMacvtap != nil:
+		// SLIRP is removed in v1.3. This scenario is tracking old VMIs that are still processed in the reconcile loop.
+		case iface.DeprecatedSlirp != nil:
 		default:
 			return nil, fmt.Errorf("undefined binding method: %v", iface)
 		}
@@ -330,6 +343,7 @@ func (n NetPod) bridgeBindingSpec(podIfaceName string, vmiIfaceIndex int, ifaceS
 	podIface := nmstate.Interface{
 		Index:       podStatusIface.Index,
 		Name:        podIfaceAlternativeName,
+		State:       nmstate.IfaceStateUp,
 		CopyMacFrom: bridgeIface.Name,
 		Controller:  bridgeIface.Name,
 		IPv4:        nmstate.IP{Enabled: pointer.P(false)},
@@ -353,12 +367,13 @@ func (n NetPod) bridgeBindingSpec(podIfaceName string, vmiIfaceIndex int, ifaceS
 	}
 
 	dummyIface := nmstate.Interface{
-		Name:     podIfaceName,
-		TypeName: nmstate.TypeDummy,
-		MTU:      podStatusIface.MTU,
-		IPv4:     podStatusIface.IPv4,
-		IPv6:     podStatusIface.IPv6,
-		Metadata: &nmstate.IfaceMetadata{NetworkName: vmiNetworkName},
+		Name:       podIfaceName,
+		TypeName:   nmstate.TypeDummy,
+		MacAddress: podStatusIface.MacAddress,
+		MTU:        podStatusIface.MTU,
+		IPv4:       podStatusIface.IPv4,
+		IPv6:       podStatusIface.IPv6,
+		Metadata:   &nmstate.IfaceMetadata{NetworkName: vmiNetworkName},
 	}
 
 	return []nmstate.Interface{bridgeIface, podIface, tapIface, dummyIface}, nil
@@ -504,7 +519,7 @@ func hasIP4GlobalUnicast(iface nmstate.Interface) bool {
 }
 
 func hasIP6GlobalUnicast(iface nmstate.Interface) bool {
-	return hasIPGlobalUnicast(iface.IPv4)
+	return hasIPGlobalUnicast(iface.IPv6)
 }
 
 func hasIPGlobalUnicast(ip nmstate.IP) bool {
@@ -547,7 +562,8 @@ func filterSupportedBindingNetworks(specNetworks []v1.Network, specInterfaces []
 			return nil, fmt.Errorf("no iface matching with network %s", network.Name)
 		}
 
-		if iface.Binding != nil || iface.SRIOV != nil || iface.Macvtap != nil {
+		// Macvtap is removed in v1.3. This scenario is tracking old VMIs that are still processed in the reconcile loop.
+		if iface.SRIOV != nil || iface.DeprecatedMacvtap != nil {
 			continue
 		}
 

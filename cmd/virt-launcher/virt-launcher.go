@@ -128,7 +128,6 @@ func createLibvirtConnection(runWithNonRoot bool) virtcli.Connection {
 
 func startDomainEventMonitoring(
 	notifier *notifyclient.Notifier,
-	virtShareDir string,
 	domainConn virtcli.Connection,
 	deleteNotificationSent chan watch.Event,
 	vmi *v1.VirtualMachineInstance,
@@ -411,7 +410,7 @@ func main() {
 		panic(err)
 	}
 
-	l.StartVirtquemud(stopChan)
+	l.StartVirtqemud(stopChan)
 	// only single domain should be present
 	domainName := api.VMINamespaceKeyFunc(vmi)
 
@@ -436,7 +435,7 @@ func main() {
 	// Clients can use this service to tell virt-launcher
 	// to start/stop virtual machines
 	options := cmdserver.NewServerOptions(*allowEmulation)
-	cmdclient.SetLegacyBaseDir(*virtShareDir)
+	cmdclient.SetBaseDir(*virtShareDir)
 	cmdServerDone := startCmdServer(cmdclient.UninitializedSocketOnGuest(), domainManager, stopChan, options)
 
 	gracefulShutdownCallback := func() {
@@ -458,7 +457,7 @@ func main() {
 
 	events := make(chan watch.Event, 2)
 	// Send domain notifications to virt-handler
-	startDomainEventMonitoring(notifier, *virtShareDir, domainConn, events, vmi, domainName, &agentStore, *qemuAgentSysInterval, *qemuAgentFileInterval, *qemuAgentUserInterval, *qemuAgentVersionInterval, *qemuAgentFSFreezeStatusInterval, metadataCache)
+	startDomainEventMonitoring(notifier, domainConn, events, vmi, domainName, &agentStore, *qemuAgentSysInterval, *qemuAgentFileInterval, *qemuAgentUserInterval, *qemuAgentVersionInterval, *qemuAgentFSFreezeStatusInterval, metadataCache)
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt,
@@ -497,6 +496,9 @@ func main() {
 		// This is a wait loop that monitors the qemu pid. When the pid
 		// exits, the wait loop breaks.
 		mon.RunForever(*qemuTimeout, signalStopChan)
+
+		// Allow hooks to gracefully shutdown
+		hookManager.Shutdown()
 
 		// Now that the pid has exited, we wait for the final delete notification to be
 		// sent back to virt-handler. This delete notification contains the reason the

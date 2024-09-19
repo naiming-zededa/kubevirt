@@ -38,20 +38,21 @@ import (
 
 const (
 	failedRetrieveVMI      = "Failed to retrieve VMI"
+	failedFreezeVMI        = "Failed to freeze VMI"
 	failedDetectCmdClient  = "Failed to detect cmd client"
 	failedConnectCmdClient = "Failed to connect cmd client"
 )
 
 type LifecycleHandler struct {
 	recorder     record.EventRecorder
-	vmiInformer  cache.SharedIndexInformer
+	vmiStore     cache.Store
 	virtShareDir string
 }
 
-func NewLifecycleHandler(recorder record.EventRecorder, vmiInformer cache.SharedIndexInformer, virtShareDir string) *LifecycleHandler {
+func NewLifecycleHandler(recorder record.EventRecorder, vmiStore cache.Store, virtShareDir string) *LifecycleHandler {
 	return &LifecycleHandler{
 		recorder:     recorder,
-		vmiInformer:  vmiInformer,
+		vmiStore:     vmiStore,
 		virtShareDir: virtShareDir,
 	}
 }
@@ -121,8 +122,9 @@ func (lh *LifecycleHandler) FreezeHandler(request *restful.Request, response *re
 	unfreezeTimeoutSeconds := int32(unfreezeTimeout.UnfreezeTimeout.Seconds())
 	err = client.FreezeVirtualMachine(vmi, unfreezeTimeoutSeconds)
 	if err != nil {
-		log.Log.Object(vmi).Reason(err).Error("Failed to freeze VMI")
+		log.Log.Object(vmi).Reason(err).Error(failedFreezeVMI)
 		response.WriteError(http.StatusBadRequest, err)
+		lh.recorder.Eventf(vmi, k8sv1.EventTypeWarning, "FreezeError", "%s: %s", failedFreezeVMI, err.Error())
 		return
 	}
 
@@ -219,7 +221,7 @@ func (lh *LifecycleHandler) GetFilesystems(request *restful.Request, response *r
 }
 
 func (lh *LifecycleHandler) getVMILauncherClient(request *restful.Request, response *restful.Response) (*v1.VirtualMachineInstance, cmdclient.LauncherClient, error) {
-	vmi, code, err := getVMI(request, lh.vmiInformer)
+	vmi, code, err := getVMI(request, lh.vmiStore)
 	if err != nil {
 		log.Log.Object(vmi).Reason(err).Error(failedRetrieveVMI)
 		response.WriteError(code, err)

@@ -1,7 +1,6 @@
 package services
 
 import (
-	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -12,10 +11,7 @@ import (
 
 	k8sv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	v1 "kubevirt.io/api/core/v1"
-	"kubevirt.io/client-go/kubecli"
 
 	"kubevirt.io/kubevirt/pkg/downwardmetrics"
 	"kubevirt.io/kubevirt/pkg/util"
@@ -199,7 +195,7 @@ func WithAutoMemoryLimits(namespace string, namespaceStore cache.Store) Resource
 	}
 }
 
-func WithCPUPinning(cpu *v1.CPU) ResourceRendererOption {
+func WithCPUPinning(cpu *v1.CPU, annotations map[string]string) ResourceRendererOption {
 	return func(renderer *ResourceRenderer) {
 		vcpus := hardware.GetNumberOfVCPUs(cpu)
 		if vcpus != 0 {
@@ -212,14 +208,22 @@ func WithCPUPinning(cpu *v1.CPU) ResourceRendererOption {
 			}
 		}
 
-		// allocate 1 more pcpu if IsolateEmulatorThread request
+		// allocate pcpus for emulatorThread if IsolateEmulatorThread is requested
 		if cpu.IsolateEmulatorThread {
-			emulatorThreadCPU := resource.NewQuantity(1, resource.BinarySI)
+			emulatorThreadCPUs := resource.NewQuantity(1, resource.BinarySI)
+
 			limits := renderer.calculatedLimits[k8sv1.ResourceCPU]
-			limits.Add(*emulatorThreadCPU)
+			_, emulatorThreadCompleteToEvenParityAnnotationExists := annotations[v1.EmulatorThreadCompleteToEvenParity]
+			if emulatorThreadCompleteToEvenParityAnnotationExists &&
+				limits.Value()%2 == 0 {
+				emulatorThreadCPUs = resource.NewQuantity(2, resource.BinarySI)
+			}
+
+			limits.Add(*emulatorThreadCPUs)
 			renderer.vmLimits[k8sv1.ResourceCPU] = limits
+
 			if cpuRequest, ok := renderer.vmRequests[k8sv1.ResourceCPU]; ok {
-				cpuRequest.Add(*emulatorThreadCPU)
+				cpuRequest.Add(*emulatorThreadCPUs)
 				renderer.vmRequests[k8sv1.ResourceCPU] = cpuRequest
 			}
 		}
@@ -384,14 +388,6 @@ func GetMemoryOverhead(vmi *v1.VirtualMachineInstance, cpuArch string, additiona
 		overhead.Add(resource.MustParse("53Mi"))
 	}
 
-	// Additional overhead for each interface with Passt binding, that forwards all ports.
-	// More information can be found here: https://bugs.passt.top/show_bug.cgi?id=20
-	for _, net := range vmi.Spec.Domain.Devices.Interfaces {
-		if net.Passt != nil && len(net.Ports) == 0 {
-			overhead.Add(resource.MustParse("800Mi"))
-		}
-	}
-
 	// Multiplying the ratio is expected to be the last calculation before returning overhead
 	if additionalOverheadRatio != nil && *additionalOverheadRatio != "" {
 		ratio, err := strconv.ParseFloat(*additionalOverheadRatio, 64)
@@ -484,21 +480,6 @@ func WithVirtualizationResources(virtResources k8sv1.ResourceList) ResourceRende
 	return func(renderer *ResourceRenderer) {
 		copyResources(virtResources, renderer.vmLimits)
 	}
-}
-
-func getNetworkToResourceMap(virtClient kubecli.KubevirtClient, vmi *v1.VirtualMachineInstance) (networkToResourceMap map[string]string, err error) {
-	networkToResourceMap = make(map[string]string)
-	for _, network := range vmi.Spec.Networks {
-		if network.Multus != nil {
-			namespace, networkName := getNamespaceAndNetworkName(vmi.Namespace, network.Multus.NetworkName)
-			crd, err := virtClient.NetworkClient().K8sCniCncfIoV1().NetworkAttachmentDefinitions(namespace).Get(context.Background(), networkName, metav1.GetOptions{})
-			if err != nil {
-				return map[string]string{}, fmt.Errorf("Failed to locate network attachment definition %s/%s", namespace, networkName)
-			}
-			networkToResourceMap[network.Name] = getResourceNameForNetwork(crd)
-		}
-	}
-	return
 }
 
 func validatePermittedHostDevices(spec *v1.VirtualMachineInstanceSpec, config *virtconfig.ClusterConfig) error {
@@ -650,11 +631,11 @@ func hotplugContainerLimits(config *virtconfig.ClusterConfig) k8sv1.ResourceList
 }
 
 func hotplugContainerRequests(config *virtconfig.ClusterConfig) k8sv1.ResourceList {
-	cpuQuantity := resource.MustParse("100m")
+	cpuQuantity := resource.MustParse("10m")
 	if cpu := config.GetSupportContainerRequest(v1.HotplugAttachment, k8sv1.ResourceCPU); cpu != nil {
 		cpuQuantity = *cpu
 	}
-	memQuantity := resource.MustParse("80M")
+	memQuantity := resource.MustParse("2M")
 	if mem := config.GetSupportContainerRequest(v1.HotplugAttachment, k8sv1.ResourceMemory); mem != nil {
 		memQuantity = *mem
 	}

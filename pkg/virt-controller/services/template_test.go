@@ -20,6 +20,7 @@
 package services
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -49,6 +50,7 @@ import (
 
 	k6tconfig "kubevirt.io/kubevirt/pkg/config"
 	"kubevirt.io/kubevirt/pkg/hooks"
+	"kubevirt.io/kubevirt/pkg/libvmi"
 	"kubevirt.io/kubevirt/pkg/network/istio"
 	storagetypes "kubevirt.io/kubevirt/pkg/storage/types"
 	"kubevirt.io/kubevirt/pkg/testutils"
@@ -61,7 +63,7 @@ import (
 var testHookSidecar = hooks.HookSidecar{Image: "test-image", ImagePullPolicy: "test-policy"}
 
 var _ = Describe("Template", func() {
-	var configFactory func(string) (*virtconfig.ClusterConfig, cache.SharedIndexInformer, TemplateService)
+	var configFactory func(string) (*virtconfig.ClusterConfig, cache.Store, TemplateService)
 	var qemuGid int64 = 107
 	var defaultArch = "amd64"
 
@@ -71,7 +73,7 @@ var _ = Describe("Template", func() {
 	var ctrl *gomock.Controller
 	var virtClient *kubecli.MockKubevirtClient
 	var config *virtconfig.ClusterConfig
-	var kvInformer cache.SharedIndexInformer
+	var kvStore cache.Store
 	var nonRootUser int64
 	resourceQuotaStore := cache.NewStore(cache.DeletionHandlingMetaNamespaceKeyFunc)
 	namespaceStore := cache.NewStore(cache.DeletionHandlingMetaNamespaceKeyFunc)
@@ -97,11 +99,11 @@ var _ = Describe("Template", func() {
 	enableFeatureGate := func(featureGate string) {
 		kvConfig := kv.DeepCopy()
 		kvConfig.Spec.Configuration.DeveloperConfiguration.FeatureGates = []string{featureGate}
-		testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, kvConfig)
+		testutils.UpdateFakeKubeVirtClusterConfig(kvStore, kvConfig)
 	}
 
 	disableFeatureGates := func() {
-		testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, kv)
+		testutils.UpdateFakeKubeVirtClusterConfig(kvStore, kv)
 	}
 
 	BeforeEach(func() {
@@ -110,8 +112,8 @@ var _ = Describe("Template", func() {
 	})
 
 	BeforeEach(func() {
-		configFactory = func(cpuArch string) (*virtconfig.ClusterConfig, cache.SharedIndexInformer, TemplateService) {
-			config, _, kvInformer := testutils.NewFakeClusterConfigUsingKVWithCPUArch(kv, cpuArch)
+		configFactory = func(cpuArch string) (*virtconfig.ClusterConfig, cache.Store, TemplateService) {
+			config, _, kvStore := testutils.NewFakeClusterConfigUsingKVWithCPUArch(kv, cpuArch)
 
 			svc = NewTemplateService("kubevirt/virt-launcher",
 				240,
@@ -132,6 +134,7 @@ var _ = Describe("Template", func() {
 					func(vmi *v1.VirtualMachineInstance, _ *v1.KubeVirtConfiguration) (hooks.HookSidecarList, error) {
 						return hooks.UnmarshalHookSidecarList(vmi)
 					}),
+				WithNetBindingPluginMemoryCalculator(&stubNetBindingPluginMemoryCalculator{}),
 			)
 			// Set up mock clients
 			networkClient := fakenetworkclient.NewSimpleClientset()
@@ -167,7 +170,7 @@ var _ = Describe("Template", func() {
 			}
 			err := networkClient.Tracker().Create(gvr, network, "other-namespace")
 			Expect(err).To(Not(HaveOccurred()))
-			return config, kvInformer, svc
+			return config, kvStore, svc
 		}
 		nonRootUser = util.NonRootUID
 	})
@@ -208,7 +211,7 @@ var _ = Describe("Template", func() {
 			return vmi
 		}
 		It("should not set seccomp profile by default", func() {
-			_, kvInformer, svc = configFactory(defaultArch)
+			_, kvStore, svc = configFactory(defaultArch)
 			pod, err := svc.RenderLaunchManifest(newMinimalWithContainerDisk("random"))
 			Expect(err).NotTo(HaveOccurred())
 
@@ -220,7 +223,7 @@ var _ = Describe("Template", func() {
 				Type:             k8sv1.SeccompProfileTypeLocalhost,
 				LocalhostProfile: pointer.String("kubevirt/kubevirt.json"),
 			}
-			_, kvInformer, svc = configFactory(defaultArch)
+			_, kvStore, svc = configFactory(defaultArch)
 			kvConfig := kv.DeepCopy()
 			kvConfig.Spec.Configuration.SeccompConfiguration = &v1.SeccompConfiguration{
 				VirtualMachineInstanceProfile: &v1.VirtualMachineInstanceProfile{
@@ -229,7 +232,7 @@ var _ = Describe("Template", func() {
 					},
 				},
 			}
-			testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, kvConfig)
+			testutils.UpdateFakeKubeVirtClusterConfig(kvStore, kvConfig)
 
 			pod, err := svc.RenderLaunchManifest(newMinimalWithContainerDisk("random"))
 			Expect(err).NotTo(HaveOccurred())
@@ -257,7 +260,7 @@ var _ = Describe("Template", func() {
 			type checkContainerFunc func(*k8sv1.Container)
 
 			DescribeTable("all containers", func(assertFunc checkContainerFunc) {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				pod, err := svc.RenderLaunchManifest(vmi)
 				Expect(err).NotTo(HaveOccurred())
 
@@ -277,7 +280,7 @@ var _ = Describe("Template", func() {
 		})
 		Context("launch template with correct parameters", func() {
 			DescribeTable("should contain tested annotations", func(vmiAnnotation, podExpectedAnnotation map[string]string) {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				pod, err := svc.RenderLaunchManifest(&v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:        "testvmi",
@@ -341,7 +344,7 @@ var _ = Describe("Template", func() {
 			)
 
 			DescribeTable("should not contain tested annotations", func(vmiAnnotation, podExpectedAnnotation map[string]string) {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				pod, err := svc.RenderLaunchManifest(&v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:        "testvmi",
@@ -384,7 +387,7 @@ var _ = Describe("Template", func() {
 			)
 
 			DescribeTable("should work", func(arch string, ovmfPath string) {
-				config, kvInformer, svc = configFactory(arch)
+				config, kvStore, svc = configFactory(arch)
 				trueVar := true
 				annotations := map[string]string{
 					hooks.HookSidecarListAnnotationName: `[{"image": "some-image:v1", "imagePullPolicy": "IfNotPresent"}]`,
@@ -417,15 +420,12 @@ var _ = Describe("Template", func() {
 					v1.VirtualMachineNameLabel: "testvmi",
 				}))
 				Expect(pod.ObjectMeta.Annotations).To(Equal(map[string]string{
-					v1.DomainAnnotation:                       "testvmi",
-					"test":                                    "shouldBeInPod",
-					hooks.HookSidecarListAnnotationName:       `[{"image": "some-image:v1", "imagePullPolicy": "IfNotPresent"}]`,
-					"pre.hook.backup.velero.io/container":     "compute",
-					"pre.hook.backup.velero.io/command":       "[\"/usr/bin/virt-freezer\", \"--freeze\", \"--name\", \"testvmi\", \"--namespace\", \"testns\"]",
-					"post.hook.backup.velero.io/container":    "compute",
-					"post.hook.backup.velero.io/command":      "[\"/usr/bin/virt-freezer\", \"--unfreeze\", \"--name\", \"testvmi\", \"--namespace\", \"testns\"]",
-					"kubevirt.io/migrationTransportUnix":      "true",
-					"kubectl.kubernetes.io/default-container": "compute",
+					v1.DomainAnnotation:                                  "testvmi",
+					"test":                                               "shouldBeInPod",
+					hooks.HookSidecarListAnnotationName:                  `[{"image": "some-image:v1", "imagePullPolicy": "IfNotPresent"}]`,
+					"kubevirt.io/migrationTransportUnix":                 "true",
+					"kubectl.kubernetes.io/default-container":            "compute",
+					"descheduler.alpha.kubernetes.io/request-evict-only": "",
 				}))
 				Expect(pod.ObjectMeta.OwnerReferences).To(Equal([]metav1.OwnerReference{{
 					APIVersion:         v1.VirtualMachineInstanceGroupVersionKind.GroupVersion().String(),
@@ -478,7 +478,7 @@ var _ = Describe("Template", func() {
 		})
 		Context("with SELinux types", func() {
 			It("should be nil if no SELinux type is specified and none is needed", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "testvmi", Namespace: "default", UID: "1234",
@@ -496,10 +496,10 @@ var _ = Describe("Template", func() {
 				}
 			})
 			It("should run under the corresponding SELinux type if specified", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				kvConfig := kv.DeepCopy()
 				kvConfig.Spec.Configuration.SELinuxLauncherType = "spc_t"
-				testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, kvConfig)
+				testutils.UpdateFakeKubeVirtClusterConfig(kvStore, kvConfig)
 
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -518,7 +518,7 @@ var _ = Describe("Template", func() {
 				Expect(pod.Spec.SecurityContext.SELinuxOptions.Type).To(Equal("spc_t"))
 			})
 			DescribeTable("should have an SELinux level of", func(enableWorkaround bool) {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				kvConfig := kv.DeepCopy()
 				kvConfig.Spec.Configuration.SELinuxLauncherType = "spc_t"
 				if enableWorkaround {
@@ -526,7 +526,7 @@ var _ = Describe("Template", func() {
 						append(kvConfig.Spec.Configuration.DeveloperConfiguration.FeatureGates,
 							virtconfig.DockerSELinuxMCSWorkaround)
 				}
-				testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, kvConfig)
+				testutils.UpdateFakeKubeVirtClusterConfig(kvStore, kvConfig)
 
 				volumes := []v1.Volume{
 					{
@@ -586,7 +586,7 @@ var _ = Describe("Template", func() {
 		})
 		DescribeTable("should check if proper environment variable is ",
 			func(debugLogsAnnotationValue string, exceptedValues []string) {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -619,7 +619,7 @@ var _ = Describe("Template", func() {
 
 		Context("without debug log annotation", func() {
 			It("should NOT add the corresponding environment variable", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "testvmi",
@@ -647,7 +647,7 @@ var _ = Describe("Template", func() {
 
 		Context("with access credentials", func() {
 			It("should add volume with secret referenced by cloud-init user secret ref", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "testvmi",
@@ -703,7 +703,7 @@ var _ = Describe("Template", func() {
 				Expect(volumeMountFound).To(BeTrue(), "could not find ssh key secret volume mount")
 			})
 			It("should add volume with secret referenced by qemu agent access cred", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "testvmi",
@@ -748,7 +748,7 @@ var _ = Describe("Template", func() {
 				Expect(volumeMountFound).To(BeTrue(), "could not find ssh key secret volume mount")
 			})
 			It("should add volume with secret referenced by user/password", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "testvmi",
@@ -796,7 +796,7 @@ var _ = Describe("Template", func() {
 
 		Context("with cloud-init user secret", func() {
 			It("should add volume with secret referenced by cloud-init user secret ref", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "testvmi",
@@ -846,7 +846,7 @@ var _ = Describe("Template", func() {
 		})
 		Context("with cloud-init network data secret", func() {
 			It("should add volume with secret referenced by cloud-init network data secret ref", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "testvmi",
@@ -897,7 +897,7 @@ var _ = Describe("Template", func() {
 		Context("with container disk", func() {
 
 			It("should add init containers to inject binary and pre-pull container disks", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				volumes := []v1.Volume{
 					{
 						Name: "containerdisk1",
@@ -950,7 +950,7 @@ var _ = Describe("Template", func() {
 		})
 		Context("migration over unix sockets", func() {
 			It("virt-launcher should have a MigrationTransportUnixAnnotation", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := api.NewMinimalVMI("fake-vmi")
 
 				pod, err := svc.RenderLaunchManifest(vmi)
@@ -959,236 +959,7 @@ var _ = Describe("Template", func() {
 				Expect(ok).To(BeTrue())
 			})
 		})
-		Context("with multus annotation", func() {
-			It("should add multus networks in the pod annotation", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
-				vmi := v1.VirtualMachineInstance{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "testvmi",
-						Namespace: "default",
-						UID:       "1234",
-					},
-					Spec: v1.VirtualMachineInstanceSpec{
-						Domain: v1.DomainSpec{
-							Devices: v1.Devices{
-								DisableHotplug: true,
-								Interfaces:     []v1.Interface{{Name: "default"}, {Name: "test1"}, {Name: "other-test1"}},
-							},
-						},
-						Networks: []v1.Network{
-							{Name: "default",
-								NetworkSource: v1.NetworkSource{
-									Multus: &v1.MultusNetwork{NetworkName: "default"},
-								}},
-							{Name: "test1",
-								NetworkSource: v1.NetworkSource{
-									Multus: &v1.MultusNetwork{NetworkName: "test1"},
-								}},
-							{Name: "other-test1",
-								NetworkSource: v1.NetworkSource{
-									Multus: &v1.MultusNetwork{NetworkName: "other-namespace/test1"},
-								}},
-						},
-					},
-				}
 
-				pod, err := svc.RenderLaunchManifest(&vmi)
-				Expect(err).ToNot(HaveOccurred())
-				value, ok := pod.Annotations["k8s.v1.cni.cncf.io/networks"]
-				Expect(ok).To(BeTrue())
-				expectedIfaces := "[" +
-					"{\"name\":\"default\",\"namespace\":\"default\",\"interface\":\"pod37a8eec1ce1\"}," +
-					"{\"name\":\"test1\",\"namespace\":\"default\",\"interface\":\"pod1b4f0e98519\"}," +
-					"{\"name\":\"test1\",\"namespace\":\"other-namespace\",\"interface\":\"pod49dba5c72f0\"}" +
-					"]"
-				Expect(value).To(Equal(expectedIfaces))
-			})
-			It("should add default multus networks in the multus default-network annotation", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
-				vmi := v1.VirtualMachineInstance{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "testvmi",
-						Namespace: "default",
-						UID:       "1234",
-					},
-					Spec: v1.VirtualMachineInstanceSpec{
-						Domain: v1.DomainSpec{
-							Devices: v1.Devices{
-								DisableHotplug: true,
-								Interfaces:     []v1.Interface{{Name: "default"}, {Name: "test1"}},
-							},
-						},
-						Networks: []v1.Network{
-							{Name: "default",
-								NetworkSource: v1.NetworkSource{
-									Multus: &v1.MultusNetwork{NetworkName: "default", Default: true},
-								}},
-							{Name: "test1",
-								NetworkSource: v1.NetworkSource{
-									Multus: &v1.MultusNetwork{NetworkName: "test1"},
-								}},
-						},
-					},
-				}
-
-				pod, err := svc.RenderLaunchManifest(&vmi)
-				Expect(err).ToNot(HaveOccurred())
-				value, ok := pod.Annotations["v1.multus-cni.io/default-network"]
-				Expect(ok).To(BeTrue())
-				Expect(value).To(Equal("default"))
-				value, ok = pod.Annotations["k8s.v1.cni.cncf.io/networks"]
-				Expect(ok).To(BeTrue())
-				Expect(value).To(Equal("[{\"name\":\"test1\",\"namespace\":\"default\",\"interface\":\"pod1b4f0e98519\"}]"))
-			})
-			It("should add MAC address in the pod annotation", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
-				vmi := v1.VirtualMachineInstance{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "testvmi",
-						Namespace: "default",
-						UID:       "1234",
-					},
-					Spec: v1.VirtualMachineInstanceSpec{
-						Domain: v1.DomainSpec{
-							Devices: v1.Devices{
-								DisableHotplug: true,
-								Interfaces: []v1.Interface{
-									{Name: "default"},
-									{
-										Name: "test1",
-										InterfaceBindingMethod: v1.InterfaceBindingMethod{
-											SRIOV: &v1.InterfaceSRIOV{},
-										},
-										MacAddress: "de:ad:00:00:be:af",
-									},
-								},
-							},
-						},
-						Networks: []v1.Network{
-							{Name: "default",
-								NetworkSource: v1.NetworkSource{
-									Multus: &v1.MultusNetwork{NetworkName: "default"},
-								}},
-							{Name: "test1",
-								NetworkSource: v1.NetworkSource{
-									Multus: &v1.MultusNetwork{NetworkName: "test1"},
-								}},
-						},
-					},
-				}
-
-				pod, err := svc.RenderLaunchManifest(&vmi)
-				Expect(err).ToNot(HaveOccurred())
-				value, ok := pod.Annotations["k8s.v1.cni.cncf.io/networks"]
-				Expect(ok).To(BeTrue())
-				expectedIfaces := "[" +
-					"{\"name\":\"default\",\"namespace\":\"default\",\"interface\":\"pod37a8eec1ce1\"}," +
-					"{\"name\":\"test1\",\"namespace\":\"default\",\"mac\":\"de:ad:00:00:be:af\",\"interface\":\"pod1b4f0e98519\"}" +
-					"]"
-				Expect(value).To(Equal(expectedIfaces))
-			})
-			DescribeTable("should add Multus networks annotation to the migration target pod with interface name scheme similar to the migration source pod",
-				func(migrationSourcePodNetworksAnnotation, expectedTargetPodMultusNetworksAnnotation map[string]string) {
-					config, kvInformer, svc = configFactory(defaultArch)
-
-					vmi := &v1.VirtualMachineInstance{
-						ObjectMeta: metav1.ObjectMeta{
-							Name:      "testvmi",
-							Namespace: "default",
-							UID:       "1234",
-						},
-						Spec: v1.VirtualMachineInstanceSpec{
-							Networks: []v1.Network{
-								{Name: "default",
-									NetworkSource: v1.NetworkSource{
-										Pod: &v1.PodNetwork{},
-									}},
-								{Name: "blue",
-									NetworkSource: v1.NetworkSource{
-										Multus: &v1.MultusNetwork{NetworkName: "test1"},
-									}},
-								{Name: "red",
-									NetworkSource: v1.NetworkSource{
-										Multus: &v1.MultusNetwork{NetworkName: "other-namespace/test1"},
-									}},
-							},
-							Domain: v1.DomainSpec{
-								Devices: v1.Devices{
-									Interfaces: []v1.Interface{{Name: "default"}, {Name: "blue"}, {Name: "red"}},
-								},
-							},
-						},
-					}
-
-					sourcePod, err := svc.RenderLaunchManifest(vmi)
-					Expect(err).ToNot(HaveOccurred())
-					sourcePod.ObjectMeta.Annotations[networkv1.NetworkStatusAnnot] = migrationSourcePodNetworksAnnotation[networkv1.NetworkStatusAnnot]
-
-					targetPod, err := svc.RenderMigrationManifest(vmi, sourcePod)
-					Expect(err).ToNot(HaveOccurred())
-
-					Expect(targetPod.Annotations[MultusNetworksAnnotation]).To(MatchJSON(expectedTargetPodMultusNetworksAnnotation[MultusNetworksAnnotation]))
-				},
-				Entry("when the migration source Multus network-status annotation has ordinal naming",
-					map[string]string{
-						networkv1.NetworkStatusAnnot: `[
-							{"interface":"eth0", "name":"default"},
-							{"interface":"net1", "name":"test1", "namespace":"default"},
-							{"interface":"net2", "name":"test1", "namespace":"other-namespace"}
-						]`,
-					},
-					map[string]string{
-						MultusNetworksAnnotation: `[
-							{"interface":"net1", "name":"test1", "namespace":"default"},
-							{"interface":"net2", "name":"test1", "namespace":"other-namespace"}
-						]`,
-					},
-				),
-				Entry("when the migration source Multus network-status annotation has hashed naming",
-					map[string]string{
-						networkv1.NetworkStatusAnnot: `[
-							{"interface":"pod16477688c0e", "name":"test1", "namespace":"default"},
-							{"interface":"podb1f51a511f1", "name":"test1", "namespace":"other-namespace"}
-						]`,
-					},
-					map[string]string{
-						MultusNetworksAnnotation: `[
-							{"interface":"pod16477688c0e", "name":"test1", "namespace":"default"},
-							{"interface":"podb1f51a511f1", "name":"test1", "namespace":"other-namespace"}
-						]`,
-					},
-				),
-			)
-		})
-		Context("with masquerade interface", func() {
-			It("should add the istio annotation", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
-				vmi := v1.VirtualMachineInstance{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "testvmi",
-						Namespace: "default",
-						UID:       "1234",
-					},
-					Spec: v1.VirtualMachineInstanceSpec{
-						Domain: v1.DomainSpec{
-							Devices: v1.Devices{
-								DisableHotplug: true,
-								Interfaces: []v1.Interface{
-									{Name: "default",
-										InterfaceBindingMethod: v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}}},
-								},
-							},
-						},
-					},
-				}
-
-				pod, err := svc.RenderLaunchManifest(&vmi)
-				Expect(err).ToNot(HaveOccurred())
-				value, ok := pod.Annotations[ISTIO_KUBEVIRT_ANNOTATION]
-				Expect(ok).To(BeTrue())
-				Expect(value).To(Equal("k6t-eth0"))
-			})
-		})
 		Context("With Istio sidecar.istio.io/inject annotation", func() {
 			var (
 				vmi v1.VirtualMachineInstance
@@ -1201,7 +972,7 @@ var _ = Describe("Template", func() {
 						Namespace: "default",
 						UID:       "1234",
 						Annotations: map[string]string{
-							istio.ISTIO_INJECT_ANNOTATION: "true",
+							istio.InjectSidecarAnnotation: "true",
 						},
 					},
 				}
@@ -1215,11 +986,11 @@ var _ = Describe("Template", func() {
 		})
 		Context("with node selectors", func() {
 			DescribeTable("should add node selectors to template", func(arch string, ovmfPath string) {
-				config, kvInformer, svc = configFactory(arch)
+				config, kvStore, svc = configFactory(arch)
 
 				nodeSelector := map[string]string{
-					"kubernetes.io/hostname": "master",
-					v1.NodeSchedulable:       "true",
+					k8sv1.LabelHostname: "master",
+					v1.NodeSchedulable:  "true",
 				}
 				annotations := map[string]string{
 					hooks.HookSidecarListAnnotationName: `[{"image": "some-image:v1", "imagePullPolicy": "IfNotPresent"}]`,
@@ -1243,9 +1014,9 @@ var _ = Describe("Template", func() {
 				}))
 				Expect(pod.ObjectMeta.GenerateName).To(Equal("virt-launcher-testvmi-"))
 				Expect(pod.Spec.NodeSelector).To(Equal(map[string]string{
-					"kubernetes.io/hostname": "master",
-					v1.NodeSchedulable:       "true",
-					k8sv1.LabelArchStable:    arch,
+					k8sv1.LabelHostname:   "master",
+					v1.NodeSchedulable:    "true",
+					k8sv1.LabelArchStable: arch,
 				}))
 				Expect(pod.Spec.Containers[0].Command).To(Equal([]string{"/usr/bin/virt-launcher-monitor",
 					"--qemu-timeout", validateAndExtractQemuTimeoutArg(pod.Spec.Containers[0].Command),
@@ -1281,7 +1052,7 @@ var _ = Describe("Template", func() {
 			)
 
 			It("should add node selector for node discovery feature to template", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmiCpuModel := "Conroe"
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -1318,7 +1089,7 @@ var _ = Describe("Template", func() {
 				pod, err := svc.RenderLaunchManifest(&vmi)
 				Expect(err).ToNot(HaveOccurred())
 
-				cpuModelLabel := NFD_CPU_MODEL_PREFIX + vmiCpuModel
+				cpuModelLabel := v1.CPUModelLabel + vmiCpuModel
 				Expect(pod.Spec.NodeSelector).Should(HaveKeyWithValue(cpuModelLabel, "true"))
 
 				cpuFeatureLabels := CPUFeatureLabelsFromCPUFeatures(&vmi)
@@ -1328,11 +1099,11 @@ var _ = Describe("Template", func() {
 			})
 
 			It("should add node selectors from kubevirt-config configMap", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				kvConfig := kv.DeepCopy()
-				nodeSelectors := map[string]string{"kubernetes.io/hostname": "node02", "node-role.kubernetes.io/compute": "true"}
+				nodeSelectors := map[string]string{k8sv1.LabelHostname: "node02", "node-role.kubernetes.io/compute": "true"}
 				kvConfig.Spec.Configuration.DeveloperConfiguration.NodeSelectors = nodeSelectors
-				testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, kvConfig)
+				testutils.UpdateFakeKubeVirtClusterConfig(kvStore, kvConfig)
 
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -1346,12 +1117,12 @@ var _ = Describe("Template", func() {
 				}
 				pod, err := svc.RenderLaunchManifest(&vmi)
 				Expect(err).ToNot(HaveOccurred())
-				Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue("kubernetes.io/hostname", "node02"))
+				Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(k8sv1.LabelHostname, "node02"))
 				Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue("node-role.kubernetes.io/compute", "true"))
 			})
 
 			It("should not add node selector for hyperv nodes if VMI does not request hyperv features", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				enableFeatureGate(virtconfig.HypervStrictCheckGate)
 
 				vmi := v1.VirtualMachineInstance{
@@ -1375,12 +1146,12 @@ var _ = Describe("Template", func() {
 				pod, err := svc.RenderLaunchManifest(&vmi)
 				Expect(err).ToNot(HaveOccurred())
 
-				Expect(pod.Spec.NodeSelector).To(Not(HaveKey(ContainSubstring(NFD_KVM_INFO_PREFIX))))
+				Expect(pod.Spec.NodeSelector).To(Not(HaveKey(ContainSubstring(v1.HypervLabel))))
 				Expect(pod.Spec.NodeSelector).To(Not(HaveKey(ContainSubstring(v1.CPUModelVendorLabel))))
 			})
 
 			It("should not add node selector for hyperv nodes if VMI requests hyperv features, but feature gate is disabled", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				enabled := true
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -1413,12 +1184,12 @@ var _ = Describe("Template", func() {
 				pod, err := svc.RenderLaunchManifest(&vmi)
 				Expect(err).ToNot(HaveOccurred())
 
-				Expect(pod.Spec.NodeSelector).To(Not(HaveKey(ContainSubstring(NFD_KVM_INFO_PREFIX))))
+				Expect(pod.Spec.NodeSelector).To(Not(HaveKey(ContainSubstring(v1.HypervLabel))))
 				Expect(pod.Spec.NodeSelector).To(Not(HaveKey(ContainSubstring(v1.CPUModelVendorLabel))))
 			})
 
 			DescribeTable("should add node selector for hyperv nodes if VMI requests hyperv features which depend on host kernel", func(EVMCSEnabled bool) {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				enableFeatureGate(virtconfig.HypervStrictCheckGate)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -1457,10 +1228,10 @@ var _ = Describe("Template", func() {
 				pod, err := svc.RenderLaunchManifest(&vmi)
 				Expect(err).ToNot(HaveOccurred())
 
-				Expect(pod.Spec.NodeSelector).Should(HaveKeyWithValue(NFD_KVM_INFO_PREFIX+"synic", "true"))
-				Expect(pod.Spec.NodeSelector).Should(HaveKeyWithValue(NFD_KVM_INFO_PREFIX+"synictimer", "true"))
-				Expect(pod.Spec.NodeSelector).Should(HaveKeyWithValue(NFD_KVM_INFO_PREFIX+"frequencies", "true"))
-				Expect(pod.Spec.NodeSelector).Should(HaveKeyWithValue(NFD_KVM_INFO_PREFIX+"ipi", "true"))
+				Expect(pod.Spec.NodeSelector).Should(HaveKeyWithValue(v1.HypervLabel+"synic", "true"))
+				Expect(pod.Spec.NodeSelector).Should(HaveKeyWithValue(v1.HypervLabel+"synictimer", "true"))
+				Expect(pod.Spec.NodeSelector).Should(HaveKeyWithValue(v1.HypervLabel+"frequencies", "true"))
+				Expect(pod.Spec.NodeSelector).Should(HaveKeyWithValue(v1.HypervLabel+"ipi", "true"))
 				if EVMCSEnabled {
 					Expect(pod.Spec.NodeSelector).Should(HaveKeyWithValue(v1.CPUModelVendorLabel+IntelVendorName, "true"))
 				} else {
@@ -1473,7 +1244,7 @@ var _ = Describe("Template", func() {
 			)
 
 			It("should not add node selector for hyperv nodes if VMI requests hyperv features which do not depend on host kernel", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				enableFeatureGate(virtconfig.HypervStrictCheckGate)
 
 				var retries uint32 = 4095
@@ -1510,7 +1281,7 @@ var _ = Describe("Template", func() {
 				pod, err := svc.RenderLaunchManifest(&vmi)
 				Expect(err).ToNot(HaveOccurred())
 
-				Expect(pod.Spec.NodeSelector).To(Not(HaveKey(ContainSubstring(NFD_KVM_INFO_PREFIX))))
+				Expect(pod.Spec.NodeSelector).To(Not(HaveKey(ContainSubstring(v1.HypervLabel))))
 			})
 
 			Context("TSC frequency label", func() {
@@ -1541,7 +1312,7 @@ var _ = Describe("Template", func() {
 				}
 
 				DescribeTable("should", func(topologyHints *v1.TopologyHints, tscRequirementType topology.TscFrequencyRequirementType, isLabelExpected bool) {
-					config, kvInformer, svc = configFactory(defaultArch)
+					config, kvStore, svc = configFactory(defaultArch)
 
 					By("Setting up the vm")
 					vmi := api.NewMinimalVMIWithNS("testvmi", "default")
@@ -1568,10 +1339,10 @@ var _ = Describe("Template", func() {
 			})
 
 			It("should add default cpu/memory resources to the sidecar container if cpu pinning was requested", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				nodeSelector := map[string]string{
-					"kubernetes.io/hostname": "master",
-					v1.NodeSchedulable:       "true",
+					k8sv1.LabelHostname: "master",
+					v1.NodeSchedulable:  "true",
 				}
 				annotations := map[string]string{
 					hooks.HookSidecarListAnnotationName: `[{"image": "some-image:v1", "imagePullPolicy": "IfNotPresent"}]`,
@@ -1692,13 +1463,16 @@ var _ = Describe("Template", func() {
 					}, true),
 			)
 
-			It("should allocate 1 more cpu when isolateEmulatorThread requested", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+			DescribeTable("when isolateEmulatorThread requested", func(
+				annotations map[string]string, requestedCores uint32, expectedCPULimits string) {
+				config, kvStore, svc = configFactory(defaultArch)
+
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "testvmi",
-						Namespace: "default",
-						UID:       "1234",
+						Name:        "testvmi",
+						Namespace:   "default",
+						UID:         "1234",
+						Annotations: annotations,
 					},
 					Spec: v1.VirtualMachineInstanceSpec{
 						Domain: v1.DomainSpec{
@@ -1706,7 +1480,8 @@ var _ = Describe("Template", func() {
 								DisableHotplug: true,
 							},
 							CPU: &v1.CPU{
-								Cores:                 2,
+								Cores:                 requestedCores,
+								Threads:               1,
 								DedicatedCPUPlacement: true,
 								IsolateEmulatorThread: true,
 							},
@@ -1716,11 +1491,16 @@ var _ = Describe("Template", func() {
 
 				pod, err := svc.RenderLaunchManifest(&vmi)
 				Expect(err).ToNot(HaveOccurred())
-				cpu := resource.MustParse("3")
+				cpu := resource.MustParse(expectedCPULimits)
 				Expect(pod.Spec.Containers[0].Resources.Limits.Cpu().Cmp(cpu)).To(BeZero())
-			})
+			},
+				Entry("no annotation added, odd  CPUs requested, should allocate one extra emulator CPU", map[string]string{}, uint32(3), "4"),
+				Entry("no annotation added, even CPUs requested, should allocate one extra emulator CPU", map[string]string{}, uint32(2), "3"),
+				Entry("EmulatorThreadCompleteToEvenParity annotation added, odd CPUs requested, should allocate one extra emulator CPU", map[string]string{v1.EmulatorThreadCompleteToEvenParity: ""}, uint32(3), "4"),
+				Entry("EmulatorThreadCompleteToEvenParity annotation added, even CPUs requested, should allocate two extra emulator CPU (to align SMT scheduling)", map[string]string{v1.EmulatorThreadCompleteToEvenParity: ""}, uint32(4), "6"),
+			)
 			It("should add node affinity to pod", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				nodeAffinity := k8sv1.NodeAffinity{}
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{Name: "testvmi", Namespace: "default", UID: "1234"},
@@ -1743,7 +1523,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("should add pod affinity to pod", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				podAffinity := k8sv1.PodAffinity{}
 				vm := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{Name: "testvm", Namespace: "default", UID: "1234"},
@@ -1763,7 +1543,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("should add pod anti-affinity to pod", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				podAntiAffinity := k8sv1.PodAntiAffinity{}
 				vm := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{Name: "testvm", Namespace: "default", UID: "1234"},
@@ -1783,7 +1563,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("should add tolerations to pod", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				podToleration := k8sv1.Toleration{Key: "test"}
 				var tolerationSeconds int64 = 14
 				vm := v1.VirtualMachineInstance{
@@ -1808,7 +1588,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("should add topology spread constraints to pod", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				topologySpreadConstraints := []k8sv1.TopologySpreadConstraint{
 					{
 						MaxSkew:           1,
@@ -1838,7 +1618,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("should add the scheduler name to the pod", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vm := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{Name: "testvm", Namespace: "default", UID: "1234"},
 					Spec: v1.VirtualMachineInstanceSpec{
@@ -1856,7 +1636,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("should use the hostname and subdomain if specified on the vm", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{Name: "testvm",
 						Namespace: "default",
@@ -1879,7 +1659,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("should add vmi labels to pod", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{Name: "testvmi",
 						Namespace: "default",
@@ -1912,7 +1692,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("should not add empty affinity to pod", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{Name: "testvm", Namespace: "default", UID: "1234"},
 					Spec: v1.VirtualMachineInstanceSpec{
@@ -1932,7 +1712,7 @@ var _ = Describe("Template", func() {
 				Expect(pod.Spec.Affinity).To(BeNil())
 			})
 			DescribeTable("should add affinity to pod of vmi host model", func(model string) {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				foundNodeSelectorRequirement := false
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{Name: "testvm", Namespace: "default", UID: "1234"},
@@ -1967,7 +1747,7 @@ var _ = Describe("Template", func() {
 		})
 		Context("with cpu and memory constraints", func() {
 			DescribeTable("should add cpu and memory constraints to a template", func(arch string, requestMemory string, limitMemory string) {
-				config, kvInformer, svc = configFactory(arch)
+				config, kvStore, svc = configFactory(arch)
 
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -2007,7 +1787,7 @@ var _ = Describe("Template", func() {
 				Entry("on arm64", "arm64", "1389926245", "2389926245"),
 			)
 			DescribeTable("should overcommit guest overhead if selected, by only adding the overhead to memory limits", func(arch string, limitMemory string) {
-				config, kvInformer, svc = configFactory(arch)
+				config, kvStore, svc = configFactory(arch)
 
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -2044,7 +1824,7 @@ var _ = Describe("Template", func() {
 				Entry("on arm64", "arm64", "2389926245"),
 			)
 			DescribeTable("should not add unset resources", func(arch string, requestMemory int) {
-				config, kvInformer, svc = configFactory(arch)
+				config, kvStore, svc = configFactory(arch)
 
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -2084,7 +1864,7 @@ var _ = Describe("Template", func() {
 			)
 
 			DescribeTable("should check autoattachGraphicsDevicse", func(arch string, autoAttach *bool, memory int) {
-				config, kvInformer, svc = configFactory(arch)
+				config, kvStore, svc = configFactory(arch)
 
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -2124,7 +1904,7 @@ var _ = Describe("Template", func() {
 				Entry("and not consider graphics overhead if it is set to false on arm64", "arm64", pointer.Bool(false), 453),
 			)
 			It("should calculate vcpus overhead based on guest toplogy", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -2158,7 +1938,7 @@ var _ = Describe("Template", func() {
 				Expect(coresMemVal.Cmp(*socketsMemVal)).To(Equal(0))
 			})
 			It("should calculate vmipod cpu request based on vcpus and cpu_allocation_ratio", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "testvmi",
@@ -2180,10 +1960,10 @@ var _ = Describe("Template", func() {
 				Expect(pod.Spec.Containers[0].Resources.Requests.Cpu().String()).To(Equal("300m"))
 			})
 			It("should allocate equal amount of cpus to vmipod as vcpus with allocation_ratio set to 1", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				kvConfig := kv.DeepCopy()
 				kvConfig.Spec.Configuration.DeveloperConfiguration.CPUAllocationRatio = 1
-				testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, kvConfig)
+				testutils.UpdateFakeKubeVirtClusterConfig(kvStore, kvConfig)
 
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -2227,10 +2007,10 @@ var _ = Describe("Template", func() {
 				Expect(pod.Spec.Containers[0].Resources.Requests.Cpu().String()).To(Equal("300m"))
 			})
 			It("should override the calculated amount of cpus if the user has explicitly specified cpu request", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				kvConfig := kv.DeepCopy()
 				kvConfig.Spec.Configuration.DeveloperConfiguration.CPUAllocationRatio = 16
-				testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, kvConfig)
+				testutils.UpdateFakeKubeVirtClusterConfig(kvStore, kvConfig)
 
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -2261,7 +2041,7 @@ var _ = Describe("Template", func() {
 
 		Context("with hugepages constraints", func() {
 			DescribeTable("should add to the template constraints ", func(arch, pagesize string, memorySize int) {
-				config, kvInformer, svc = configFactory(arch)
+				config, kvStore, svc = configFactory(arch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "testvmi",
@@ -2336,7 +2116,7 @@ var _ = Describe("Template", func() {
 				Entry("hugepages-1Gi on arm64", "arm64", "1Gi", 389),
 			)
 			DescribeTable("should account for difference between guest and container requested memory ", func(arch string, memorySize int) {
-				config, kvInformer, svc = configFactory(arch)
+				config, kvStore, svc = configFactory(arch)
 				guestMem := resource.MustParse("64M")
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -2416,7 +2196,7 @@ var _ = Describe("Template", func() {
 
 		Context("with file mode pvc source", func() {
 			It("should add volume to template", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				namespace := "testns"
 				pvcName := "pvcFile"
 				pvc := k8sv1.PersistentVolumeClaim{
@@ -2471,7 +2251,7 @@ var _ = Describe("Template", func() {
 
 		Context("with blockdevice mode pvc source", func() {
 			It("should add device to template", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				namespace := "testns"
 				pvcName := "pvcDevice"
 				mode := k8sv1.PersistentVolumeBlock
@@ -2542,7 +2322,7 @@ var _ = Describe("Template", func() {
 
 		Context("with non existing pvc source", func() {
 			It("should result in an error", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				namespace := "testns"
 				pvcName := "pvcNotExisting"
 				volumeName := "pvc-volume"
@@ -2573,7 +2353,7 @@ var _ = Describe("Template", func() {
 
 		Context("with hotplug volumes", func() {
 			It("should render without any hotplug volumes listed in volumeStatus or having `Hotpluggable` flag", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				permanentVolumeName := "permanent-vol"
 				hotplugFromSpecName := "hotplug-from-spec"
 				hotplugFromStatusName := "hotplug-from-status"
@@ -2632,7 +2412,7 @@ var _ = Describe("Template", func() {
 
 		Context("with launcher's pull secret", func() {
 			It("should contain launcher's secret in pod spec", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "testvmi", Namespace: "default", UID: "1234",
@@ -2686,7 +2466,7 @@ var _ = Describe("Template", func() {
 			}
 
 			It("should add secret to pod spec", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				pod, err := svc.RenderLaunchManifest(&vmi)
 				Expect(err).ToNot(HaveOccurred())
 
@@ -2698,7 +2478,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("should deduplicate identical secrets", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				volumes[1].VolumeSource.ContainerDisk.ImagePullSecret = "pull-secret-2"
 
 				pod, err := svc.RenderLaunchManifest(&vmi)
@@ -2712,7 +2492,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("should have compute as first container in the pod", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				pod, err := svc.RenderLaunchManifest(&vmi)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(pod.Spec.Containers[0].Image).To(Equal("kubevirt/virt-launcher"))
@@ -2724,7 +2504,7 @@ var _ = Describe("Template", func() {
 		Context("with sriov interface", func() {
 
 			It("should not run privileged", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				// For Power we are currently running in privileged mode or libvirt will fail to lock memory
 				if svc.IsPPC64() {
 					Skip("ppc64le is currently running is privileged mode, so skipping test")
@@ -2737,7 +2517,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("should not mount pci related host directories", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				pod, err := svc.RenderLaunchManifest(newVMIWithSriovInterface("testvmi", "1234"))
 				Expect(err).ToNot(HaveOccurred())
 
@@ -2754,7 +2534,7 @@ var _ = Describe("Template", func() {
 				}
 			})
 			It("should add 1G of memory overhead", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := newVMIWithSriovInterface("testvmi", "1234")
 				vmi.Spec.Domain.Resources = v1.ResourceRequirements{
 					Requests: k8sv1.ResourceList{
@@ -2771,7 +2551,7 @@ var _ = Describe("Template", func() {
 				Expect(pod.Spec.Containers[0].Resources.Requests.Memory().Value()).To(Equal(expectedMemory.Value()))
 			})
 			It("should still add memory overhead for 1 core if cpu topology wasn't provided", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				requirements := v1.ResourceRequirements{
 					Requests: k8sv1.ResourceList{
 						k8sv1.ResourceMemory: resource.MustParse("512Mi"),
@@ -2803,7 +2583,7 @@ var _ = Describe("Template", func() {
 
 		Context("with ports", func() {
 			It("Should have empty port list in the pod manifest", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				iface := v1.InterfaceMasquerade{}
 				domain := v1.DomainSpec{
 					Devices: v1.Devices{
@@ -2825,7 +2605,7 @@ var _ = Describe("Template", func() {
 				Expect(pod.Spec.Containers[0].Ports).To(BeEmpty())
 			})
 			It("Should create a port list in the pod manifest", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				iface := v1.InterfaceMasquerade{}
 				ports := []v1.Port{{Name: "http", Port: 80}, {Protocol: "UDP", Port: 80}, {Port: 90}, {Name: "other-http", Port: 80}}
 				domain := v1.DomainSpec{
@@ -2860,7 +2640,7 @@ var _ = Describe("Template", func() {
 				Expect(pod.Spec.Containers[0].Ports[3].Protocol).To(Equal(k8sv1.Protocol("TCP")))
 			})
 			It("Should create a port list in the pod manifest with multiple interfaces", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				masqueradeIface := v1.InterfaceMasquerade{}
 				bridgeIface := v1.InterfaceBridge{}
 				ports1 := []v1.Port{{Name: "http", Port: 80}}
@@ -2917,6 +2697,7 @@ var _ = Describe("Template", func() {
 				resourceQuotaStore,
 				namespaceStore,
 				WithSidecarCreator(testSidecarCreator),
+				WithNetBindingPluginMemoryCalculator(&stubNetBindingPluginMemoryCalculator{}),
 			)
 			vmi := v1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{
 				Name: "testvmi", Namespace: "default", UID: "1234",
@@ -2931,7 +2712,7 @@ var _ = Describe("Template", func() {
 
 		Context("with pod networking", func() {
 			It("Should require tun device by default", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "testvmi", Namespace: "default", UID: "1234",
@@ -2953,7 +2734,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("Should require tun device if explicitly requested", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				domain := v1.DomainSpec{}
 				autoAttach := true
 				domain.Devices.AutoattachPodInterface = &autoAttach
@@ -2980,7 +2761,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("Should not require tun device if explicitly rejected", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				domain := v1.DomainSpec{}
 				autoAttach := false
 				domain.Devices.AutoattachPodInterface = &autoAttach
@@ -3024,7 +2805,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("Should add an empytDir backed by Memory", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi.Spec.Volumes = []v1.Volume{
 					{
 						Name: "downardMetrics",
@@ -3055,7 +2836,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("Should add 1Mi memory overhead", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				pod, err := svc.RenderLaunchManifest(vmi)
 				Expect(err).ToNot(HaveOccurred())
 				overhead := pod.Spec.Containers[0].Resources.Requests.Memory()
@@ -3077,7 +2858,7 @@ var _ = Describe("Template", func() {
 
 		Context("with a configMap volume source", func() {
 			It("Should add the ConfigMap to template", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				volumes := []v1.Volume{
 					{
 						Name: "configmap-volume",
@@ -3120,7 +2901,7 @@ var _ = Describe("Template", func() {
 		Context("with a Sysprep volume source", func() {
 			Context("with a ConfigMap", func() {
 				It("Should add the Sysprep ConfigMap to template", func() {
-					config, kvInformer, svc = configFactory(defaultArch)
+					config, kvStore, svc = configFactory(defaultArch)
 					volumes := []v1.Volume{
 						{
 							Name: "sysprep-configmap-volume",
@@ -3157,7 +2938,7 @@ var _ = Describe("Template", func() {
 			})
 			Context("with a Secret", func() {
 				It("Should add the Sysprep SecretRef to template", func() {
-					config, kvInformer, svc = configFactory(defaultArch)
+					config, kvStore, svc = configFactory(defaultArch)
 					volumes := []v1.Volume{
 						{
 							Name: "sysprep-configmap-volume",
@@ -3197,7 +2978,7 @@ var _ = Describe("Template", func() {
 
 		Context("with a secret volume source", func() {
 			It("should add the Secret to template", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				volumes := []v1.Volume{
 					{
 						Name: "secret-volume",
@@ -3283,7 +3064,7 @@ var _ = Describe("Template", func() {
 				}
 			})
 			It("should copy all specified probes", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				pod, err := svc.RenderLaunchManifest(vmi)
 				Expect(err).ToNot(HaveOccurred())
 				livenessProbe := pod.Spec.Containers[0].LivenessProbe
@@ -3308,7 +3089,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("should not set a readiness probe on the pod, if no one was specified on the vmi", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi.Spec.ReadinessProbe = nil
 				pod, err := svc.RenderLaunchManifest(vmi)
 				Expect(err).ToNot(HaveOccurred())
@@ -3318,7 +3099,7 @@ var _ = Describe("Template", func() {
 
 		Context("with GPU device interface", func() {
 			It("should not run privileged", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				// For Power we are currently running in privileged mode or libvirt will fail to lock memory
 				if svc.IsPPC64() {
 					Skip("ppc64le is currently running is privileged mode, so skipping test")
@@ -3350,7 +3131,7 @@ var _ = Describe("Template", func() {
 				Expect(*pod.Spec.Containers[0].SecurityContext.Privileged).To(BeFalse())
 			})
 			It("should not mount pci related host directories and should have gpu resource", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "testvmi",
@@ -3395,7 +3176,7 @@ var _ = Describe("Template", func() {
 
 		Context("with HostDevice device interface", func() {
 			It("should not run privileged", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				// For Power we are currently running in privileged mode or libvirt will fail to lock memory
 				if svc.IsPPC64() {
 					Skip("ppc64le is currently running is privileged mode, so skipping test")
@@ -3427,7 +3208,7 @@ var _ = Describe("Template", func() {
 				Expect(*pod.Spec.Containers[0].SecurityContext.Privileged).To(BeFalse())
 			})
 			It("should not mount pci related host directories", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "testvmi",
@@ -3472,7 +3253,7 @@ var _ = Describe("Template", func() {
 
 		Context("with specified priorityClass", func() {
 			It("should add priorityClass", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "testvmi",
@@ -3716,7 +3497,7 @@ var _ = Describe("Template", func() {
 			}
 
 			It("should define containers and volumes properly", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := utils.GetVMIKernelBootWithRandName()
 				vmi.ObjectMeta = metav1.ObjectMeta{
 					Name: "testvmi-kernel-boot", Namespace: "default", UID: "1234",
@@ -3737,11 +3518,11 @@ var _ = Describe("Template", func() {
 
 		Context("Using defaultRuntimeClass", func() {
 			It("Should set a runtimeClassName on launcher pod, if configured", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				runtimeClassName := "customRuntime"
 				kvConfig := kv.DeepCopy()
 				kvConfig.Spec.Configuration.DefaultRuntimeClass = runtimeClassName
-				testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, kvConfig)
+				testutils.UpdateFakeKubeVirtClusterConfig(kvStore, kvConfig)
 
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
@@ -3758,7 +3539,7 @@ var _ = Describe("Template", func() {
 			})
 
 			It("Should leave runtimeClassName unset on pod, if not configured", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "testvmi",
@@ -3781,8 +3562,6 @@ var _ = Describe("Template", func() {
 				vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{*v1.DefaultBridgeNetworkInterface()}
 			case "masquerade":
 				vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{*v1.DefaultMasqueradeNetworkInterface()}
-			case "slirp":
-				vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{*v1.DefaultSlirpNetworkInterface()}
 			}
 
 			pod, err := svc.RenderLaunchManifest(vmi)
@@ -3798,12 +3577,16 @@ var _ = Describe("Template", func() {
 		},
 			Entry("when there is bridge interface", "bridge"),
 			Entry("when there is masquerade interface", "masquerade"),
-			Entry("when there is slirp interface", "slirp"),
 		)
 
 		It("should require capabilites which we set on virt-launcher binary", func() {
 			vmi := api.NewMinimalVMI("fake-vmi")
-			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{*v1.DefaultMacvtapNetworkInterface("test")}
+			vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{{
+				Name: "test",
+				InterfaceBindingMethod: v1.InterfaceBindingMethod{
+					DeprecatedMacvtap: &v1.DeprecatedInterfaceMacvtap{},
+				},
+			}}
 
 			pod, err := svc.RenderLaunchManifest(vmi)
 			Expect(err).ToNot(HaveOccurred())
@@ -3886,7 +3669,7 @@ var _ = Describe("Template", func() {
 				vmi.Status.RuntimeUser = uint64(nonRootUser)
 				vmi.Spec.Domain.Devices.Interfaces = []v1.Interface{{
 					InterfaceBindingMethod: v1.InterfaceBindingMethod{
-						Passt: &v1.InterfacePasst{},
+						DeprecatedPasst: &v1.DeprecatedInterfacePasst{},
 					},
 				}}
 				return vmi
@@ -3895,9 +3678,6 @@ var _ = Describe("Template", func() {
 				RunAsGroup:   &nonRootUser,
 				RunAsNonRoot: pointer.Bool(true),
 				FSGroup:      &nonRootUser,
-				SELinuxOptions: &k8sv1.SELinuxOptions{
-					Type: "virt_launcher.process",
-				},
 			}),
 			Entry("on a virtiofs vmi", func() *v1.VirtualMachineInstance {
 				nonRootUser := util.NonRootUID
@@ -3922,7 +3702,7 @@ var _ = Describe("Template", func() {
 
 			vmi.Status.SelinuxContext = "test_u:test_r:test_t:s0"
 			claimMap := map[string]*k8sv1.PersistentVolumeClaim{}
-			pod, err := svc.RenderHotplugAttachmentPodTemplate([]*v1.Volume{}, ownerPod, vmi, claimMap, false)
+			pod, err := svc.RenderHotplugAttachmentPodTemplate([]*v1.Volume{}, ownerPod, vmi, claimMap)
 			Expect(err).ToNot(HaveOccurred())
 
 			runUser := int64(util.NonRootUID)
@@ -3972,7 +3752,7 @@ var _ = Describe("Template", func() {
 					},
 				},
 			})
-			pod, err := svc.RenderHotplugAttachmentPodTemplate(volumes, ownerPod, vmi, claimMap, false)
+			pod, err := svc.RenderHotplugAttachmentPodTemplate(volumes, ownerPod, vmi, claimMap)
 			prop := k8sv1.MountPropagationHostToContainer
 			Expect(err).ToNot(HaveOccurred())
 			Expect(pod.Spec.Containers[0].VolumeMounts).To(HaveLen(2))
@@ -4019,7 +3799,7 @@ var _ = Describe("Template", func() {
 					},
 				},
 			})
-			pod, err := svc.RenderHotplugAttachmentPodTemplate(volumes, ownerPod, vmi, claimMap, false)
+			pod, err := svc.RenderHotplugAttachmentPodTemplate(volumes, ownerPod, vmi, claimMap)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(pod.Spec.Containers[0].VolumeDevices).ToNot(BeNil())
 			Expect(pod.Spec.Containers[0].VolumeDevices).To(Equal([]k8sv1.VolumeDevice{
@@ -4059,18 +3839,18 @@ var _ = Describe("Template", func() {
 			Entry("when volume is a filesystem", false),
 		)
 
-		verifyPodRequestLimits1to1Ratio := func(pod *k8sv1.Pod) {
-			cpuLimit := pod.Spec.Containers[0].Resources.Limits.Cpu().Value()
+		verifyPodRequestLimits := func(pod *k8sv1.Pod) {
+			cpuLimit := pod.Spec.Containers[0].Resources.Limits.Cpu().MilliValue()
 			memLimit := pod.Spec.Containers[0].Resources.Limits.Memory().Value()
-			cpuReq := pod.Spec.Containers[0].Resources.Requests.Cpu().Value()
+			cpuReq := pod.Spec.Containers[0].Resources.Requests.Cpu().MilliValue()
 			memReq := pod.Spec.Containers[0].Resources.Requests.Memory().Value()
 			expCpuLimitQ := resource.MustParse("100m")
-			Expect(cpuLimit).To(Equal(expCpuLimitQ.Value()))
+			Expect(cpuLimit).To(Equal(expCpuLimitQ.MilliValue()))
 			expMemLimitQ := resource.MustParse("80M")
 			Expect(memLimit).To(Equal(expMemLimitQ.Value()))
-			expCpuReqQ := resource.MustParse("100m")
-			Expect(cpuReq).To(Equal(expCpuReqQ.Value()))
-			expMemReqQ := resource.MustParse("80M")
+			expCpuReqQ := resource.MustParse("10m")
+			Expect(cpuReq).To(Equal(expCpuReqQ.MilliValue()))
+			expMemReqQ := resource.MustParse("2M")
 			Expect(memReq).To(Equal(expMemReqQ.Value()))
 		}
 
@@ -4091,9 +3871,9 @@ var _ = Describe("Template", func() {
 				},
 			}
 			claimMap := map[string]*k8sv1.PersistentVolumeClaim{}
-			pod, err := svc.RenderHotplugAttachmentPodTemplate([]*v1.Volume{}, ownerPod, vmi, claimMap, false)
+			pod, err := svc.RenderHotplugAttachmentPodTemplate([]*v1.Volume{}, ownerPod, vmi, claimMap)
 			Expect(err).ToNot(HaveOccurred())
-			verifyPodRequestLimits1to1Ratio(pod)
+			verifyPodRequestLimits(pod)
 		})
 
 		DescribeTable("hould compute the correct resource req according to desired QoS when rendering hotplug trigger pods", func(isBlock bool) {
@@ -4114,7 +3894,7 @@ var _ = Describe("Template", func() {
 			}
 			pod, err := svc.RenderHotplugAttachmentTriggerPodTemplate(&v1.Volume{}, ownerPod, vmi, "test", isBlock, false)
 			Expect(err).ToNot(HaveOccurred())
-			verifyPodRequestLimits1to1Ratio(pod)
+			verifyPodRequestLimits(pod)
 		},
 			Entry("when volume is a block device", true),
 			Entry("when volume is a filesystem", false),
@@ -4142,7 +3922,7 @@ var _ = Describe("Template", func() {
 
 		Context("With a realtime workload", func() {
 			It("should calculate the overhead memory including the requested memory", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := newMinimalWithContainerDisk("testvmi")
 				vmi.Spec.Domain.Resources = v1.ResourceRequirements{
 					Requests: k8sv1.ResourceList{
@@ -4176,7 +3956,7 @@ var _ = Describe("Template", func() {
 
 		Context("with Virtual Machine name label", func() {
 			It("should replace label with VM name", func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				vmi := v1.VirtualMachineInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "testvmi",
@@ -4199,7 +3979,7 @@ var _ = Describe("Template", func() {
 		Context("without Virtual Machine name label", func() {
 			Context("with valid VM name", func() {
 				It("should create label with VM name", func() {
-					config, kvInformer, svc = configFactory(defaultArch)
+					config, kvStore, svc = configFactory(defaultArch)
 					vmi := v1.VirtualMachineInstance{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:      "testvmi",
@@ -4221,7 +4001,7 @@ var _ = Describe("Template", func() {
 				It("should create label with trimmed VM name", func() {
 					name := "testvmi-" + strings.Repeat("a", 63)
 
-					config, kvInformer, svc = configFactory(defaultArch)
+					config, kvStore, svc = configFactory(defaultArch)
 					vmi := v1.VirtualMachineInstance{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:      name,
@@ -4242,7 +4022,7 @@ var _ = Describe("Template", func() {
 
 		Context("with guest-to-request memory headroom", func() {
 			BeforeEach(func() {
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 			})
 
 			newVmi := func() *v1.VirtualMachineInstance {
@@ -4285,7 +4065,7 @@ var _ = Describe("Template", func() {
 			BeforeEach(func() {
 				vmi = api.NewMinimalVMI("configmap-sidecar-test")
 				vmi.Annotations = map[string]string{
-					hooks.HookSidecarListAnnotationName: `[{"image": "test:test", "configMap": {"name": "test-cm", 
+					hooks.HookSidecarListAnnotationName: `[{"image": "test:test", "configMap": {"name": "test-cm",
 "key": "script.sh", "hookPath": "/usr/bin/onDefineDomain"}}]`,
 				}
 			})
@@ -4304,7 +4084,7 @@ var _ = Describe("Template", func() {
 					virtClient.EXPECT().CoreV1().Return(k8sClient.CoreV1()).AnyTimes()
 				})
 				It("should add ConfigMap as volume to Pod and mount in sidecar", func() {
-					config, kvInformer, svc = configFactory(defaultArch)
+					config, kvStore, svc = configFactory(defaultArch)
 					pod, err := svc.RenderLaunchManifest(vmi)
 					Expect(err).ToNot(HaveOccurred())
 
@@ -4326,9 +4106,64 @@ var _ = Describe("Template", func() {
 			})
 			When("ConfigMap does not exist on the cluster", func() {
 				It("should fail with error", func() {
-					config, kvInformer, svc = configFactory(defaultArch)
+					config, kvStore, svc = configFactory(defaultArch)
 					_, err := svc.RenderLaunchManifest(vmi)
 					Expect(err).To(HaveOccurred())
+				})
+			})
+		})
+
+		Context("with pvc in VMI annotations for sidecar", func() {
+			var vmi *v1.VirtualMachineInstance
+			const (
+				claim           = "test-pvc"
+				dirSidecar      = "/debug"
+				shareDirCompute = "/var/run/debug"
+			)
+			BeforeEach(func() {
+				vmi = api.NewMinimalVMI("pvc-sidecar-test")
+				vmi.Annotations = map[string]string{
+					hooks.HookSidecarListAnnotationName: fmt.Sprintf(`[{"image": "test:test", "pvc": {"name": "%s","volumePath": "%s", "sharedComputePath": "%s"}}]`, claim, dirSidecar, shareDirCompute),
+				}
+			})
+			When("PVC exists on the cluster", func() {
+				BeforeEach(func() {
+					mode := k8sv1.PersistentVolumeFilesystem
+					k8sClient := k8sfake.NewSimpleClientset()
+					k8sClient.Fake.PrependReactor("get", "pvcs", func(action testing.Action) (handled bool, obj k8sruntime.Object, err error) {
+						pvc := k8sv1.PersistentVolumeClaim{
+							ObjectMeta: metav1.ObjectMeta{
+								Name: claim,
+							},
+							Spec: k8sv1.PersistentVolumeClaimSpec{
+								VolumeMode: &mode,
+							},
+						}
+						return true, &pvc, nil
+					})
+					virtClient.EXPECT().CoreV1().Return(k8sClient.CoreV1()).AnyTimes()
+				})
+				It("should add the pvc to Pod and mount in sidecar", func() {
+					config, kvStore, svc = configFactory(defaultArch)
+					pod, err := svc.RenderLaunchManifest(vmi)
+					Expect(err).ToNot(HaveOccurred())
+
+					Expect(pod.Spec.Volumes).To(ContainElement(k8sv1.Volume{
+						Name: claim,
+						VolumeSource: k8sv1.VolumeSource{
+							PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{
+								ClaimName: claim,
+							},
+						},
+					}))
+					Expect(pod.Spec.Containers[0].VolumeMounts).To(ContainElement(k8sv1.VolumeMount{
+						MountPath: shareDirCompute,
+						Name:      claim,
+					}))
+					Expect(pod.Spec.Containers[1].VolumeMounts).To(ContainElement(k8sv1.VolumeMount{
+						MountPath: dirSidecar,
+						Name:      claim,
+					}))
 				})
 			})
 		})
@@ -4338,7 +4173,7 @@ var _ = Describe("Template", func() {
 	Describe("ServiceAccountName", func() {
 
 		It("Should add service account if present", func() {
-			config, kvInformer, svc = configFactory(defaultArch)
+			config, kvStore, svc = configFactory(defaultArch)
 			serviceAccountName := "testAccount"
 			volumes := []v1.Volume{
 				{
@@ -4368,7 +4203,7 @@ var _ = Describe("Template", func() {
 		})
 
 		It("Should not add service account if not present", func() {
-			config, kvInformer, svc = configFactory(defaultArch)
+			config, kvStore, svc = configFactory(defaultArch)
 			vmi := v1.VirtualMachineInstance{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "testvmi", Namespace: "default", UID: "1234",
@@ -4436,7 +4271,7 @@ var _ = Describe("Template", func() {
 		var cpuRequests resource.Quantity
 
 		BeforeEach(func() {
-			config, kvInformer, svc = configFactory(defaultArch)
+			config, kvStore, svc = configFactory(defaultArch)
 			cpuRequests = resource.MustParse("200m")
 			sampleQuantity := resource.MustParse("900m")
 			resourceQuotaWithCPULimits := k8sv1.ResourceQuota{
@@ -4476,12 +4311,12 @@ var _ = Describe("Template", func() {
 		When("the auto resource limits feature gate is disabled", func() {
 			BeforeEach(func() {
 				By("enabling the auto CPU limit namespace selector")
-				config, kvInformer, svc = configFactory(defaultArch)
+				config, kvStore, svc = configFactory(defaultArch)
 				kvConfig := kv.DeepCopy()
 				kvConfig.Spec.Configuration.AutoCPULimitNamespaceLabelSelector = &metav1.LabelSelector{
 					MatchLabels: map[string]string{"testAutoLimits": "true"},
 				}
-				testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, kvConfig)
+				testutils.UpdateFakeKubeVirtClusterConfig(kvStore, kvConfig)
 			})
 
 			It("should not automatically set CPU limits when namespace labels does not match AutoCPULimitNamespaceLabelSelector", func() {
@@ -4550,7 +4385,7 @@ var _ = Describe("Template", func() {
 				By("enabling the auto resource limits feature gate")
 				kvConfig := kv.DeepCopy()
 				kvConfig.Spec.Configuration.DeveloperConfiguration.FeatureGates = []string{virtconfig.AutoResourceLimitsGate}
-				testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, kvConfig)
+				testutils.UpdateFakeKubeVirtClusterConfig(kvStore, kvConfig)
 			})
 
 			Context("when the creation namespace has a resource quota with CPU limits associated to it", func() {
@@ -4618,13 +4453,13 @@ var _ = Describe("Template", func() {
 			Context("when the creation namespace has a resource quota without CPU limits associated to it", func() {
 				BeforeEach(func() {
 					By("enabling the auto CPU limit namespace selector")
-					config, kvInformer, svc = configFactory(defaultArch)
+					config, kvStore, svc = configFactory(defaultArch)
 					kvConfig := kv.DeepCopy()
 					kvConfig.Spec.Configuration.AutoCPULimitNamespaceLabelSelector = &metav1.LabelSelector{
 						MatchLabels: map[string]string{"testAutoLimits": "true"},
 					}
 					kvConfig.Spec.Configuration.DeveloperConfiguration.FeatureGates = []string{virtconfig.AutoResourceLimitsGate}
-					testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, kvConfig)
+					testutils.UpdateFakeKubeVirtClusterConfig(kvStore, kvConfig)
 				})
 
 				It("should not automatically set CPU limits when namespace labels does not match AutoCPULimitNamespaceLabelSelector", func() {
@@ -4662,7 +4497,7 @@ var _ = Describe("Template", func() {
 		var guestMemory resource.Quantity
 
 		BeforeEach(func() {
-			config, kvInformer, svc = configFactory(defaultArch)
+			config, kvStore, svc = configFactory(defaultArch)
 			guestMemory = resource.MustParse("64M")
 
 			sampleQuantity := resource.MustParse("128M")
@@ -4731,7 +4566,7 @@ var _ = Describe("Template", func() {
 				By("enabling the auto resource limits feature gate")
 				kvConfig := kv.DeepCopy()
 				kvConfig.Spec.Configuration.DeveloperConfiguration.FeatureGates = []string{virtconfig.AutoResourceLimitsGate}
-				testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, kvConfig)
+				testutils.UpdateFakeKubeVirtClusterConfig(kvStore, kvConfig)
 			})
 
 			Context("when the creation namespace has a resource quota with memory limits associated to it", func() {
@@ -4904,45 +4739,424 @@ var _ = Describe("Template", func() {
 		)
 	})
 
+	Context("network-info", func() {
+		const (
+			noDeviceInfoPlugin = "no_deviceinfo"
+			deviceInfoPlugin   = "deviceinfo"
+		)
+		BeforeEach(func() {
+			bindingPlugins := map[string]v1.InterfaceBindingPlugin{
+				deviceInfoPlugin:   {DownwardAPI: v1.DeviceInfo},
+				noDeviceInfoPlugin: {},
+			}
+			kvConfig := kv.DeepCopy()
+			kvConfig.Spec.Configuration.NetworkConfiguration = &v1.NetworkConfiguration{Binding: bindingPlugins}
+			_, kvStore, svc = configFactory(defaultArch)
+			testutils.UpdateFakeKubeVirtClusterConfig(kvStore, kvConfig)
+		})
+		It("has no downward-api for network-info when missing supported network-binding", func() {
+			vmi := libvmi.New(libvmi.WithNamespace("default"),
+				libvmi.WithNetwork(v1.DefaultPodNetwork()),
+				libvmi.WithInterface(*v1.DefaultBridgeNetworkInterface()),
+				libvmi.WithNetwork(libvmi.MultusNetwork("network1", "default/default")),
+				libvmi.WithInterface(libvmi.InterfaceWithBindingPlugin("network1", v1.PluginBinding{Name: noDeviceInfoPlugin})),
+			)
+			pod, err := svc.RenderLaunchManifest(vmi)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(pod.Spec.Volumes).ToNot(ContainElement(networkInfoAnnotVolume()),
+				"pod should not have network-info annotation volume")
+
+			Expect(pod.Spec.Containers[0].Name).To(Equal("compute"))
+			Expect(pod.Spec.Containers[0].VolumeMounts).ToNot(ContainElement(networkInfoAnnotVolumeMount()),
+				"pod should not have network-info annotation volume mount")
+		})
+
+		DescribeTable("downward api for network-info is defined",
+			func(interfaces []v1.Interface, networks []v1.Network) {
+				vmi := libvmi.New(libvmi.WithNamespace("default"))
+				vmi.Spec.Domain.Devices.Interfaces = interfaces
+				vmi.Spec.Networks = networks
+
+				pod, err := svc.RenderLaunchManifest(vmi)
+				Expect(err).ToNot(HaveOccurred())
+
+				const netInfoAnnotVolName = "network-info-annotation"
+				netInfoVolumes := filterDownwardAPIVolumeByName(pod.Spec.Volumes, netInfoAnnotVolName)
+				Expect(netInfoVolumes).To(ConsistOf(networkInfoAnnotVolume()),
+					"should have single network-info annotation volume")
+
+				const computeContainerName = "compute"
+				Expect(pod.Spec.Containers[0].Name).To(Equal(computeContainerName))
+				netInfoVolumeMounts := filterVolumeMountByName(pod.Spec.Containers[0].VolumeMounts, netInfoAnnotVolName)
+				Expect(netInfoVolumeMounts).To(ConsistOf(networkInfoAnnotVolumeMount()),
+					"should have single network-info annotation volume mount")
+			},
+			Entry("with SR-IOV interface",
+				[]v1.Interface{libvmi.InterfaceDeviceWithSRIOVBinding("network1")},
+				[]v1.Network{*libvmi.MultusNetwork("network1", "default/default")},
+			),
+			Entry("with binding plugin device-info interface",
+				[]v1.Interface{libvmi.InterfaceWithBindingPlugin("network1", v1.PluginBinding{Name: deviceInfoPlugin})},
+				[]v1.Network{*libvmi.MultusNetwork("network1", "default/default")},
+			),
+			Entry("with binding plugin device-info and SR-IOV interfaces",
+				[]v1.Interface{
+					libvmi.InterfaceDeviceWithSRIOVBinding("network1"),
+					libvmi.InterfaceWithBindingPlugin("network2", v1.PluginBinding{Name: deviceInfoPlugin}),
+				},
+				[]v1.Network{
+					*libvmi.MultusNetwork("network1", "default/default"),
+					*libvmi.MultusNetwork("network2", "default/default"),
+				},
+			),
+		)
+	})
+
+	Context("Network binding plugin", func() {
+		It("Should consider network binding plugin memory overhead", func() {
+			const (
+				iface1name  = "iface1"
+				plugin1name = "plugin1"
+			)
+
+			kvConfig := kv.DeepCopy()
+			kvConfig.Spec.Configuration.NetworkConfiguration = &v1.NetworkConfiguration{
+				Binding: map[string]v1.InterfaceBindingPlugin{
+					plugin1name: {
+						ComputeResourceOverhead: &k8sv1.ResourceRequirements{
+							Requests: map[k8sv1.ResourceName]resource.Quantity{
+								k8sv1.ResourceMemory: resource.MustParse("500Mi"),
+							},
+						},
+					},
+				},
+			}
+
+			config, _, _ := testutils.NewFakeClusterConfigUsingKVConfig(&kvConfig.Spec.Configuration)
+
+			netBindingPluginMemoryOverheadCalculator := &stubNetBindingPluginMemoryCalculator{}
+			svc = NewTemplateService("kubevirt/virt-launcher",
+				240,
+				"/var/run/kubevirt",
+				"/var/lib/kubevirt",
+				"/var/run/kubevirt-ephemeral-disks",
+				"/var/run/kubevirt/container-disks",
+				v1.HotplugDiskDir,
+				"pull-secret-1",
+				pvcCache,
+				virtClient,
+				config,
+				qemuGid,
+				"kubevirt/vmexport",
+				resourceQuotaStore,
+				namespaceStore,
+				WithSidecarCreator(testSidecarCreator),
+				WithNetBindingPluginMemoryCalculator(netBindingPluginMemoryOverheadCalculator),
+			)
+
+			vmi := libvmi.New(
+				libvmi.WithNamespace("default"),
+				libvmi.WithInterface(v1.Interface{Name: iface1name, Binding: &v1.PluginBinding{Name: plugin1name}}),
+				libvmi.WithNetwork(&v1.Network{Name: iface1name}),
+			)
+
+			_, err := svc.RenderLaunchManifest(vmi)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(netBindingPluginMemoryOverheadCalculator.calculatedMemoryOverhead).To(BeTrue())
+		})
+	})
+
+	Context("Custom annotations Generation", func() {
+		const (
+			testNamespace = "default"
+
+			generator1Key1   = "generator1Key1"
+			generator1Value1 = "generator1Value1"
+			generator1Key2   = "generator1Key2"
+			generator1Value2 = "generator1Value2"
+
+			generator2Key1   = "generator2Key1"
+			generator2Value1 = "generator2Value1"
+			generator2Key2   = "generator2Key2"
+			generator2Value2 = "generator2Value2"
+		)
+
+		var (
+			generator1Annotations map[string]string
+			generator2Annotations map[string]string
+
+			generator1Err = errors.New("generator1 failed")
+			generator2Err = errors.New("generator2 failed")
+		)
+
+		BeforeEach(func() {
+			generator1Annotations = map[string]string{
+				generator1Key1: generator1Value1,
+				generator1Key2: generator1Value2,
+			}
+
+			generator2Annotations = map[string]string{
+				generator2Key1: generator2Value1,
+				generator2Key2: generator2Value2,
+			}
+		})
+
+		It("Should call all registered annotation generators", func() {
+			generator1 := stubAnnotationsGenerator{annotations: generator1Annotations}
+			generator2 := stubAnnotationsGenerator{annotations: generator2Annotations}
+
+			svc = NewTemplateService("kubevirt/virt-launcher",
+				240,
+				"/var/run/kubevirt",
+				"/var/lib/kubevirt",
+				"/var/run/kubevirt-ephemeral-disks",
+				"/var/run/kubevirt/container-disks",
+				v1.HotplugDiskDir,
+				"pull-secret-1",
+				pvcCache,
+				virtClient,
+				config,
+				qemuGid,
+				"kubevirt/vmexport",
+				resourceQuotaStore,
+				namespaceStore,
+				WithAnnotationsGenerators(generator1, generator2),
+			)
+
+			vmi := libvmi.New(libvmi.WithNamespace(testNamespace))
+
+			pod, err := svc.RenderLaunchManifest(vmi)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(pod.Annotations).To(HaveKeyWithValue(generator1Key1, generator1Value1))
+			Expect(pod.Annotations).To(HaveKeyWithValue(generator1Key1, generator1Value1))
+			Expect(pod.Annotations).To(HaveKeyWithValue(generator2Key1, generator2Value1))
+			Expect(pod.Annotations).To(HaveKeyWithValue(generator2Key2, generator2Value2))
+		})
+
+		DescribeTable("Should fail when the first generator failure is encountered", func(generator1, generator2 stubAnnotationsGenerator, expectedErr error) {
+			svc = NewTemplateService("kubevirt/virt-launcher",
+				240,
+				"/var/run/kubevirt",
+				"/var/lib/kubevirt",
+				"/var/run/kubevirt-ephemeral-disks",
+				"/var/run/kubevirt/container-disks",
+				v1.HotplugDiskDir,
+				"pull-secret-1",
+				pvcCache,
+				virtClient,
+				config,
+				qemuGid,
+				"kubevirt/vmexport",
+				resourceQuotaStore,
+				namespaceStore,
+				WithAnnotationsGenerators(generator1, generator2),
+			)
+
+			vmi := libvmi.New(libvmi.WithNamespace(testNamespace))
+
+			_, err := svc.RenderLaunchManifest(vmi)
+			Expect(err).To(MatchError(expectedErr))
+		},
+			Entry("When the last generator fails",
+				stubAnnotationsGenerator{
+					annotations: generator1Annotations,
+				},
+				stubAnnotationsGenerator{
+					annotations:   generator2Annotations,
+					generationErr: generator2Err,
+				},
+				generator2Err,
+			),
+			Entry("When all generators fail",
+				stubAnnotationsGenerator{
+					annotations:   generator1Annotations,
+					generationErr: generator1Err,
+				},
+				stubAnnotationsGenerator{
+					annotations:   generator2Annotations,
+					generationErr: generator2Err,
+				},
+				generator1Err,
+			),
+		)
+
+		It("Last generator overrides previously generated key/value pairs", func() {
+			const (
+				sharedKey = "sharedKey"
+				val1      = "val1"
+				val2      = "val2"
+			)
+
+			generator1 := stubAnnotationsGenerator{
+				annotations: map[string]string{sharedKey: val1},
+			}
+
+			generator2 := stubAnnotationsGenerator{
+				annotations: map[string]string{sharedKey: val2},
+			}
+
+			svc = NewTemplateService("kubevirt/virt-launcher",
+				240,
+				"/var/run/kubevirt",
+				"/var/lib/kubevirt",
+				"/var/run/kubevirt-ephemeral-disks",
+				"/var/run/kubevirt/container-disks",
+				v1.HotplugDiskDir,
+				"pull-secret-1",
+				pvcCache,
+				virtClient,
+				config,
+				qemuGid,
+				"kubevirt/vmexport",
+				resourceQuotaStore,
+				namespaceStore,
+				WithAnnotationsGenerators(generator1, generator2),
+			)
+
+			vmi := libvmi.New(libvmi.WithNamespace(testNamespace))
+
+			pod, err := svc.RenderLaunchManifest(vmi)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(pod.Annotations).To(HaveKeyWithValue(sharedKey, val2))
+		})
+	})
+
+	Context("Network target annotations generation", func() {
+		const (
+			testNamespace = "default"
+
+			testKey = "netAnnotation"
+
+			initialValue = "netAnnotationInitial"
+			updatedValue = "netAnnotationUpdated"
+		)
+
+		It("Should call network target annotations generator when templating a migration target pod", func() {
+			generator := stubTargetAnnotationsGenerator{
+				annotations: map[string]string{testKey: updatedValue},
+			}
+
+			svc = NewTemplateService("kubevirt/virt-launcher",
+				240,
+				"/var/run/kubevirt",
+				"/var/lib/kubevirt",
+				"/var/run/kubevirt-ephemeral-disks",
+				"/var/run/kubevirt/container-disks",
+				v1.HotplugDiskDir,
+				"pull-secret-1",
+				pvcCache,
+				virtClient,
+				config,
+				qemuGid,
+				"kubevirt/vmexport",
+				resourceQuotaStore,
+				namespaceStore,
+				WithNetTargetAnnotationsGenerator(generator),
+			)
+
+			vmi := libvmi.New(libvmi.WithNamespace(testNamespace))
+
+			sourcePod, err := svc.RenderLaunchManifest(vmi)
+			Expect(err).ToNot(HaveOccurred())
+
+			sourcePod.Annotations[testKey] = initialValue
+
+			targetPod, err := svc.RenderMigrationManifest(vmi, sourcePod)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(targetPod.Annotations).To(HaveKeyWithValue(testKey, updatedValue))
+		})
+
+		It("Should fail templating a migration target pod when network target annotations generator fails", func() {
+			expectedErr := errors.New("some err")
+
+			generator := stubTargetAnnotationsGenerator{
+				annotations:   map[string]string{testKey: updatedValue},
+				generationErr: expectedErr,
+			}
+
+			svc = NewTemplateService("kubevirt/virt-launcher",
+				240,
+				"/var/run/kubevirt",
+				"/var/lib/kubevirt",
+				"/var/run/kubevirt-ephemeral-disks",
+				"/var/run/kubevirt/container-disks",
+				v1.HotplugDiskDir,
+				"pull-secret-1",
+				pvcCache,
+				virtClient,
+				config,
+				qemuGid,
+				"kubevirt/vmexport",
+				resourceQuotaStore,
+				namespaceStore,
+				WithNetTargetAnnotationsGenerator(generator),
+			)
+
+			vmi := libvmi.New(libvmi.WithNamespace(testNamespace))
+
+			sourcePod, err := svc.RenderLaunchManifest(vmi)
+			Expect(err).ToNot(HaveOccurred())
+
+			sourcePod.Annotations[testKey] = initialValue
+
+			_, err = svc.RenderMigrationManifest(vmi, sourcePod)
+			Expect(err).To(MatchError(expectedErr))
+		})
+	})
 })
+
+func networkInfoAnnotVolume() k8sv1.Volume {
+	netInfoAnnotFile := k8sv1.DownwardAPIVolumeFile{
+		Path: "network-info",
+		FieldRef: &k8sv1.ObjectFieldSelector{
+			FieldPath: "metadata.annotations['kubevirt.io/network-info']",
+		},
+	}
+	return k8sv1.Volume{
+		Name: "network-info-annotation",
+		VolumeSource: k8sv1.VolumeSource{
+			DownwardAPI: &k8sv1.DownwardAPIVolumeSource{
+				Items: []k8sv1.DownwardAPIVolumeFile{netInfoAnnotFile},
+			},
+		},
+	}
+}
+
+func networkInfoAnnotVolumeMount() k8sv1.VolumeMount {
+	return k8sv1.VolumeMount{
+		Name:      "network-info-annotation",
+		MountPath: "/etc/podinfo",
+	}
+}
+
+func filterDownwardAPIVolumeByName(volumes []k8sv1.Volume, name string) []k8sv1.Volume {
+	var filteredVolumes []k8sv1.Volume
+	for _, vol := range volumes {
+		if vol.Name == name && vol.VolumeSource.DownwardAPI != nil {
+			filteredVolumes = append(filteredVolumes, vol)
+		}
+	}
+	return filteredVolumes
+}
+
+func filterVolumeMountByName(mounts []k8sv1.VolumeMount, name string) []k8sv1.VolumeMount {
+	var filteredVolumesMounts []k8sv1.VolumeMount
+	for _, mount := range mounts {
+		if mount.Name == name {
+			filteredVolumesMounts = append(filteredVolumesMounts, mount)
+		}
+	}
+	return filteredVolumesMounts
+}
 
 func testSidecarCreator(vmi *v1.VirtualMachineInstance, kvc *v1.KubeVirtConfiguration) (hooks.HookSidecarList, error) {
 	return []hooks.HookSidecar{testHookSidecar}, nil
 }
-
-var _ = Describe("getResourceNameForNetwork", func() {
-	It("should return empty string when resource name is not specified", func() {
-		network := &networkv1.NetworkAttachmentDefinition{}
-		Expect(getResourceNameForNetwork(network)).To(Equal(""))
-	})
-
-	It("should return resource name if specified", func() {
-		network := &networkv1.NetworkAttachmentDefinition{
-			ObjectMeta: metav1.ObjectMeta{
-				Annotations: map[string]string{
-					MULTUS_RESOURCE_NAME_ANNOTATION: "fake.com/fakeResource",
-				},
-			},
-		}
-		Expect(getResourceNameForNetwork(network)).To(Equal("fake.com/fakeResource"))
-	})
-})
-
-var _ = Describe("getNamespaceAndNetworkName", func() {
-	It("should return vmi namespace when namespace is implicit", func() {
-		vmi := &v1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Name: "testvmi", Namespace: "testns"}}
-		namespace, networkName := getNamespaceAndNetworkName(vmi.Namespace, "testnet")
-		Expect(namespace).To(Equal("testns"))
-		Expect(networkName).To(Equal("testnet"))
-	})
-
-	It("should return namespace from networkName when namespace is explicit", func() {
-		vmi := &v1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Name: "testvmi", Namespace: "testns"}}
-		namespace, networkName := getNamespaceAndNetworkName(vmi.Namespace, "otherns/testnet")
-		Expect(namespace).To(Equal("otherns"))
-		Expect(networkName).To(Equal("testnet"))
-	})
-})
 
 var _ = Describe("requestResource", func() {
 	It("should register resource in limits and requests", func() {
@@ -5018,4 +5232,32 @@ func validateAndExtractQemuTimeoutArg(args []string) string {
 	Expect(failMsg).To(Equal(""))
 
 	return timeoutString
+}
+
+type stubNetBindingPluginMemoryCalculator struct {
+	calculatedMemoryOverhead bool
+}
+
+func (smc *stubNetBindingPluginMemoryCalculator) Calculate(_ *v1.VirtualMachineInstance, _ map[string]v1.InterfaceBindingPlugin) resource.Quantity {
+	smc.calculatedMemoryOverhead = true
+
+	return resource.Quantity{}
+}
+
+type stubAnnotationsGenerator struct {
+	annotations   map[string]string
+	generationErr error
+}
+
+func (sag stubAnnotationsGenerator) Generate(_ *v1.VirtualMachineInstance) (map[string]string, error) {
+	return sag.annotations, sag.generationErr
+}
+
+type stubTargetAnnotationsGenerator struct {
+	annotations   map[string]string
+	generationErr error
+}
+
+func (stag stubTargetAnnotationsGenerator) GenerateFromSource(_ *v1.VirtualMachineInstance, _ *k8sv1.Pod) (map[string]string, error) {
+	return stag.annotations, stag.generationErr
 }

@@ -186,8 +186,11 @@ var _ = Describe("netpod", func() {
 	},
 		Entry("bridge", v1.InterfaceBindingMethod{Bridge: &v1.InterfaceBridge{}}),
 		Entry("masquerade", v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}}),
-		Entry("passt", v1.InterfaceBindingMethod{Passt: &v1.InterfacePasst{}}),
-		Entry("slirp", v1.InterfaceBindingMethod{Slirp: &v1.InterfaceSlirp{}}),
+
+		// passt is removed in v1.3. This scenario is tracking old VMIs that are still processed in the reconcile loop.
+		Entry("passt", v1.InterfaceBindingMethod{DeprecatedPasst: &v1.DeprecatedInterfacePasst{}}),
+		// SLIRP is removed in v1.3. This scenario is tracking old VMIs that are still processed in the reconcile loop.
+		Entry("slirp", v1.InterfaceBindingMethod{DeprecatedSlirp: &v1.DeprecatedInterfaceSlirp{}}),
 	)
 
 	It("setup masquerade binding", func() {
@@ -328,6 +331,12 @@ var _ = Describe("netpod", func() {
 					NextHopAddress:   defaultGatewayIP4Address,
 					TableID:          0,
 				},
+				// Static route to a wider subnet containing the local subnet
+				{
+					Destination:      "10.222.0.0/16",
+					NextHopInterface: "eth0",
+					TableID:          0,
+				},
 			}},
 		}}
 
@@ -362,6 +371,7 @@ var _ = Describe("netpod", func() {
 						Index:       0,
 						CopyMacFrom: "k6t-eth0",
 						Controller:  "k6t-eth0",
+						State:       nmstate.IfaceStateUp,
 						IPv4:        ipDisabled,
 						IPv6:        ipDisabled,
 						LinuxStack:  nmstate.LinuxIfaceStack{PortLearning: pointer.P(false)},
@@ -377,9 +387,10 @@ var _ = Describe("netpod", func() {
 						Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: defaultPodNetworkName},
 					},
 					{
-						Name:     "eth0",
-						TypeName: nmstate.TypeDummy,
-						MTU:      1500,
+						Name:       "eth0",
+						TypeName:   nmstate.TypeDummy,
+						MacAddress: podIfaceOrignalMAC,
+						MTU:        1500,
 						IPv4: nmstate.IP{
 							Enabled: pointer.P(true),
 							Address: []nmstate.IPAddress{{
@@ -413,6 +424,7 @@ var _ = Describe("netpod", func() {
 			podIfaceOrignalMAC,
 			defaultGatewayIP4Address,
 			"192.168.1.0/24",
+			"10.222.0.0/16",
 		)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(cache.ReadDHCPInterfaceCache(&baseCacheCreator, "0", "eth0")).To(Equal(expDHCPConfig))
@@ -469,6 +481,7 @@ var _ = Describe("netpod", func() {
 						Index:       0,
 						CopyMacFrom: "k6t-eth0",
 						Controller:  "k6t-eth0",
+						State:       nmstate.IfaceStateUp,
 						IPv4:        ipDisabled,
 						IPv6:        ipDisabled,
 						LinuxStack:  nmstate.LinuxIfaceStack{PortLearning: pointer.P(false)},
@@ -484,10 +497,11 @@ var _ = Describe("netpod", func() {
 						Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: defaultPodNetworkName},
 					},
 					{
-						Name:     "eth0",
-						TypeName: nmstate.TypeDummy,
-						MTU:      1500,
-						IPv4:     ipDisabled,
+						Name:       "eth0",
+						TypeName:   nmstate.TypeDummy,
+						MacAddress: podIfaceOrignalMAC,
+						MTU:        1500,
+						IPv4:       ipDisabled,
 						IPv6: nmstate.IP{
 							Enabled: pointer.P(true),
 							Address: []nmstate.IPAddress{{
@@ -522,6 +536,8 @@ var _ = Describe("netpod", func() {
 			secondaryNetworkName = "secondnetwork"
 
 			hotplugEnabled = true
+
+			secondaryPodIfaceOrignalMAC = "12:34:56:78:90:cd"
 		)
 		var (
 			specNetworks   []v1.Network
@@ -561,7 +577,7 @@ var _ = Describe("netpod", func() {
 						Index:      secondaryPodInterfaceIndex,
 						TypeName:   nmstate.TypeVETH,
 						State:      nmstate.IfaceStateUp,
-						MacAddress: "12:34:56:78:90:cd",
+						MacAddress: secondaryPodIfaceOrignalMAC,
 						MTU:        1500,
 						IPv4:       ipDisabled,
 						IPv6:       ipDisabled,
@@ -674,6 +690,7 @@ var _ = Describe("netpod", func() {
 							Index:       secondaryPodInterfaceIndex,
 							CopyMacFrom: "k6t-914f438d88d",
 							Controller:  "k6t-914f438d88d",
+							State:       nmstate.IfaceStateUp,
 							IPv4:        ipDisabled,
 							IPv6:        ipDisabled,
 							LinuxStack:  nmstate.LinuxIfaceStack{PortLearning: pointer.P(false)},
@@ -689,12 +706,13 @@ var _ = Describe("netpod", func() {
 							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: secondaryNetworkName},
 						},
 						{
-							Name:     secondaryPodInterfaceName,
-							TypeName: nmstate.TypeDummy,
-							MTU:      1500,
-							IPv4:     ipDisabled,
-							IPv6:     ipDisabled,
-							Metadata: &nmstate.IfaceMetadata{Pid: 0, NetworkName: secondaryNetworkName},
+							Name:       secondaryPodInterfaceName,
+							TypeName:   nmstate.TypeDummy,
+							MacAddress: secondaryPodIfaceOrignalMAC,
+							MTU:        1500,
+							IPv4:       ipDisabled,
+							IPv6:       ipDisabled,
+							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: secondaryNetworkName},
 						},
 					},
 					LinuxStack: nmstate.LinuxStack{
@@ -779,13 +797,14 @@ var _ = Describe("netpod", func() {
 							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: secondaryNetworkName},
 						},
 						{
-							Name:     secondaryPodInterfaceName,
-							TypeName: nmstate.TypeDummy,
-							State:    nmstate.IfaceStateAbsent,
-							MTU:      1500,
-							IPv4:     ipDisabled,
-							IPv6:     ipDisabled,
-							Metadata: &nmstate.IfaceMetadata{Pid: 0, NetworkName: secondaryNetworkName},
+							Name:       secondaryPodInterfaceName,
+							TypeName:   nmstate.TypeDummy,
+							MacAddress: secondaryPodIfaceOrignalMAC,
+							State:      nmstate.IfaceStateAbsent,
+							MTU:        1500,
+							IPv4:       ipDisabled,
+							IPv6:       ipDisabled,
+							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: secondaryNetworkName},
 						},
 					},
 					LinuxStack: nmstate.LinuxStack{
@@ -854,6 +873,7 @@ var _ = Describe("netpod", func() {
 							Index:       secondaryPodInterfaceIndex,
 							CopyMacFrom: "k6t-net1",
 							Controller:  "k6t-net1",
+							State:       nmstate.IfaceStateUp,
 							IPv4:        ipDisabled,
 							IPv6:        ipDisabled,
 							LinuxStack:  nmstate.LinuxIfaceStack{PortLearning: pointer.P(false)},
@@ -869,12 +889,13 @@ var _ = Describe("netpod", func() {
 							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: secondaryNetworkName},
 						},
 						{
-							Name:     secondaryPodInterfaceOrderedName,
-							TypeName: nmstate.TypeDummy,
-							MTU:      1500,
-							IPv4:     ipDisabled,
-							IPv6:     ipDisabled,
-							Metadata: &nmstate.IfaceMetadata{Pid: 0, NetworkName: secondaryNetworkName},
+							Name:       secondaryPodInterfaceOrderedName,
+							TypeName:   nmstate.TypeDummy,
+							MacAddress: secondaryPodIfaceOrignalMAC,
+							MTU:        1500,
+							IPv4:       ipDisabled,
+							IPv6:       ipDisabled,
+							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: secondaryNetworkName},
 						},
 					},
 					LinuxStack: nmstate.LinuxStack{
@@ -917,7 +938,7 @@ var _ = Describe("netpod", func() {
 
 		vmiIface := v1.Interface{
 			Name:                   defaultPodNetworkName,
-			InterfaceBindingMethod: v1.InterfaceBindingMethod{Passt: &v1.InterfacePasst{}},
+			InterfaceBindingMethod: v1.InterfaceBindingMethod{DeprecatedPasst: &v1.DeprecatedInterfacePasst{}},
 		}
 		netPod := netpod.NewNetPod(
 			[]v1.Network{*v1.DefaultPodNetwork()},
@@ -973,11 +994,15 @@ var _ = Describe("netpod", func() {
 	},
 		// Not processed by the discovery & config steps.
 		Entry("SR-IOV", v1.InterfaceBindingMethod{SRIOV: &v1.InterfaceSRIOV{}}, nmstate.Spec{}),
-		Entry("Macvtap", v1.InterfaceBindingMethod{Macvtap: &v1.InterfaceMacvtap{}}, nmstate.Spec{}),
+
+		// Macvtap is removed in v1.3. This scenario is tracking old VMIs that are still processed in the reconcile loop.
+		Entry("Macvtap", v1.InterfaceBindingMethod{DeprecatedMacvtap: &v1.DeprecatedInterfaceMacvtap{}}, nmstate.Spec{}),
+
+		// SLIRP is removed in v1.3. This scenario is tracking old VMIs that are still processed in the reconcile loop.
 		// Processed by the discovery but not by the config step.
 		// When processed by the config step, the nmstate structure will be initialized (e.g. to an empty interface list).
 		// Interfaces will not get populated because the specific binding (slirp) is not treated there.
-		Entry("Slirp", v1.InterfaceBindingMethod{Slirp: &v1.InterfaceSlirp{}}, nmstate.Spec{Interfaces: []nmstate.Interface{}}),
+		Entry("Slirp", v1.InterfaceBindingMethod{DeprecatedSlirp: &v1.DeprecatedInterfaceSlirp{}}, nmstate.Spec{Interfaces: []nmstate.Interface{}}),
 	)
 
 	Context("setup with plugged networks marked for removal", func() {
@@ -1109,11 +1134,12 @@ var _ = Describe("netpod", func() {
 							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet1},
 						},
 						{
-							Name:     "pod7087ef4cd1f",
-							TypeName: nmstate.TypeDummy,
-							State:    nmstate.IfaceStateAbsent,
-							MTU:      1500,
-							Metadata: &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet1},
+							Name:       "pod7087ef4cd1f",
+							TypeName:   nmstate.TypeDummy,
+							State:      nmstate.IfaceStateAbsent,
+							MacAddress: "22:34:56:78:90:ab",
+							MTU:        1500,
+							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet1},
 						},
 						// Third network.
 						{
@@ -1127,6 +1153,7 @@ var _ = Describe("netpod", func() {
 							Name:        "bc6cc93fa1e-nic",
 							CopyMacFrom: "k6t-bc6cc93fa1e",
 							Controller:  "k6t-bc6cc93fa1e",
+							State:       nmstate.IfaceStateUp,
 							IPv4:        ipDisabled,
 							IPv6:        ipDisabled,
 							LinuxStack:  nmstate.LinuxIfaceStack{PortLearning: pointer.P(false)},
@@ -1142,10 +1169,11 @@ var _ = Describe("netpod", func() {
 							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet2},
 						},
 						{
-							Name:     "podbc6cc93fa1e",
-							TypeName: nmstate.TypeDummy,
-							MTU:      1500,
-							Metadata: &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet2},
+							Name:       "podbc6cc93fa1e",
+							TypeName:   nmstate.TypeDummy,
+							MacAddress: "32:34:56:78:90:ab",
+							MTU:        1500,
+							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet2},
 						},
 					},
 					LinuxStack: nmstate.LinuxStack{},
@@ -1221,11 +1249,12 @@ var _ = Describe("netpod", func() {
 							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet1},
 						},
 						{
-							Name:     "pod7087ef4cd1f",
-							TypeName: nmstate.TypeDummy,
-							State:    nmstate.IfaceStateAbsent,
-							MTU:      1500,
-							Metadata: &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet1},
+							Name:       "pod7087ef4cd1f",
+							TypeName:   nmstate.TypeDummy,
+							State:      nmstate.IfaceStateAbsent,
+							MacAddress: "22:34:56:78:90:ab",
+							MTU:        1500,
+							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet1},
 						},
 						// Third network.
 						{
@@ -1245,11 +1274,12 @@ var _ = Describe("netpod", func() {
 							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet2},
 						},
 						{
-							Name:     "podbc6cc93fa1e",
-							TypeName: nmstate.TypeDummy,
-							State:    nmstate.IfaceStateAbsent,
-							MTU:      1500,
-							Metadata: &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet2},
+							Name:       "podbc6cc93fa1e",
+							TypeName:   nmstate.TypeDummy,
+							State:      nmstate.IfaceStateAbsent,
+							MacAddress: "32:34:56:78:90:ab",
+							MTU:        1500,
+							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet2},
 						},
 					},
 					LinuxStack: nmstate.LinuxStack{},
@@ -1327,6 +1357,7 @@ var _ = Describe("netpod", func() {
 							Name:        "7087ef4cd1f-nic",
 							CopyMacFrom: "k6t-7087ef4cd1f",
 							Controller:  "k6t-7087ef4cd1f",
+							State:       nmstate.IfaceStateUp,
 							IPv4:        ipDisabled,
 							IPv6:        ipDisabled,
 							LinuxStack:  nmstate.LinuxIfaceStack{PortLearning: pointer.P(false)},
@@ -1342,10 +1373,11 @@ var _ = Describe("netpod", func() {
 							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet1},
 						},
 						{
-							Name:     "pod7087ef4cd1f",
-							TypeName: nmstate.TypeDummy,
-							MTU:      1500,
-							Metadata: &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet1},
+							Name:       "pod7087ef4cd1f",
+							TypeName:   nmstate.TypeDummy,
+							MacAddress: "22:34:56:78:90:ab",
+							MTU:        1500,
+							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet1},
 						},
 						// Third network.
 						{
@@ -1365,11 +1397,12 @@ var _ = Describe("netpod", func() {
 							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet2},
 						},
 						{
-							Name:     "podbc6cc93fa1e",
-							TypeName: nmstate.TypeDummy,
-							State:    nmstate.IfaceStateAbsent,
-							MTU:      1500,
-							Metadata: &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet2},
+							Name:       "podbc6cc93fa1e",
+							TypeName:   nmstate.TypeDummy,
+							State:      nmstate.IfaceStateAbsent,
+							MacAddress: "32:34:56:78:90:ab",
+							MTU:        1500,
+							Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet2},
 						},
 					},
 					LinuxStack: nmstate.LinuxStack{},
@@ -1523,6 +1556,7 @@ var _ = Describe("netpod", func() {
 						Name:        "7087ef4cd1f-nic",
 						CopyMacFrom: "k6t-7087ef4cd1f",
 						Controller:  "k6t-7087ef4cd1f",
+						State:       nmstate.IfaceStateUp,
 						IPv4:        ipDisabled,
 						IPv6:        ipDisabled,
 						LinuxStack:  nmstate.LinuxIfaceStack{PortLearning: pointer.P(false)},
@@ -1538,10 +1572,11 @@ var _ = Describe("netpod", func() {
 						Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet1},
 					},
 					{
-						Name:     "pod7087ef4cd1f",
-						TypeName: nmstate.TypeDummy,
-						MTU:      1500,
-						Metadata: &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet1},
+						Name:       "pod7087ef4cd1f",
+						TypeName:   nmstate.TypeDummy,
+						MacAddress: "22:34:56:78:90:ab",
+						MTU:        1500,
+						Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet1},
 					},
 					// Third network.
 					{
@@ -1561,11 +1596,12 @@ var _ = Describe("netpod", func() {
 						Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet2},
 					},
 					{
-						Name:     "podbc6cc93fa1e",
-						TypeName: nmstate.TypeDummy,
-						State:    nmstate.IfaceStateAbsent,
-						MTU:      1500,
-						Metadata: &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet2},
+						Name:       "podbc6cc93fa1e",
+						TypeName:   nmstate.TypeDummy,
+						State:      nmstate.IfaceStateAbsent,
+						MacAddress: "32:34:56:78:90:ab",
+						MTU:        1500,
+						Metadata:   &nmstate.IfaceMetadata{Pid: 0, NetworkName: testNet2},
 					},
 				},
 				LinuxStack: nmstate.LinuxStack{},
@@ -1646,7 +1682,7 @@ func (c *tempCacheCreator) New(filePath string) *cache.Cache {
 	return cache.NewCustomCache(filePath, kfs.NewWithRootPath(c.tmpDir))
 }
 
-func expectedDHCPConfig(podIfaceCIDR, podIfaceMAC, defaultGW, staticRouteDst string) (*cache.DHCPConfig, error) {
+func expectedDHCPConfig(podIfaceCIDR, podIfaceMAC, defaultGW, staticRouteDst, staticRouteToWiderSubnet string) (*cache.DHCPConfig, error) {
 	ipv4, err := vishnetlink.ParseAddr(podIfaceCIDR)
 	if err != nil {
 		return nil, err
@@ -1659,9 +1695,16 @@ func expectedDHCPConfig(podIfaceCIDR, podIfaceMAC, defaultGW, staticRouteDst str
 	if err != nil {
 		return nil, err
 	}
+
+	staticRouteToWiderSubnetDest, err := vishnetlink.ParseAddr(staticRouteToWiderSubnet)
+	if err != nil {
+		return nil, err
+	}
+
 	routes := []vishnetlink.Route{
 		{Gw: net.ParseIP(defaultGW)},
 		{Dst: destAddr.IPNet, Gw: net.ParseIP(defaultGW)},
+		{Dst: staticRouteToWiderSubnetDest.IPNet, Gw: nil},
 	}
 	return &cache.DHCPConfig{
 		IP:           *ipv4,

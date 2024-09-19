@@ -33,8 +33,8 @@ import (
 	"strings"
 	"time"
 
+	pb "github.com/cheggaaa/pb/v3"
 	"github.com/spf13/cobra"
-	pb "gopkg.in/cheggaaa/pb.v1"
 	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -51,6 +51,7 @@ import (
 
 	instancetypeapi "kubevirt.io/api/instancetype"
 
+	"kubevirt.io/kubevirt/pkg/apimachinery/patch"
 	storagetypes "kubevirt.io/kubevirt/pkg/storage/types"
 	"kubevirt.io/kubevirt/pkg/util"
 	"kubevirt.io/kubevirt/pkg/virtctl/templates"
@@ -76,10 +77,10 @@ const (
 	processingWaitTotal    = 24 * time.Hour
 
 	//UploadProxyURIAsync is a URI of the upload proxy, the endpoint is asynchronous
-	UploadProxyURIAsync = "/v1alpha1/upload-async"
+	UploadProxyURIAsync = "/v1beta1/upload-async"
 
 	//UploadProxyURI is a URI of the upload proxy, the endpoint is synchronous for backwards compatibility
-	UploadProxyURI = "/v1alpha1/upload"
+	UploadProxyURI = "/v1beta1/upload"
 
 	configName = "config"
 
@@ -114,6 +115,7 @@ var (
 	noCreate          bool
 	createPVC         bool
 	forceBind         bool
+	dataSource        bool
 	archiveUpload     bool
 )
 
@@ -168,6 +170,7 @@ func NewImageUploadCommand(clientConfig clientcmd.ClientConfig) *cobra.Command {
 	cmd.Flags().BoolVar(&noCreate, "no-create", false, "Don't attempt to create a new DataVolume/PVC.")
 	cmd.Flags().UintVar(&uploadPodWaitSecs, "wait-secs", 300, "Seconds to wait for upload pod to start.")
 	cmd.Flags().BoolVar(&forceBind, "force-bind", false, "Force bind the PVC, ignoring the WaitForFirstConsumer logic.")
+	cmd.Flags().BoolVar(&dataSource, "datasource", false, "Create a DataSource pointing to the created DataVolume/PVC.")
 	cmd.Flags().StringVar(&defaultInstancetype, "default-instancetype", "", "The default instance type to associate with the image.")
 	cmd.Flags().StringVar(&defaultInstancetypeKind, "default-instancetype-kind", "", "The default instance type kind to associate with the image.")
 	cmd.Flags().StringVar(&defaultPreference, "default-preference", "", "The default preference to associate with the image.")
@@ -386,6 +389,12 @@ func (c *command) run(args []string) error {
 		return err
 	}
 
+	if dataSource {
+		if err := handleDataSource(virtClient, name, namespace); err != nil {
+			return err
+		}
+	}
+
 	fmt.Println("Uploading data completed successfully, waiting for processing to complete, you can hit ctrl-c without interrupting the progress")
 	err = UploadProcessingCompleteFunc(virtClient, namespace, name, processingWaitInterval, processingWaitTotal)
 	if err != nil {
@@ -460,7 +469,9 @@ func uploadData(uploadProxyURL, token string, file *os.File, insecure bool) erro
 		return err
 	}
 
-	bar := pb.New64(fi.Size()).SetUnits(pb.U_BYTES)
+	bar := pb.Full.Start64(fi.Size())
+	bar.SetWriter(os.Stdout)
+	bar.Set(pb.Bytes, true)
 	reader := bar.NewProxyReader(file)
 
 	client := httpClientCreatorFunc(insecure)
@@ -611,18 +622,22 @@ func waitUploadProcessingComplete(client kubernetes.Interface, namespace, name s
 	return err
 }
 
-func setDefaultInstancetypeLabels(labels map[string]string) {
+func setDefaultInstancetypeLabels(target metav1.Object) {
+	if target.GetLabels() == nil {
+		target.SetLabels(make(map[string]string))
+	}
+
 	if defaultInstancetype != "" {
-		labels[instancetypeapi.DefaultInstancetypeLabel] = defaultInstancetype
+		target.GetLabels()[instancetypeapi.DefaultInstancetypeLabel] = defaultInstancetype
 	}
 	if defaultInstancetypeKind != "" {
-		labels[instancetypeapi.DefaultInstancetypeKindLabel] = defaultInstancetypeKind
+		target.GetLabels()[instancetypeapi.DefaultInstancetypeKindLabel] = defaultInstancetypeKind
 	}
 	if defaultPreference != "" {
-		labels[instancetypeapi.DefaultPreferenceLabel] = defaultPreference
+		target.GetLabels()[instancetypeapi.DefaultPreferenceLabel] = defaultPreference
 	}
 	if defaultPreferenceKind != "" {
-		labels[instancetypeapi.DefaultPreferenceKindLabel] = defaultPreferenceKind
+		target.GetLabels()[instancetypeapi.DefaultPreferenceKindLabel] = defaultPreferenceKind
 	}
 }
 
@@ -645,9 +660,6 @@ func createUploadDataVolume(client kubecli.KubevirtClient, namespace, name, size
 		annotations[forceImmediateBindingAnnotation] = ""
 	}
 
-	labels := make(map[string]string)
-	setDefaultInstancetypeLabels(labels)
-
 	contentType := cdiv1.DataVolumeKubeVirt
 	if archiveUpload {
 		contentType = cdiv1.DataVolumeArchive
@@ -658,7 +670,6 @@ func createUploadDataVolume(client kubecli.KubevirtClient, namespace, name, size
 			Name:        name,
 			Namespace:   namespace,
 			Annotations: annotations,
-			Labels:      labels,
 		},
 		Spec: cdiv1.DataVolumeSpec{
 			Source: &cdiv1.DataVolumeSource{
@@ -668,6 +679,7 @@ func createUploadDataVolume(client kubecli.KubevirtClient, namespace, name, size
 			Storage:     pvcSpec,
 		},
 	}
+	setDefaultInstancetypeLabels(&dv.ObjectMeta)
 
 	dv, err = client.CdiClient().CdiV1beta1().DataVolumes(namespace).Create(context.Background(), dv, metav1.CreateOptions{})
 	if err != nil {
@@ -752,10 +764,7 @@ func createUploadPVC(client kubecli.KubevirtClient, namespace, name, size, stora
 	}
 
 	pvc.ObjectMeta.Annotations = annotations
-
-	labels := make(map[string]string)
-	setDefaultInstancetypeLabels(labels)
-	pvc.ObjectMeta.Labels = labels
+	setDefaultInstancetypeLabels(&pvc.ObjectMeta)
 
 	pvc, err = client.CoreV1().PersistentVolumeClaims(namespace).Create(context.Background(), pvc, metav1.CreateOptions{})
 	if err != nil {
@@ -923,4 +932,71 @@ func handleEventErrors(client kubecli.KubevirtClient, pvcName, dvName, namespace
 	}
 
 	return nil
+}
+
+func handleDataSource(client kubecli.KubevirtClient, name string, namespace string) error {
+	ds, err := client.CdiClient().CdiV1beta1().DataSources(namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return err
+	}
+
+	if ds != nil {
+		err = updateExistingDataSource(client, name, namespace, ds)
+	} else {
+		err = createNewDataSource(client, name, namespace)
+	}
+	return err
+}
+
+func createNewDataSource(client kubecli.KubevirtClient, name, namespace string) error {
+	ds := &cdiv1.DataSource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    map[string]string{},
+		},
+		Spec: cdiv1.DataSourceSpec{
+			Source: cdiv1.DataSourceSource{
+				PVC: &cdiv1.DataVolumeSourcePVC{
+					Name:      name,
+					Namespace: namespace,
+				},
+			},
+		},
+	}
+	setDefaultInstancetypeLabels(&ds.ObjectMeta)
+
+	_, err := client.CdiClient().CdiV1beta1().DataSources(namespace).Create(context.Background(), ds, metav1.CreateOptions{})
+	if err == nil {
+		fmt.Printf("Created a new DataSource %s/%s\n", namespace, name)
+	}
+	return err
+}
+
+func updateExistingDataSource(client kubecli.KubevirtClient, pvcName, pvcNamespace string, ds *cdiv1.DataSource) error {
+	setDefaultInstancetypeLabels(&ds.ObjectMeta)
+
+	patchBytes, err := patch.GeneratePatchPayload(
+		patch.PatchOperation{
+			Op:    patch.PatchReplaceOp,
+			Path:  "/metadata/labels",
+			Value: ds.Labels,
+		},
+		patch.PatchOperation{
+			Op:   patch.PatchReplaceOp,
+			Path: "/spec/source/pvc",
+			Value: map[string]string{
+				"name":      pvcName,
+				"namespace": pvcNamespace,
+			},
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	if _, err = client.CdiClient().CdiV1beta1().DataSources(ds.Namespace).Patch(context.Background(), ds.Name, types.JSONPatchType, patchBytes, metav1.PatchOptions{}); err == nil {
+		fmt.Printf("Updated an existing DataSource %s/%s\n", ds.Namespace, ds.Name)
+	}
+	return err
 }

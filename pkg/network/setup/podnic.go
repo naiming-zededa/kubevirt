@@ -51,7 +51,7 @@ type podNIC struct {
 	domainGenerator  domainspec.LibvirtSpecGenerator
 }
 
-func newPhase2PodNIC(vmi *v1.VirtualMachineInstance, network *v1.Network, iface *v1.Interface, handler netdriver.NetworkHandler, cacheCreator cacheCreator, domain *api.Domain) (*podNIC, error) {
+func newPhase2PodNIC(vmi *v1.VirtualMachineInstance, network *v1.Network, iface *v1.Interface, handler netdriver.NetworkHandler, cacheCreator cacheCreator, domain *api.Domain, domainAttachment string) (*podNIC, error) {
 	podnic, err := newPodNIC(vmi, network, iface, handler, cacheCreator, nil)
 	if err != nil {
 		return nil, err
@@ -68,7 +68,7 @@ func newPhase2PodNIC(vmi *v1.VirtualMachineInstance, network *v1.Network, iface 
 	}
 
 	podnic.dhcpConfigurator = podnic.newDHCPConfigurator()
-	podnic.domainGenerator = podnic.newLibvirtSpecGenerator(domain)
+	podnic.domainGenerator = podnic.newLibvirtSpecGenerator(domain, domainAttachment)
 
 	return podnic, nil
 }
@@ -135,25 +135,9 @@ func (l *podNIC) newDHCPConfigurator() dhcpconfigurator.Configurator {
 	return dhcpConfigurator
 }
 
-func (l *podNIC) newLibvirtSpecGenerator(domain *api.Domain) domainspec.LibvirtSpecGenerator {
-	if l.vmiSpecIface.Bridge != nil {
-		cachedDomainIface, err := l.cachedDomainInterface()
-		if err != nil {
-			return nil
-		}
-		if cachedDomainIface == nil {
-			cachedDomainIface = &api.Interface{}
-		}
-		return domainspec.NewBridgeLibvirtSpecGenerator(l.vmiSpecIface, domain, *cachedDomainIface, l.podInterfaceName, l.handler)
-	}
-	if l.vmiSpecIface.Masquerade != nil {
-		return domainspec.NewMasqueradeLibvirtSpecGenerator(l.vmiSpecIface, l.vmiSpecNetwork, domain, l.podInterfaceName, l.handler)
-	}
-	if l.vmiSpecIface.Macvtap != nil {
-		return domainspec.NewMacvtapLibvirtSpecGenerator(l.vmiSpecIface, domain, l.podInterfaceName, l.handler)
-	}
-	if l.vmiSpecIface.Passt != nil {
-		return domainspec.NewPasstLibvirtSpecGenerator(l.vmiSpecIface, domain, l.podInterfaceName, l.vmi)
+func (l *podNIC) newLibvirtSpecGenerator(domain *api.Domain, domainAttachment string) domainspec.LibvirtSpecGenerator {
+	if domainAttachment == string(v1.Tap) {
+		return domainspec.NewTapLibvirtSpecGenerator(l.vmiSpecIface, domain, l.podInterfaceName, l.handler)
 	}
 	return nil
 }

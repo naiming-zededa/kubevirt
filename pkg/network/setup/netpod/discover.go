@@ -63,6 +63,8 @@ func (n NetPod) discover(currentStatus *nmstate.Status) error {
 				return err
 			}
 
+			// This cache is no longer used by vit-launcher, the dummy interface is used instead to store the data.
+			// It is kept here for backward compatibility.
 			if err := n.storeBridgeDomainInterfaceData(podIfaceStatus, vmiSpecIface); err != nil {
 				return err
 			}
@@ -76,7 +78,8 @@ func (n NetPod) discover(currentStatus *nmstate.Status) error {
 				return err
 			}
 
-		case vmiSpecIface.Passt != nil:
+		// passt is removed in v1.3. This scenario is tracking old VMIs that are still processed in the reconcile loop.
+		case vmiSpecIface.DeprecatedPasst != nil:
 			if !podIfaceExists {
 				return fmt.Errorf("pod link (%s) is missing", podIfaceName)
 			}
@@ -85,18 +88,27 @@ func (n NetPod) discover(currentStatus *nmstate.Status) error {
 				return err
 			}
 
-		case vmiSpecIface.Slirp != nil:
+		// SLIRP is removed in v1.3. This scenario is tracking old VMIs that are still processed in the reconcile loop.
+		case vmiSpecIface.DeprecatedSlirp != nil:
 			if !podIfaceExists {
 				return fmt.Errorf("pod link (%s) is missing", podIfaceName)
 			}
 
 			if err := n.storePodInterfaceData(vmiSpecIface, podIfaceStatus); err != nil {
 				return err
+			}
+
+		case vmiSpecIface.Binding != nil:
+			// The existence of the pod interface depends on the network binding plugin implementation
+			if podIfaceExists {
+				if err := n.storePodInterfaceData(vmiSpecIface, podIfaceStatus); err != nil {
+					return err
+				}
 			}
 
 		// Skip the discovery for all other known network interface bindings.
-		case vmiSpecIface.Binding != nil:
-		case vmiSpecIface.Macvtap != nil:
+		// Macvtap is removed in v1.3. This scenario is tracking old VMIs that are still processed in the reconcile loop.
+		case vmiSpecIface.DeprecatedMacvtap != nil:
 		case vmiSpecIface.SRIOV != nil:
 		default:
 			return fmt.Errorf("undefined binding method: %v", vmiSpecIface)

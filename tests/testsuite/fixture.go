@@ -25,14 +25,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"kubevirt.io/kubevirt/tests/framework/matcher"
-
-	"kubevirt.io/kubevirt/tests/framework/kubevirt"
-
-	"k8s.io/apimachinery/pkg/api/errors"
-
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	"k8s.io/apimachinery/pkg/api/errors"
 
 	k8sv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -42,10 +38,15 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/log"
 
+	"kubevirt.io/kubevirt/pkg/libvmi"
 	"kubevirt.io/kubevirt/pkg/virt-controller/services"
 	"kubevirt.io/kubevirt/tests/flags"
+	"kubevirt.io/kubevirt/tests/framework/kubevirt"
+	"kubevirt.io/kubevirt/tests/framework/matcher"
+	"kubevirt.io/kubevirt/tests/libkubevirt"
 	"kubevirt.io/kubevirt/tests/libnode"
 	"kubevirt.io/kubevirt/tests/libstorage"
+	"kubevirt.io/kubevirt/tests/libvmifact"
 	"kubevirt.io/kubevirt/tests/util"
 )
 
@@ -99,6 +100,13 @@ func SynchronizedBeforeTestSetup() []byte {
 	return nil
 }
 
+func addTestAnnotation(vmi *v1.VirtualMachineInstance) {
+	if vmi.Annotations == nil {
+		vmi.Annotations = map[string]string{}
+	}
+	vmi.Annotations["kubevirt.io/created-by-test"] = GinkgoT().Name()
+}
+
 func BeforeTestSuiteSetup(_ []byte) {
 
 	worker := GinkgoParallelProcess()
@@ -134,6 +142,9 @@ func BeforeTestSuiteSetup(_ []byte) {
 
 	SetDefaultEventuallyTimeout(defaultEventuallyTimeout)
 	SetDefaultEventuallyPollingInterval(defaultEventuallyPollingInterval)
+
+	libvmifact.RegisterArchitecture(Arch)
+	libvmi.RegisterDefaultOption(addTestAnnotation)
 }
 
 func EnsureKubevirtReady() {
@@ -142,14 +153,14 @@ func EnsureKubevirtReady() {
 
 func EnsureKubevirtReadyWithTimeout(timeout time.Duration) {
 	virtClient := kubevirt.Client()
-	kv := util.GetCurrentKv(virtClient)
+	kv := libkubevirt.GetCurrentKv(virtClient)
 
 	Eventually(matcher.ThisDeploymentWith(flags.KubeVirtInstallNamespace, "virt-operator"), 180*time.Second, 1*time.Second).
 		Should(matcher.HaveReadyReplicasNumerically(">", 0),
 			"virt-operator deployment is not ready")
 
 	Eventually(func() *v1.KubeVirt {
-		kv, err := virtClient.KubeVirt(kv.Namespace).Get(kv.Name, &metav1.GetOptions{})
+		kv, err := virtClient.KubeVirt(kv.Namespace).Get(context.Background(), kv.Name, metav1.GetOptions{})
 		Expect(err).ToNot(HaveOccurred())
 		return kv
 	}, timeout, 1*time.Second).Should(

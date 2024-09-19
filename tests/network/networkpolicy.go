@@ -14,8 +14,6 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"kubevirt.io/kubevirt/tests/util"
-
 	corev1 "k8s.io/api/core/v1"
 	networkv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -25,10 +23,10 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
 
-	"kubevirt.io/kubevirt/tests"
 	"kubevirt.io/kubevirt/tests/console"
 	"kubevirt.io/kubevirt/tests/libnet"
-	"kubevirt.io/kubevirt/tests/libvmi"
+	"kubevirt.io/kubevirt/tests/libnet/vmnetserver"
+	"kubevirt.io/kubevirt/tests/libvmifact"
 	"kubevirt.io/kubevirt/tests/libwait"
 	"kubevirt.io/kubevirt/tests/testsuite"
 )
@@ -52,7 +50,7 @@ var _ = SIGDescribe("[rfe_id:150][crit:high][vendor:cnv-qe@redhat.com][level:com
 
 		BeforeEach(func() {
 			var err error
-			serverVMI, err = createServerVmi(virtClient, util.NamespaceTestDefault, serverVMILabels)
+			serverVMI, err = createServerVmi(virtClient, testsuite.NamespaceTestDefault, serverVMILabels)
 			Expect(err).ToNot(HaveOccurred())
 			assertIPsNotEmptyForVMI(serverVMI)
 		})
@@ -64,7 +62,7 @@ var _ = SIGDescribe("[rfe_id:150][crit:high][vendor:cnv-qe@redhat.com][level:com
 				var err error
 				// deny-by-default networkpolicy will deny all the traffic to the vms in the namespace
 				policy = createNetworkPolicy(serverVMI.Namespace, "deny-by-default", metav1.LabelSelector{}, []networkv1.NetworkPolicyIngressRule{})
-				clientVMI, err = createClientVmi(util.NamespaceTestDefault, virtClient)
+				clientVMI, err = createClientVmi(testsuite.NamespaceTestDefault, virtClient)
 				Expect(err).ToNot(HaveOccurred())
 				assertIPsNotEmptyForVMI(clientVMI)
 			})
@@ -116,7 +114,7 @@ var _ = SIGDescribe("[rfe_id:150][crit:high][vendor:cnv-qe@redhat.com][level:com
 
 				BeforeEach(func() {
 					var err error
-					clientVMI, err = createClientVmi(util.NamespaceTestDefault, virtClient)
+					clientVMI, err = createClientVmi(testsuite.NamespaceTestDefault, virtClient)
 					Expect(err).ToNot(HaveOccurred())
 					assertIPsNotEmptyForVMI(clientVMI)
 				})
@@ -186,7 +184,7 @@ var _ = SIGDescribe("[rfe_id:150][crit:high][vendor:cnv-qe@redhat.com][level:com
 			When("client vmi is on default namespace", func() {
 				BeforeEach(func() {
 					var err error
-					clientVMI, err = createClientVmi(util.NamespaceTestDefault, virtClient)
+					clientVMI, err = createClientVmi(testsuite.NamespaceTestDefault, virtClient)
 					Expect(err).ToNot(HaveOccurred())
 					assertIPsNotEmptyForVMI(clientVMI)
 				})
@@ -233,7 +231,7 @@ var _ = SIGDescribe("[rfe_id:150][crit:high][vendor:cnv-qe@redhat.com][level:com
 				)
 
 				var err error
-				clientVMI, err = createClientVmi(util.NamespaceTestDefault, virtClient)
+				clientVMI, err = createClientVmi(testsuite.NamespaceTestDefault, virtClient)
 				Expect(err).ToNot(HaveOccurred())
 				assertIPsNotEmptyForVMI(clientVMI)
 			})
@@ -262,7 +260,7 @@ var _ = SIGDescribe("[rfe_id:150][crit:high][vendor:cnv-qe@redhat.com][level:com
 				)
 
 				var err error
-				clientVMI, err = createClientVmi(util.NamespaceTestDefault, virtClient)
+				clientVMI, err = createClientVmi(testsuite.NamespaceTestDefault, virtClient)
 				Expect(err).ToNot(HaveOccurred())
 				assertIPsNotEmptyForVMI(clientVMI)
 			})
@@ -397,9 +395,9 @@ func assertIPsNotEmptyForVMI(vmi *v1.VirtualMachineInstance) {
 }
 
 func createClientVmi(namespace string, virtClient kubecli.KubevirtClient) (*v1.VirtualMachineInstance, error) {
-	clientVMI := libvmi.NewAlpineWithTestTooling(libvmi.WithMasqueradeNetworking()...)
+	clientVMI := libvmifact.NewAlpineWithTestTooling(libnet.WithMasqueradeNetworking())
 	var err error
-	clientVMI, err = virtClient.VirtualMachineInstance(namespace).Create(context.Background(), clientVMI)
+	clientVMI, err = virtClient.VirtualMachineInstance(namespace).Create(context.Background(), clientVMI, metav1.CreateOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -409,8 +407,8 @@ func createClientVmi(namespace string, virtClient kubecli.KubevirtClient) (*v1.V
 }
 
 func createServerVmi(virtClient kubecli.KubevirtClient, namespace string, serverVMILabels map[string]string) (*v1.VirtualMachineInstance, error) {
-	serverVMI := libvmi.NewAlpineWithTestTooling(
-		libvmi.WithMasqueradeNetworking(
+	serverVMI := libvmifact.NewAlpineWithTestTooling(
+		libnet.WithMasqueradeNetworking(
 			v1.Port{
 				Name:     "http80",
 				Port:     80,
@@ -421,18 +419,18 @@ func createServerVmi(virtClient kubecli.KubevirtClient, namespace string, server
 				Port:     81,
 				Protocol: "TCP",
 			},
-		)...,
+		),
 	)
 	serverVMI.Labels = serverVMILabels
-	serverVMI, err := virtClient.VirtualMachineInstance(namespace).Create(context.Background(), serverVMI)
+	serverVMI, err := virtClient.VirtualMachineInstance(namespace).Create(context.Background(), serverVMI, metav1.CreateOptions{})
 	if err != nil {
 		return nil, err
 	}
 	serverVMI = libwait.WaitUntilVMIReady(serverVMI, console.LoginToAlpine)
 
 	By("Start HTTP server at serverVMI on ports 80 and 81")
-	tests.HTTPServer.Start(serverVMI, 80)
-	tests.HTTPServer.Start(serverVMI, 81)
+	vmnetserver.HTTPServer.Start(serverVMI, 80)
+	vmnetserver.HTTPServer.Start(serverVMI, 81)
 
 	return serverVMI, nil
 }

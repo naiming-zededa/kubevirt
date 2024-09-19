@@ -70,12 +70,12 @@ import (
 	"kubevirt.io/kubevirt/pkg/certificates/bootstrap"
 	containerdisk "kubevirt.io/kubevirt/pkg/container-disk"
 	"kubevirt.io/kubevirt/pkg/controller"
-	inotifyinformer "kubevirt.io/kubevirt/pkg/inotify-informer"
-	_ "kubevirt.io/kubevirt/pkg/monitoring/client/prometheus"               // import for prometheus metrics
-	promdomain "kubevirt.io/kubevirt/pkg/monitoring/domainstats/prometheus" // import for prometheus metrics
+	clientmetrics "kubevirt.io/kubevirt/pkg/monitoring/metrics/common/client"
+	metrics "kubevirt.io/kubevirt/pkg/monitoring/metrics/virt-handler"
+	metricshandler "kubevirt.io/kubevirt/pkg/monitoring/metrics/virt-handler/handler"
 	"kubevirt.io/kubevirt/pkg/monitoring/profiler"
-	_ "kubevirt.io/kubevirt/pkg/monitoring/reflector/prometheus" // import for prometheus metrics
-	_ "kubevirt.io/kubevirt/pkg/monitoring/workqueue/prometheus" // import for prometheus metrics
+	"kubevirt.io/kubevirt/pkg/network/netbinding"
+	netsetup "kubevirt.io/kubevirt/pkg/network/setup"
 	"kubevirt.io/kubevirt/pkg/service"
 	"kubevirt.io/kubevirt/pkg/util"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
@@ -88,8 +88,6 @@ import (
 	nodelabeller "kubevirt.io/kubevirt/pkg/virt-handler/node-labeller"
 	"kubevirt.io/kubevirt/pkg/virt-handler/rest"
 	"kubevirt.io/kubevirt/pkg/virt-handler/selinux"
-	virt_api "kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
-	"kubevirt.io/kubevirt/pkg/watchdog"
 )
 
 const (
@@ -126,9 +124,6 @@ const (
 	defaultClientKeyFilePath  = "/etc/virt-handler/clientcertificates/tls.key"
 	defaultTlsCertFilePath    = "/etc/virt-handler/servercertificates/tls.crt"
 	defaultTlsKeyFilePath     = "/etc/virt-handler/servercertificates/tls.key"
-
-	// Default network-status downward API file path
-	defaultNetworkStatusFilePath = "/etc/podinfo/network-status"
 )
 
 type virtHandlerApp struct {
@@ -220,6 +215,7 @@ func (app *virtHandlerApp) Run() {
 	}
 
 	app.reloadableRateLimiter = ratelimiter.NewReloadableRateLimiter(flowcontrol.NewTokenBucketRateLimiter(virtconfig.DefaultVirtHandlerQPS, virtconfig.DefaultVirtHandlerBurst))
+	clientmetrics.RegisterRestConfigHooks()
 	clientConfig, err := kubecli.GetKubevirtClientConfig()
 	if err != nil {
 		panic(err)
@@ -261,19 +257,7 @@ func (app *virtHandlerApp) Run() {
 	vmiTargetInformer := factory.VMITargetHost(app.HostOverride)
 
 	// Wire Domain controller
-	domainSharedInformer, err := virtcache.NewSharedInformer(app.VirtShareDir, int(app.WatchdogTimeoutDuration.Seconds()), recorder, vmiSourceInformer.GetStore(), time.Duration(app.domainResyncPeriodSeconds)*time.Second)
-	if err != nil {
-		panic(err)
-	}
-
-	// Legacy directory for watchdog files
-	err = os.MkdirAll(watchdog.WatchdogFileDirectory(app.VirtShareDir), 0755)
-	if err != nil {
-		panic(err)
-	}
-
-	// Legacy Directory for graceful shutdown trigger files.
-	err = os.MkdirAll(filepath.Join(app.VirtShareDir, "graceful-shutdown-trigger"), 0755)
+	domainSharedInformer := virtcache.NewSharedInformer(app.VirtShareDir, int(app.WatchdogTimeoutDuration.Seconds()), recorder, vmiSourceInformer.GetStore(), time.Duration(app.domainResyncPeriodSeconds)*time.Second)
 	if err != nil {
 		panic(err)
 	}
@@ -287,24 +271,11 @@ func (app *virtHandlerApp) Run() {
 	}
 
 	cmdclient.SetPodsBaseDir("/pods")
-	cmdclient.SetLegacyBaseDir(app.VirtShareDir)
 	containerdisk.SetKubeletPodsDirectory(app.KubeletPodsDir)
-	err = os.MkdirAll(cmdclient.LegacySocketsDirectory(), 0755)
-	if err != nil {
-		panic(err)
-	}
 
 	if err := app.prepareCertManager(); err != nil {
 		glog.Fatalf("Error preparing the certificate manager: %v", err)
 	}
-
-	// Legacy support, Remove this informer once we no longer support
-	// VMIs with graceful shutdown trigger
-	gracefulShutdownInformer := cache.NewSharedIndexInformer(
-		inotifyinformer.NewFileListWatchFromClient(filepath.Join(app.VirtShareDir, "graceful-shutdown-trigger")),
-		&virt_api.Domain{},
-		0,
-		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 
 	podIsolationDetector := isolation.NewSocketBasedIsolationDetector(app.VirtShareDir)
 	app.clusterConfig, err = virtconfig.NewClusterConfig(factory.CRD(), factory.KubeVirt(), app.namespace)
@@ -338,24 +309,23 @@ func (app *virtHandlerApp) Run() {
 	var capabilities *api.Capabilities
 	var hostCpuModel string
 	nodeLabellerrecorder := broadcaster.NewRecorder(scheme.Scheme, k8sv1.EventSource{Component: "node-labeller", Host: app.HostOverride})
-	nodeLabellerController, err := nodelabeller.NewNodeLabeller(app.clusterConfig, app.virtCli, app.HostOverride, app.namespace, nodeLabellerrecorder)
+	nodeLabellerController, err := nodelabeller.NewNodeLabeller(app.clusterConfig, app.virtCli.CoreV1().Nodes(), app.HostOverride, nodeLabellerrecorder)
 	if err != nil {
 		panic(err)
 	}
 	capabilities = nodeLabellerController.HostCapabilities()
 
-	// Node labelling is only relevant on x86_64 arch.
-	if virtconfig.IsAMD64(runtime.GOARCH) {
+	// Node labelling is only relevant on x86_64 and s390x arches.
+	if virtconfig.IsAMD64(runtime.GOARCH) || virtconfig.IsS390X(runtime.GOARCH) {
 		hostCpuModel = nodeLabellerController.GetHostCpuModel().Name
 
 		go nodeLabellerController.Run(10, stop)
 	}
 
 	migrationIpAddress := app.PodIpAddress
-	migrationIpAddress, err = virthandler.FindMigrationIP(defaultNetworkStatusFilePath, migrationIpAddress)
+	migrationIpAddress, err = virthandler.FindMigrationIP(migrationIpAddress)
 	if err != nil {
-		log.Log.Reason(err)
-		return
+		panic(err)
 	}
 
 	downwardMetricsManager := dmetricsmanager.NewDownwardMetricsManager(app.HostOverride)
@@ -371,8 +341,6 @@ func (app *virtHandlerApp) Run() {
 		vmiSourceInformer,
 		vmiTargetInformer,
 		domainSharedInformer,
-		gracefulShutdownInformer,
-		int(app.WatchdogTimeoutDuration.Seconds()),
 		app.MaxDevices,
 		app.clusterConfig,
 		podIsolationDetector,
@@ -380,6 +348,9 @@ func (app *virtHandlerApp) Run() {
 		downwardMetricsManager,
 		capabilities,
 		hostCpuModel,
+		netsetup.NewNetConf(),
+		netsetup.NewNetStat(),
+		netbinding.MemoryCalculator{},
 	)
 	if err != nil {
 		panic(err)
@@ -390,11 +361,14 @@ func (app *virtHandlerApp) Run() {
 
 	lifecycleHandler := rest.NewLifecycleHandler(
 		recorder,
-		vmiSourceInformer,
+		vmiSourceInformer.GetStore(),
 		app.VirtShareDir,
 	)
 
-	promdomain.SetupDomainStatsCollector(app.virtCli, app.VirtShareDir, app.HostOverride, app.MaxRequestsInFlight, vmiSourceInformer)
+	if err := metrics.SetupMetrics(app.VirtShareDir, app.HostOverride, app.MaxRequestsInFlight, vmiSourceInformer); err != nil {
+		panic(err)
+	}
+
 	if err := downwardmetrics.RunDownwardMetricsCollector(context.Background(), app.HostOverride, vmiSourceInformer, podIsolationDetector); err != nil {
 		panic(fmt.Errorf("failed to set up the downwardMetrics collector: %v", err))
 	}
@@ -405,7 +379,6 @@ func (app *virtHandlerApp) Run() {
 	// Bootstrapping. From here on the startup order matters
 
 	factory.Start(stop)
-	go gracefulShutdownInformer.Run(stop)
 	go domainSharedInformer.Run(stop)
 
 	se, exists, err := selinux.NewSELinux()
@@ -442,7 +415,7 @@ func (app *virtHandlerApp) Run() {
 
 	consoleHandler := rest.NewConsoleHandler(
 		podIsolationDetector,
-		vmiSourceInformer,
+		vmiSourceInformer.GetStore(),
 		app.clientcertmanager,
 	)
 
@@ -563,7 +536,7 @@ func (app *virtHandlerApp) runPrometheusServer(errCh chan error) {
 
 	mux.Add(webService)
 	log.Log.V(1).Infof("metrics: max concurrent requests=%d", app.MaxRequestsInFlight)
-	mux.Handle("/metrics", promdomain.Handler(app.MaxRequestsInFlight))
+	mux.Handle("/metrics", metricshandler.Handler(app.MaxRequestsInFlight))
 	server := http.Server{
 		Addr:      app.ServiceListen.Address(),
 		Handler:   mux,

@@ -1,6 +1,7 @@
 package fuzz
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -18,6 +19,7 @@ import (
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks"
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks/validating-webhook/admitters"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
+	"kubevirt.io/kubevirt/pkg/virt-config/deprecation"
 )
 
 type fuzzOption int
@@ -43,7 +45,7 @@ func FuzzAdmitter(f *testing.F) {
 			objType: &v1.VirtualMachineInstance{},
 			admit: func(config *virtconfig.ClusterConfig, request *admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 				adm := &admitters.VMICreateAdmitter{ClusterConfig: config}
-				return adm.Admit(request)
+				return adm.Admit(context.Background(), request)
 			},
 			fuzzFuncs: fuzzFuncs(withSyntaxErrors),
 		},
@@ -53,7 +55,7 @@ func FuzzAdmitter(f *testing.F) {
 			objType: &v1.VirtualMachineInstance{},
 			admit: func(config *virtconfig.ClusterConfig, request *admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 				adm := &admitters.VMICreateAdmitter{ClusterConfig: config}
-				return adm.Admit(request)
+				return adm.Admit(context.Background(), request)
 			},
 			fuzzFuncs: fuzzFuncs(),
 		},
@@ -66,7 +68,7 @@ func FuzzAdmitter(f *testing.F) {
 					ClusterConfig:       config,
 					InstancetypeMethods: testutils.NewMockInstancetypeMethods(),
 				}
-				return adm.Admit(request)
+				return adm.Admit(context.Background(), request)
 			},
 			fuzzFuncs: fuzzFuncs(withSyntaxErrors),
 		},
@@ -79,7 +81,7 @@ func FuzzAdmitter(f *testing.F) {
 					ClusterConfig:       config,
 					InstancetypeMethods: testutils.NewMockInstancetypeMethods(),
 				}
-				return adm.Admit(request)
+				return adm.Admit(context.Background(), request)
 			},
 			fuzzFuncs: fuzzFuncs(),
 		},
@@ -163,11 +165,11 @@ func fuzzKubeVirtConfig(seed int64) *virtconfig.ClusterConfig {
 			featureGates := []string{
 				virtconfig.ExpandDisksGate,
 				virtconfig.CPUManager,
-				virtconfig.NUMAFeatureGate,
+				deprecation.NUMAFeatureGate,
 				virtconfig.IgnitionGate,
-				virtconfig.LiveMigrationGate,
-				virtconfig.SRIOVLiveMigrationGate,
-				virtconfig.CPUNodeDiscoveryGate,
+				deprecation.LiveMigrationGate,
+				deprecation.SRIOVLiveMigrationGate,
+				deprecation.CPUNodeDiscoveryGate,
 				virtconfig.HypervStrictCheckGate,
 				virtconfig.SidecarGate,
 				virtconfig.GPUGate,
@@ -177,15 +179,15 @@ func fuzzKubeVirtConfig(seed int64) *virtconfig.ClusterConfig {
 				virtconfig.HotplugVolumesGate,
 				virtconfig.HostDiskGate,
 				virtconfig.VirtIOFSGate,
-				virtconfig.MacvtapGate,
-				virtconfig.PasstGate,
+				deprecation.MacvtapGate,
+				deprecation.PasstGate,
 				virtconfig.DownwardMetricsFeatureGate,
-				virtconfig.NonRoot,
+				deprecation.NonRoot,
 				virtconfig.Root,
 				virtconfig.ClusterProfiler,
 				virtconfig.WorkloadEncryptionSEV,
 				virtconfig.DockerSELinuxMCSWorkaround,
-				virtconfig.PSA,
+				deprecation.PSA,
 				virtconfig.VSOCKGate,
 			}
 

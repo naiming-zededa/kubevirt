@@ -13,6 +13,7 @@ import (
 	"kubevirt.io/client-go/kubecli"
 	"kubevirt.io/client-go/log"
 
+	"kubevirt.io/kubevirt/pkg/virtctl/adm"
 	"kubevirt.io/kubevirt/pkg/virtctl/configuration"
 	"kubevirt.io/kubevirt/pkg/virtctl/console"
 	"kubevirt.io/kubevirt/pkg/virtctl/create"
@@ -27,6 +28,7 @@ import (
 	"kubevirt.io/kubevirt/pkg/virtctl/softreboot"
 	"kubevirt.io/kubevirt/pkg/virtctl/ssh"
 	"kubevirt.io/kubevirt/pkg/virtctl/templates"
+	"kubevirt.io/kubevirt/pkg/virtctl/unpause"
 	"kubevirt.io/kubevirt/pkg/virtctl/usbredir"
 	"kubevirt.io/kubevirt/pkg/virtctl/version"
 	"kubevirt.io/kubevirt/pkg/virtctl/vm"
@@ -76,7 +78,6 @@ func NewVirtctlCommand() (*cobra.Command, clientcmd.ClientConfig) {
 	optionsCmd.SetUsageTemplate(templates.OptionsUsageTemplate())
 	//TODO: Add a ClientConfigFactory which allows substituting the KubeVirt client with a mock for unit testing
 	clientConfig := kubecli.DefaultClientConfig(rootCmd.PersistentFlags())
-	AddGlogFlags(rootCmd.PersistentFlags())
 	rootCmd.SetUsageTemplate(templates.MainUsageTemplate())
 	rootCmd.SetOut(os.Stdout)
 	rootCmd.AddCommand(
@@ -99,8 +100,8 @@ func NewVirtctlCommand() (*cobra.Command, clientcmd.ClientConfig) {
 		vm.NewRemoveVolumeCommand(clientConfig),
 		vm.NewExpandCommand(clientConfig),
 		memorydump.NewMemoryDumpCommand(clientConfig),
-		pause.NewPauseCommand(clientConfig),
-		pause.NewUnpauseCommand(clientConfig),
+		pause.NewCommand(clientConfig),
+		unpause.NewCommand(clientConfig),
 		softreboot.NewSoftRebootCommand(clientConfig),
 		expose.NewExposeCommand(clientConfig),
 		version.VersionCommand(clientConfig),
@@ -109,6 +110,7 @@ func NewVirtctlCommand() (*cobra.Command, clientcmd.ClientConfig) {
 		vmexport.NewVirtualMachineExportCommand(clientConfig),
 		create.NewCommand(clientConfig),
 		credentials.NewCommand(clientConfig),
+		adm.NewCommand(clientConfig),
 		optionsCmd,
 	)
 	return rootCmd, clientConfig

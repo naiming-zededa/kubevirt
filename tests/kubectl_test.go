@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"kubevirt.io/kubevirt/tests/libmigration"
+	"kubevirt.io/kubevirt/tests/libpod"
+	"kubevirt.io/kubevirt/tests/libvmops"
 
 	"kubevirt.io/kubevirt/tests/decorators"
 
@@ -13,7 +15,7 @@ import (
 	"kubevirt.io/kubevirt/tests/framework/kubevirt"
 	"kubevirt.io/kubevirt/tests/testsuite"
 
-	"kubevirt.io/kubevirt/tests/libvmi"
+	"kubevirt.io/kubevirt/tests/libvmifact"
 
 	"kubevirt.io/kubevirt/tests/clientcmd"
 	"kubevirt.io/kubevirt/tests/console"
@@ -25,7 +27,7 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
 
-	"kubevirt.io/kubevirt/tests"
+	"kubevirt.io/kubevirt/pkg/libvmi"
 )
 
 var _ = Describe("[sig-compute]oc/kubectl integration", decorators.SigCompute, func() {
@@ -40,10 +42,10 @@ var _ = Describe("[sig-compute]oc/kubectl integration", decorators.SigCompute, f
 	})
 
 	DescribeTable("[test_id:3812]explain vm/vmi", func(resource string) {
-		output, stderr, err := clientcmd.RunCommand(k8sClient, "explain", resource)
+		output, stderr, err := clientcmd.RunCommand(testsuite.GetTestNamespace(nil), k8sClient, "explain", resource)
 		// kubectl will not find resource for the first time this command is issued
 		if err != nil {
-			output, _, err = clientcmd.RunCommand(k8sClient, "explain", resource)
+			output, _, err = clientcmd.RunCommand(testsuite.GetTestNamespace(nil), k8sClient, "explain", resource)
 		}
 		Expect(err).NotTo(HaveOccurred(), stderr)
 		Expect(output).To(ContainSubstring("apiVersion	<string>"))
@@ -64,9 +66,9 @@ var _ = Describe("[sig-compute]oc/kubectl integration", decorators.SigCompute, f
 	)
 
 	It("[test_id:5182]vmipreset have validation", func() {
-		output, _, err := clientcmd.RunCommand(k8sClient, "explain", "vmipreset")
+		output, _, err := clientcmd.RunCommand(testsuite.GetTestNamespace(nil), k8sClient, "explain", "vmipreset")
 		if err != nil {
-			output, _, err = clientcmd.RunCommand(k8sClient, "explain", "vmipreset")
+			output, _, err = clientcmd.RunCommand(testsuite.GetTestNamespace(nil), k8sClient, "explain", "vmipreset")
 		}
 		Expect(err).NotTo(HaveOccurred())
 		Expect(output).To(ContainSubstring("apiVersion	<string>"))
@@ -79,9 +81,9 @@ var _ = Describe("[sig-compute]oc/kubectl integration", decorators.SigCompute, f
 	})
 
 	It("[test_id:5183]vmirs have validation", func() {
-		output, _, err := clientcmd.RunCommand(k8sClient, "explain", "vmirs")
+		output, _, err := clientcmd.RunCommand(testsuite.GetTestNamespace(nil), k8sClient, "explain", "vmirs")
 		if err != nil {
-			output, _, err = clientcmd.RunCommand(k8sClient, "explain", "vmirs")
+			output, _, err = clientcmd.RunCommand(testsuite.GetTestNamespace(nil), k8sClient, "explain", "vmirs")
 		}
 		Expect(err).NotTo(HaveOccurred())
 		Expect(output).To(ContainSubstring("apiVersion	<string>"))
@@ -102,21 +104,24 @@ var _ = Describe("[sig-compute]oc/kubectl integration", decorators.SigCompute, f
 		BeforeEach(func() {
 			virtCli = kubevirt.Client()
 
-			vm = tests.NewRandomVirtualMachine(tests.NewRandomVMI(), false)
-			vm, err = virtCli.VirtualMachine(testsuite.GetTestNamespace(vm)).Create(context.Background(), vm)
+			vm = libvmi.NewVirtualMachine(libvmifact.NewCirros(
+				libvmi.WithInterface(libvmi.InterfaceDeviceWithMasqueradeBinding()),
+				libvmi.WithNetwork(v1.DefaultPodNetwork()),
+			))
+			vm, err = virtCli.VirtualMachine(testsuite.GetTestNamespace(vm)).Create(context.Background(), vm, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
-			tests.StartVirtualMachine(vm)
+			vm = libvmops.StartVirtualMachine(vm)
 		})
 
 		AfterEach(func() {
-			virtCli.VirtualMachine(testsuite.GetTestNamespace(vm)).Delete(context.Background(), vm.Name, &metav1.DeleteOptions{})
+			virtCli.VirtualMachine(testsuite.GetTestNamespace(vm)).Delete(context.Background(), vm.Name, metav1.DeleteOptions{})
 		})
 
 		DescribeTable("should verify set of columns for", func(verb, resource string, expectedHeader []string) {
-			result, _, err = clientcmd.RunCommand(k8sClient, verb, resource, vm.Name)
+			result, _, err = clientcmd.RunCommand(testsuite.GetTestNamespace(nil), k8sClient, verb, resource, vm.Name)
 			// due to issue of kubectl that sometimes doesn't show CRDs on the first try, retry the same command
 			if err != nil {
-				result, _, err = clientcmd.RunCommand(k8sClient, verb, resource, vm.Name)
+				result, _, err = clientcmd.RunCommand(testsuite.GetTestNamespace(nil), k8sClient, verb, resource, vm.Name)
 			}
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result).ToNot(BeEmpty())
@@ -135,10 +140,10 @@ var _ = Describe("[sig-compute]oc/kubectl integration", decorators.SigCompute, f
 
 		DescribeTable("should verify set of wide columns for", func(verb, resource, option string, expectedHeader []string, verifyPos int, expectedData string) {
 
-			result, _, err := clientcmd.RunCommand(k8sClient, verb, resource, vm.Name, "-o", option)
+			result, _, err := clientcmd.RunCommand(testsuite.GetTestNamespace(nil), k8sClient, verb, resource, vm.Name, "-o", option)
 			// due to issue of kubectl that sometimes doesn't show CRDs on the first try, retry the same command
 			if err != nil {
-				result, _, err = clientcmd.RunCommand(k8sClient, verb, resource, vm.Name, "-o", option)
+				result, _, err = clientcmd.RunCommand(testsuite.GetTestNamespace(nil), k8sClient, verb, resource, vm.Name, "-o", option)
 			}
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result).ToNot(BeEmpty())
@@ -171,23 +176,23 @@ var _ = Describe("[sig-compute]oc/kubectl integration", decorators.SigCompute, f
 
 		Context("'kubectl get vmim'", func() {
 			It("print the expected columns and their corresponding values", func() {
-				vmi := libvmi.NewCirros(
+				vmi := libvmifact.NewCirros(
 					libvmi.WithInterface(libvmi.InterfaceDeviceWithMasqueradeBinding()),
 					libvmi.WithNetwork(v1.DefaultPodNetwork()),
 				)
 				By("Starting the VirtualMachineInstance")
-				vmi = tests.RunVMIAndExpectLaunch(vmi, libmigration.MigrationWaitTime)
+				vmi = libvmops.RunVMIAndExpectLaunch(vmi, libmigration.MigrationWaitTime)
 
 				By("Checking that the VirtualMachineInstance console has expected output")
 				Expect(console.LoginToCirros(vmi)).To(Succeed())
 
 				By("creating the migration")
-				migration := tests.NewRandomMigration(vmi.Name, vmi.Namespace)
+				migration := libmigration.New(vmi.Name, vmi.Namespace)
 
 				var migrationCreated *v1.VirtualMachineInstanceMigration
 				By("starting migration")
 				Eventually(func() error {
-					migrationCreated, err = virtClient.VirtualMachineInstanceMigration(migration.Namespace).Create(migration, &metav1.CreateOptions{})
+					migrationCreated, err = virtClient.VirtualMachineInstanceMigration(migration.Namespace).Create(context.Background(), migration, metav1.CreateOptions{})
 					return err
 				}, libmigration.MigrationWaitTime, 1*time.Second).Should(Succeed(), "migration creation should succeed")
 				migration = migrationCreated
@@ -195,10 +200,10 @@ var _ = Describe("[sig-compute]oc/kubectl integration", decorators.SigCompute, f
 				libmigration.ExpectMigrationToSucceedWithDefaultTimeout(virtClient, migration)
 
 				k8sClient := clientcmd.GetK8sCmdClient()
-				result, _, err := clientcmd.RunCommand(k8sClient, "get", "vmim", migration.Name)
+				result, _, err := clientcmd.RunCommand(testsuite.GetTestNamespace(nil), k8sClient, "get", "vmim", migration.Name)
 				// due to issue of kubectl that sometimes doesn't show CRDs on the first try, retry the same command
 				if err != nil {
-					result, _, err = clientcmd.RunCommand(k8sClient, "get", "vmim", migration.Name)
+					result, _, err = clientcmd.RunCommand(testsuite.GetTestNamespace(nil), k8sClient, "get", "vmim", migration.Name)
 				}
 
 				expectedHeader := []string{"NAME", "PHASE", "VMI"}
@@ -229,12 +234,13 @@ var _ = Describe("[sig-compute]oc/kubectl integration", decorators.SigCompute, f
 		)
 
 		It("oc/kubectl logs <vmi-pod> return default container log", func() {
-			vm = libvmi.NewCirros()
-			vm = tests.RunVMIAndExpectLaunch(vm, 30)
+			vm = libvmifact.NewCirros()
+			vm = libvmops.RunVMIAndExpectLaunch(vm, 30)
 
 			k8sClient := clientcmd.GetK8sCmdClient()
-
-			output, _, err := clientcmd.RunCommand(k8sClient, "logs", tests.GetPodByVirtualMachineInstance(vm).Name)
+			pod, err := libpod.GetPodByVirtualMachineInstance(vm, vm.Namespace)
+			Expect(err).NotTo(HaveOccurred())
+			output, _, err := clientcmd.RunCommand(testsuite.GetTestNamespace(nil), k8sClient, "logs", pod.Name)
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(output).To(ContainSubstring("component"))

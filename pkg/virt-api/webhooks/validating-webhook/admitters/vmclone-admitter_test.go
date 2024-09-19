@@ -27,7 +27,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/client-go/testing"
-	"kubevirt.io/api/snapshot/v1alpha1"
+	snapshotv1 "kubevirt.io/api/snapshot/v1beta1"
 	"kubevirt.io/client-go/generated/kubevirt/clientset/versioned/fake"
 
 	"github.com/golang/mock/gomock"
@@ -47,7 +47,6 @@ import (
 
 	"kubevirt.io/kubevirt/pkg/testutils"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
-	"kubevirt.io/kubevirt/tests/util"
 )
 
 var _ = Describe("Validating VirtualMachineClone Admitter", func() {
@@ -57,12 +56,12 @@ var _ = Describe("Validating VirtualMachineClone Admitter", func() {
 	var admitter *VirtualMachineCloneAdmitter
 	var vmClone *clonev1lpha1.VirtualMachineClone
 	var config *virtconfig.ClusterConfig
-	var kvInformer cache.SharedIndexInformer
+	var kvStore cache.Store
 	var vmInterface *kubecli.MockVirtualMachineInterface
 	var vm *v1.VirtualMachine
 
 	enableFeatureGate := func(featureGate string) {
-		testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, &v1.KubeVirt{
+		testutils.UpdateFakeKubeVirtClusterConfig(kvStore, &v1.KubeVirt{
 			Spec: v1.KubeVirtSpec{
 				Configuration: v1.KubeVirtConfiguration{
 					DeveloperConfiguration: &v1.DeveloperConfiguration{
@@ -74,7 +73,7 @@ var _ = Describe("Validating VirtualMachineClone Admitter", func() {
 	}
 
 	disableFeatureGates := func() {
-		testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, &v1.KubeVirt{
+		testutils.UpdateFakeKubeVirtClusterConfig(kvStore, &v1.KubeVirt{
 			Spec: v1.KubeVirtSpec{
 				Configuration: v1.KubeVirtConfiguration{
 					DeveloperConfiguration: &v1.DeveloperConfiguration{
@@ -139,60 +138,60 @@ var _ = Describe("Validating VirtualMachineClone Admitter", func() {
 	BeforeEach(func() {
 		ctrl = gomock.NewController(GinkgoT())
 		virtClient = kubecli.NewMockKubevirtClient(ctrl)
-		config, _, kvInformer = testutils.NewFakeClusterConfigUsingKVConfig(&v1.KubeVirtConfiguration{})
+		config, _, kvStore = testutils.NewFakeClusterConfigUsingKVConfig(&v1.KubeVirtConfiguration{})
 		vmInterface = kubecli.NewMockVirtualMachineInterface(ctrl)
 		kubevirtClient = fake.NewSimpleClientset()
 		virtClient.
 			EXPECT().
-			VirtualMachine(util.NamespaceTestDefault).
+			VirtualMachine(metav1.NamespaceDefault).
 			Return(vmInterface).
 			AnyTimes()
 		virtClient.
 			EXPECT().
-			VirtualMachineSnapshot(util.NamespaceTestDefault).
-			Return(kubevirtClient.SnapshotV1alpha1().VirtualMachineSnapshots(util.NamespaceTestDefault)).
+			VirtualMachineSnapshot(metav1.NamespaceDefault).
+			Return(kubevirtClient.SnapshotV1beta1().VirtualMachineSnapshots(metav1.NamespaceDefault)).
 			AnyTimes()
 		virtClient.
 			EXPECT().
-			VirtualMachineSnapshotContent(util.NamespaceTestDefault).
-			Return(kubevirtClient.SnapshotV1alpha1().VirtualMachineSnapshotContents(util.NamespaceTestDefault)).
+			VirtualMachineSnapshotContent(metav1.NamespaceDefault).
+			Return(kubevirtClient.SnapshotV1beta1().VirtualMachineSnapshotContents(metav1.NamespaceDefault)).
 			AnyTimes()
 
 		admitter = &VirtualMachineCloneAdmitter{Config: config, Client: virtClient}
 		vmClone = newValidClone()
 		vm = newValidVM(vmClone.Namespace, vmClone.Spec.Source.Name)
-		vmInterface.EXPECT().Get(context.Background(), vmClone.Spec.Source.Name, gomock.Any()).Return(vm, nil).AnyTimes()
-		vmInterface.EXPECT().Get(context.Background(), gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("does-not-exist")).AnyTimes()
+		vmInterface.EXPECT().Get(gomock.Any(), vmClone.Spec.Source.Name, gomock.Any()).Return(vm, nil).AnyTimes()
+		vmInterface.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("does-not-exist")).AnyTimes()
 
 		kubevirtClient.Fake.PrependReactor("*", "*", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
 			Expect(action).To(BeNil())
 			return true, nil, nil
 		})
 		kubevirtClient.Fake.PrependReactor("get", "virtualmachinesnapshots", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
-			snapshot := &v1alpha1.VirtualMachineSnapshot{
+			snapshot := &snapshotv1.VirtualMachineSnapshot{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-snapshot",
-					Namespace: util.NamespaceTestDefault,
+					Namespace: metav1.NamespaceDefault,
 				},
-				Status: &v1alpha1.VirtualMachineSnapshotStatus{
+				Status: &snapshotv1.VirtualMachineSnapshotStatus{
 					VirtualMachineSnapshotContentName: pointer.String("snapshot-contents"),
 				},
 			}
 			return true, snapshot, nil
 		})
 		kubevirtClient.Fake.PrependReactor("get", "virtualmachinesnapshotcontents", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
-			var volumeBackups []v1alpha1.VolumeBackup
+			var volumeBackups []snapshotv1.VolumeBackup
 			for _, volume := range vm.Spec.Template.Spec.Volumes {
-				volumeBackups = append(volumeBackups, v1alpha1.VolumeBackup{
+				volumeBackups = append(volumeBackups, snapshotv1.VolumeBackup{
 					VolumeName: volume.Name,
 				})
 			}
 
-			contents := &v1alpha1.VirtualMachineSnapshotContent{
-				Spec: v1alpha1.VirtualMachineSnapshotContentSpec{
+			contents := &snapshotv1.VirtualMachineSnapshotContent{
+				Spec: snapshotv1.VirtualMachineSnapshotContentSpec{
 					VirtualMachineSnapshotName: pointer.String("test-vm"),
-					Source: v1alpha1.SourceSpec{
-						VirtualMachine: &v1alpha1.VirtualMachine{
+					Source: snapshotv1.SourceSpec{
+						VirtualMachine: &snapshotv1.VirtualMachine{
 							Spec: vm.Spec,
 						},
 					},
@@ -250,8 +249,8 @@ var _ = Describe("Validating VirtualMachineClone Admitter", func() {
 			vmClone.Spec.Source.Kind = kind
 			admitter.admitAndExpect(vmClone, true)
 		},
-			Entry("VM", "VirtualMachine"),
-			Entry("Snapshot", "VirtualMachineSnapshot"),
+			Entry("VM", virtualMachineKind),
+			Entry("Snapshot", virtualMachineSnapshotKind),
 		)
 
 		It("Should reject unknown source type", func() {
@@ -268,6 +267,26 @@ var _ = Describe("Validating VirtualMachineClone Admitter", func() {
 	It("Should reject a source VM that does not exist", func() {
 		vmClone.Spec.Source.Name = "vm-that-doesnt-exist"
 		admitter.admitAndExpect(vmClone, false)
+	})
+
+	When("Both source and target kinds are VirtualMachine", func() {
+		It("Should reject a target with the same name as the source", func() {
+			vmClone.Spec.Source.Kind = virtualMachineKind
+			vmClone.Spec.Target.Kind = virtualMachineKind
+
+			vmClone.Spec.Target.Name = vmClone.Spec.Source.Name
+			admitter.admitAndExpect(vmClone, false)
+		})
+	})
+
+	When("Source kind is a VirtualMachineSnapshot and target kind is VirtualMachine", func() {
+		It("Should allow the target to have the same name as the source", func() {
+			vmClone.Spec.Source.Kind = virtualMachineSnapshotKind
+			vmClone.Spec.Target.Kind = virtualMachineKind
+
+			vmClone.Spec.Target.Name = vmClone.Spec.Source.Name
+			admitter.admitAndExpect(vmClone, true)
+		})
 	})
 
 	It("Should reject if snapshot feature gate is not enabled", func() {
@@ -310,14 +329,14 @@ var _ = Describe("Validating VirtualMachineClone Admitter", func() {
 		})
 
 		It("should reject if vmsnapshot contents don't include a volume's backup", func() {
-			vmClone.Spec.Source.Kind = "VirtualMachineSnapshot"
+			vmClone.Spec.Source.Kind = virtualMachineSnapshotKind
 
 			kubevirtClient.Fake.PrependReactor("get", "virtualmachinesnapshotcontents", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
-				contents := &v1alpha1.VirtualMachineSnapshotContent{
-					Spec: v1alpha1.VirtualMachineSnapshotContentSpec{
+				contents := &snapshotv1.VirtualMachineSnapshotContent{
+					Spec: snapshotv1.VirtualMachineSnapshotContentSpec{
 						VirtualMachineSnapshotName: pointer.String("test-vm"),
-						Source: v1alpha1.SourceSpec{
-							VirtualMachine: &v1alpha1.VirtualMachine{
+						Source: snapshotv1.SourceSpec{
+							VirtualMachine: &snapshotv1.VirtualMachine{
 								Spec: vm.Spec,
 							},
 						},
@@ -359,6 +378,43 @@ var _ = Describe("Validating VirtualMachineClone Admitter", func() {
 		)
 	})
 
+	Context("Template Annotations and labels filters", func() {
+		testFilter := func(filter string, expectAllowed bool) {
+			vmClone.Spec.Template.LabelFilters = []string{filter}
+			vmClone.Spec.Template.AnnotationFilters = []string{filter}
+			admitter.admitAndExpect(vmClone, expectAllowed)
+		}
+
+		DescribeTable("Should reject", func(filter string) {
+			testFilter(filter, false)
+		},
+			Entry("templateFilter negation character alone", "!"),
+			Entry("templateFilter negation in the middle", "mykey/!something"),
+			Entry("templateFilter negation in the end", "mykey/something!"),
+			Entry("templateFilter wildcard in the beginning", "*mykey/something"),
+			Entry("templateFilter wildcard in the middle", "mykey/*something"),
+		)
+
+		DescribeTable("Should allow", func(filter string) {
+			testFilter(filter, true)
+		},
+			Entry("templateFilter regular filter", "mykey/something"),
+			Entry("templateFilter wildcard only", "*"),
+			Entry("templateFilter wildcard in the end", "mykey/something*"),
+			Entry("templateFilter negation in the beginning", "!mykey/something"),
+		)
+	})
+
+	DescribeTable("newMacAddresses", func(mac string, expectAllowed bool) {
+		vmClone.Spec.NewMacAddresses = map[string]string{
+			"default": mac,
+		}
+		admitter.admitAndExpect(vmClone, expectAllowed)
+	},
+		Entry("valid mac address", "00:00:00:00:00:00", true),
+		Entry("invalid mac address", "00:00:00:00:00", false),
+	)
+
 })
 
 func createCloneAdmissionReview(vmClone *clonev1lpha1.VirtualMachineClone) *admissionv1.AdmissionReview {
@@ -382,12 +438,12 @@ func createCloneAdmissionReview(vmClone *clonev1lpha1.VirtualMachineClone) *admi
 
 func (admitter *VirtualMachineCloneAdmitter) admitAndExpect(clone *clonev1lpha1.VirtualMachineClone, expectAllowed bool) {
 	ar := createCloneAdmissionReview(clone)
-	resp := admitter.Admit(ar)
+	resp := admitter.Admit(context.Background(), ar)
 	Expect(resp.Allowed).To(Equal(expectAllowed))
 }
 
 func newValidClone() *clonev1lpha1.VirtualMachineClone {
-	vmClone := kubecli.NewMinimalCloneWithNS("testclone", util.NamespaceTestDefault)
+	vmClone := kubecli.NewMinimalCloneWithNS("testclone", metav1.NamespaceDefault)
 	vmClone.Spec.Source = newValidObjReference()
 	vmClone.Spec.Target = newValidObjReference()
 	vmClone.Spec.Target.Name = "clone-target-vm"
@@ -398,7 +454,7 @@ func newValidClone() *clonev1lpha1.VirtualMachineClone {
 func newValidObjReference() *k8sv1.TypedLocalObjectReference {
 	return &k8sv1.TypedLocalObjectReference{
 		APIGroup: pointer.String(core.GroupName),
-		Kind:     "VirtualMachine",
+		Kind:     virtualMachineKind,
 		Name:     "clone-source-vm",
 	}
 }

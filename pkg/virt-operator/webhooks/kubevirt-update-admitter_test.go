@@ -20,9 +20,12 @@
 package webhooks
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+
+	"kubevirt.io/kubevirt/pkg/virt-config/deprecation"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -170,7 +173,7 @@ var _ = Describe("Validating KubeVirtUpdate Admitter", func() {
 			admitter = NewKubeVirtUpdateAdmitter(nil, clusterConfig)
 		})
 
-		admit := func(kubevirt v1.KubeVirt) *admissionv1.AdmissionResponse {
+		admit := func(ctx context.Context, kubevirt v1.KubeVirt) *admissionv1.AdmissionResponse {
 			kvBytes, err := json.Marshal(kubevirt)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -186,7 +189,7 @@ var _ = Describe("Validating KubeVirtUpdate Admitter", func() {
 					Operation: admissionv1.Update,
 				},
 			}
-			return admitter.Admit(request)
+			return admitter.Admit(ctx, request)
 		}
 
 		const warn = true
@@ -204,7 +207,7 @@ var _ = Describe("Validating KubeVirtUpdate Admitter", func() {
 				},
 			}
 
-			response := admit(kvObject)
+			response := admit(context.Background(), kvObject)
 			Expect(response).NotTo(BeNil())
 			if shouldWarn {
 				Expect(response.Warnings).NotTo(BeEmpty())
@@ -239,7 +242,7 @@ var _ = Describe("Validating KubeVirtUpdate Admitter", func() {
 				},
 			}
 
-			response := admit(kvObject)
+			response := admit(context.Background(), kvObject)
 			Expect(response).NotTo(BeNil())
 			if shouldWarn {
 				Expect(response.Warnings).NotTo(BeEmpty())
@@ -276,6 +279,40 @@ var _ = Describe("Validating KubeVirtUpdate Admitter", func() {
 			}),
 
 			Entry("should not warn if configuration nil", warnNotExpected, nil),
+		)
+
+		DescribeTable("should raise warning when a deprecated feature-gate is enabled", func(featureGate, expectedWarning string) {
+			kv := v1.KubeVirt{}
+			kvBytes, err := json.Marshal(kv)
+			Expect(err).ToNot(HaveOccurred())
+
+			kv.Spec.Configuration.DeveloperConfiguration = &v1.DeveloperConfiguration{FeatureGates: []string{featureGate}}
+			kvUpdatedBytes, err := json.Marshal(kv)
+			Expect(err).ToNot(HaveOccurred())
+
+			request := &admissionv1.AdmissionReview{
+				Request: &admissionv1.AdmissionRequest{
+					Resource:  KubeVirtGroupVersionResource,
+					Operation: admissionv1.Update,
+					OldObject: runtime.RawExtension{Raw: kvBytes},
+					Object:    runtime.RawExtension{Raw: kvUpdatedBytes},
+				},
+			}
+
+			Expect(admitter.Admit(context.Background(), request)).To(Equal(&admissionv1.AdmissionResponse{
+				Allowed: true,
+				Warnings: []string{
+					expectedWarning,
+				},
+			}))
+		},
+			Entry("with LiveMigration", deprecation.LiveMigrationGate, fmt.Sprintf(deprecation.WarningPattern, deprecation.LiveMigrationGate, deprecation.GA)),
+			Entry("with SRIOVLiveMigration", deprecation.SRIOVLiveMigrationGate, fmt.Sprintf(deprecation.WarningPattern, deprecation.SRIOVLiveMigrationGate, deprecation.GA)),
+			Entry("with NonRoot", deprecation.NonRoot, fmt.Sprintf(deprecation.WarningPattern, deprecation.NonRoot, deprecation.GA)),
+			Entry("with PSA", deprecation.PSA, fmt.Sprintf(deprecation.WarningPattern, deprecation.PSA, deprecation.GA)),
+			Entry("with CPUNodeDiscoveryGate", deprecation.CPUNodeDiscoveryGate, fmt.Sprintf(deprecation.WarningPattern, deprecation.CPUNodeDiscoveryGate, deprecation.GA)),
+			Entry("with Passt", deprecation.PasstGate, deprecation.PasstDiscontinueMessage),
+			Entry("with MacvtapGate", deprecation.MacvtapGate, deprecation.MacvtapDiscontinueMessage),
 		)
 	})
 })

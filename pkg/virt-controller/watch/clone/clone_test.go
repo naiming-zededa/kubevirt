@@ -19,6 +19,7 @@
 package clone
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -28,251 +29,166 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	k8sv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/testing"
-	"k8s.io/client-go/tools/cache"
-	framework "k8s.io/client-go/tools/cache/testing"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/utils/pointer"
 
-	"kubevirt.io/api/clone"
 	clonev1alpha1 "kubevirt.io/api/clone/v1alpha1"
 	virtv1 "kubevirt.io/api/core/v1"
-	snapshotv1alpha1 "kubevirt.io/api/snapshot/v1alpha1"
+	snapshotv1 "kubevirt.io/api/snapshot/v1beta1"
 	kubevirtfake "kubevirt.io/client-go/generated/kubevirt/clientset/versioned/fake"
 	"kubevirt.io/client-go/kubecli"
 
+	"kubevirt.io/kubevirt/pkg/apimachinery/patch"
+	kvcontroller "kubevirt.io/kubevirt/pkg/controller"
+	"kubevirt.io/kubevirt/pkg/libvmi"
+	"kubevirt.io/kubevirt/pkg/pointer"
 	"kubevirt.io/kubevirt/pkg/testutils"
-	"kubevirt.io/kubevirt/tests"
-	"kubevirt.io/kubevirt/tests/libvmi"
-	"kubevirt.io/kubevirt/tests/util"
 )
 
 const (
-	snapshotResource        = "virtualmachinesnapshots"
 	restoreResource         = "virtualmachinerestores"
-	snapshotContentResource = "virtualmachinesnapshotcontents"
 	vmAPIGroup              = "kubevirt.io"
 	snapshotAPIGroup        = "snapshot.kubevirt.io"
+	testCloneUID            = "clone-uid"
+	testSnapshotName        = "tmp-snapshot-clone-uid"
+	testSnapshotContentName = "vmsnapshot-content-snapshot-UID"
+	testRestoreName         = "tmp-restore-clone-uid"
 )
 
 var _ = Describe("Clone", func() {
-	var ctrl *gomock.Controller
+	var (
+		controller *VMCloneController
+		recorder   *record.FakeRecorder
+		mockQueue  *testutils.MockWorkQueue
 
-	var vmInterface *kubecli.MockVirtualMachineInterface
-
-	var vmInformer cache.SharedIndexInformer
-	var snapshotInformer cache.SharedIndexInformer
-	var restoreInformer cache.SharedIndexInformer
-	var snapshotContentInformer cache.SharedIndexInformer
-
-	var cloneInformer cache.SharedIndexInformer
-	var cloneSource *framework.FakeControllerSource
-
-	var stop chan struct{}
-	var controller *VMCloneController
-	var recorder *record.FakeRecorder
-	var mockQueue *testutils.MockWorkQueue
-	var client *kubevirtfake.Clientset
-	var k8sClient *k8sfake.Clientset
-
-	var testNamespace string
-
-	var sourceVM *virtv1.VirtualMachine
-	var vmClone *clonev1alpha1.VirtualMachineClone
-
-	syncCaches := func(stop chan struct{}) {
-		go vmInformer.Run(stop)
-		go snapshotInformer.Run(stop)
-		go restoreInformer.Run(stop)
-		go cloneInformer.Run(stop)
-		Expect(cache.WaitForCacheSync(stop, vmInformer.HasSynced, snapshotInformer.HasSynced,
-			restoreInformer.HasSynced, cloneInformer.HasSynced)).To(BeTrue())
-	}
+		client    *kubevirtfake.Clientset
+		k8sClient *k8sfake.Clientset
+		sourceVM  *virtv1.VirtualMachine
+		vmClone   *clonev1alpha1.VirtualMachineClone
+	)
 
 	addVM := func(vm *virtv1.VirtualMachine) {
-		err := vmInformer.GetStore().Add(vm)
+		err := controller.vmStore.Add(vm)
 		Expect(err).ShouldNot(HaveOccurred())
 	}
 
 	addClone := func(vmClone *clonev1alpha1.VirtualMachineClone) {
-		mockQueue.ExpectAdds(1)
-		cloneSource.Add(vmClone)
-		mockQueue.Wait()
+		var err error
+		vmClone, err = client.CloneV1alpha1().VirtualMachineClones(metav1.NamespaceDefault).Create(context.TODO(), vmClone, metav1.CreateOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		controller.vmCloneIndexer.Add(vmClone)
+		key, err := kvcontroller.KeyFunc(vmClone)
+		Expect(err).To(Not(HaveOccurred()))
+		mockQueue.Add(key)
 	}
 
-	addSnapshot := func(snapshot *snapshotv1alpha1.VirtualMachineSnapshot) {
-		err := snapshotInformer.GetStore().Add(snapshot)
+	addSnapshot := func(snapshot *snapshotv1.VirtualMachineSnapshot) {
+		var err error
+		snapshot, err = client.SnapshotV1beta1().VirtualMachineSnapshots(metav1.NamespaceDefault).Create(context.TODO(), snapshot, metav1.CreateOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		err = controller.snapshotStore.Add(snapshot)
+		Expect(err).ToNot(HaveOccurred())
+	}
+
+	addSnapshotContent := func(snapshotContent *snapshotv1.VirtualMachineSnapshotContent) {
+		err := controller.snapshotContentStore.Add(snapshotContent)
 		Expect(err).ShouldNot(HaveOccurred())
 	}
 
-	addRestore := func(restore *snapshotv1alpha1.VirtualMachineRestore) {
-		err := restoreInformer.GetStore().Add(restore)
+	addRestore := func(restore *snapshotv1.VirtualMachineRestore) {
+		var err error
+		restore, err = client.SnapshotV1beta1().VirtualMachineRestores(metav1.NamespaceDefault).Create(context.TODO(), restore, metav1.CreateOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		err = controller.restoreStore.Add(restore)
+		Expect(err).ToNot(HaveOccurred())
+	}
+
+	addPVC := func(pvc *k8sv1.PersistentVolumeClaim) {
+		err := controller.pvcStore.Add(pvc)
 		Expect(err).ShouldNot(HaveOccurred())
 	}
 
-	expectSnapshotCreate := func(sourceVMName string, vmClone *clonev1alpha1.VirtualMachineClone) {
-		client.Fake.PrependReactor("create", snapshotResource, func(action testing.Action) (handled bool, ret runtime.Object, err error) {
-			create, ok := action.(testing.CreateAction)
-			Expect(ok).To(BeTrue())
-
-			snapshot := create.GetObject().(*snapshotv1alpha1.VirtualMachineSnapshot)
-			Expect(snapshot.Spec.Source.Kind).To(Equal("VirtualMachine"))
-			Expect(snapshot.Spec.Source.Name).To(Equal(sourceVMName))
-			Expect(snapshot.OwnerReferences).To(HaveLen(1))
-			validateOwnerReference(snapshot.OwnerReferences[0], vmClone)
-
-			return true, create.GetObject(), nil
-		})
+	expectSnapshotExists := func() {
+		vmSnapshot, err := client.SnapshotV1beta1().VirtualMachineSnapshots(metav1.NamespaceDefault).Get(context.TODO(), testSnapshotName, metav1.GetOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(vmSnapshot).ToNot(BeNil())
+		Expect(vmSnapshot.Spec.Source.Kind).To(Equal("VirtualMachine"))
+		Expect(vmSnapshot.OwnerReferences).To(HaveLen(1))
+		validateOwnerReference(vmSnapshot.OwnerReferences[0], vmClone)
 	}
 
-	expectRestoreCreate := func(restoreName string, vmClone *clonev1alpha1.VirtualMachineClone) {
+	expectSnapshotDoesNotExist := func() {
+		_, err := client.SnapshotV1beta1().VirtualMachineSnapshots(metav1.NamespaceDefault).Get(context.TODO(), testSnapshotName, metav1.GetOptions{})
+		Expect(err).To(MatchError(errors.IsNotFound, "k8serrors.IsNotFound"), "Snapshot should not exists")
+	}
+
+	expectRestoreExists := func() {
+		vmRestore, err := client.SnapshotV1beta1().VirtualMachineRestores(metav1.NamespaceDefault).Get(context.TODO(), testRestoreName, metav1.GetOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(vmRestore).ToNot(BeNil())
+		Expect(vmRestore.Spec.VirtualMachineSnapshotName).To(Equal(testSnapshotName))
+		Expect(vmRestore.OwnerReferences).To(HaveLen(1))
+		validateOwnerReference(vmRestore.OwnerReferences[0], vmClone)
+	}
+
+	expectRestoreCreationFailure := func(snapshotName string, vmClone *clonev1alpha1.VirtualMachineClone, restoreName string) {
 		client.Fake.PrependReactor("create", restoreResource, func(action testing.Action) (handled bool, ret runtime.Object, err error) {
 			create, ok := action.(testing.CreateAction)
 			Expect(ok).To(BeTrue())
 
-			restore := create.GetObject().(*snapshotv1alpha1.VirtualMachineRestore)
-			Expect(restore.Spec.VirtualMachineSnapshotName).To(Equal(restoreName))
-			Expect(restore.OwnerReferences).To(HaveLen(1))
-			validateOwnerReference(restore.OwnerReferences[0], vmClone)
+			restorecreated := create.GetObject().(*snapshotv1.VirtualMachineRestore)
+			Expect(restorecreated.Spec.VirtualMachineSnapshotName).To(Equal(snapshotName))
+			Expect(restorecreated.OwnerReferences).To(HaveLen(1))
+			validateOwnerReference(restorecreated.OwnerReferences[0], vmClone)
 
-			return true, create.GetObject(), nil
+			return true, nil, fmt.Errorf("when snapshot source and restore target VMs are different - target VM must not exist")
 		})
 	}
 
-	expectSnapshotDelete := func(snapshotName string) {
-		client.Fake.PrependReactor("delete", snapshotResource, func(action testing.Action) (handled bool, ret runtime.Object, err error) {
-			create, ok := action.(testing.DeleteAction)
-			Expect(ok).To(BeTrue())
-
-			Expect(create.GetName()).To(Equal(snapshotName))
-
-			return true, nil, nil
-		})
+	expectRestoreDoesNotExist := func() {
+		_, err := client.SnapshotV1beta1().VirtualMachineRestores(metav1.NamespaceDefault).Get(context.TODO(), testRestoreName, metav1.GetOptions{})
+		Expect(err).To(MatchError(errors.IsNotFound, "k8serrors.IsNotFound"), "Restore should not exists")
 	}
 
-	expectRestoreDelete := func(restoreName string) {
-		client.Fake.PrependReactor("delete", restoreResource, func(action testing.Action) (handled bool, ret runtime.Object, err error) {
-			create, ok := action.(testing.DeleteAction)
-			Expect(ok).To(BeTrue())
-
-			Expect(create.GetName()).To(Equal(restoreName))
-
-			return true, nil, nil
-		})
+	expectCloneBeInPhase := func(phase clonev1alpha1.VirtualMachineClonePhase) {
+		clone, err := client.CloneV1alpha1().VirtualMachineClones(metav1.NamespaceDefault).Get(context.TODO(), vmClone.Name, metav1.GetOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(clone).ToNot(BeNil())
+		Expect(clone.Status.Phase).To(Equal(phase))
 	}
 
-	expectCloneUpdate := func(phase clonev1alpha1.VirtualMachineClonePhase) {
-		client.Fake.PrependReactor("update", clone.ResourceVMClonePlural, func(action testing.Action) (handled bool, ret runtime.Object, err error) {
-			update, ok := action.(testing.UpdateAction)
-			Expect(ok).To(BeTrue())
-
-			vmClone := update.GetObject().(*clonev1alpha1.VirtualMachineClone)
-			Expect(vmClone.Status.Phase).To(Equal(phase))
-
-			return true, update.GetObject(), nil
-		})
+	expectCloneDeletion := func() {
+		_, err := client.CloneV1alpha1().VirtualMachineClones(metav1.NamespaceDefault).Get(context.TODO(), vmClone.Name, metav1.GetOptions{})
+		Expect(err).To(HaveOccurred())
+		Expect(errors.IsNotFound(err)).To(BeTrue())
 	}
 
 	expectEvent := func(event Event) {
 		testutils.ExpectEvent(recorder, string(event))
 	}
 
-	expectSnapshotContentGet := func(vm *virtv1.VirtualMachine) {
-		client.Fake.PrependReactor("get", snapshotContentResource, func(action testing.Action) (handled bool, ret runtime.Object, err error) {
-			_, ok := action.(testing.GetAction)
-			Expect(ok).To(BeTrue())
-
-			content := snapshotv1alpha1.VirtualMachineSnapshotContent{
-				Spec: snapshotv1alpha1.VirtualMachineSnapshotContentSpec{
-					Source: snapshotv1alpha1.SourceSpec{
-						VirtualMachine: &snapshotv1alpha1.VirtualMachine{
-							ObjectMeta: vm.ObjectMeta,
-							Spec:       vm.Spec,
-							Status:     vm.Status,
-						},
-					},
-				},
-			}
-
-			return true, &content, nil
-		})
-	}
-
 	setSnapshotSource := func(vmClone *clonev1alpha1.VirtualMachineClone, snapshotName string) {
 		source := vmClone.Spec.Source
-		source.APIGroup = pointer.String(snapshotAPIGroup)
+		source.APIGroup = pointer.P(snapshotAPIGroup)
 		source.Kind = "VirtualMachineSnapshot"
 		source.Name = snapshotName
 	}
 
-	BeforeEach(func() {
-		stop = make(chan struct{})
-		ctrl = gomock.NewController(GinkgoT())
-		virtClient := kubecli.NewMockKubevirtClient(ctrl)
-
-		testNamespace = util.NamespaceTestDefault
-
-		vmInterface = kubecli.NewMockVirtualMachineInterface(ctrl)
-		vmInformer, _ = testutils.NewFakeInformerFor(&virtv1.VirtualMachine{})
-		snapshotInformer, _ = testutils.NewFakeInformerFor(&snapshotv1alpha1.VirtualMachineSnapshot{})
-		restoreInformer, _ = testutils.NewFakeInformerFor(&snapshotv1alpha1.VirtualMachineRestore{})
-		cloneInformer, cloneSource = testutils.NewFakeInformerFor(&clonev1alpha1.VirtualMachineClone{})
-		snapshotContentInformer, _ = testutils.NewFakeInformerFor(&snapshotv1alpha1.VirtualMachineSnapshotContent{})
-
-		recorder = record.NewFakeRecorder(100)
-		recorder.IncludeObject = true
-
-		controller, _ = NewVmCloneController(
-			virtClient,
-			cloneInformer,
-			snapshotInformer,
-			restoreInformer,
-			vmInformer,
-			snapshotContentInformer,
-			recorder)
-		mockQueue = testutils.NewMockWorkQueue(controller.vmCloneQueue)
-		controller.vmCloneQueue = mockQueue
-
-		client = kubevirtfake.NewSimpleClientset()
-
-		virtClient.EXPECT().VirtualMachine(testNamespace).Return(vmInterface).AnyTimes()
-		virtClient.EXPECT().VirtualMachineClone(util.NamespaceTestDefault).Return(client.CloneV1alpha1().VirtualMachineClones(util.NamespaceTestDefault)).AnyTimes()
-		virtClient.EXPECT().VirtualMachineSnapshot(util.NamespaceTestDefault).Return(client.SnapshotV1alpha1().VirtualMachineSnapshots(util.NamespaceTestDefault)).AnyTimes()
-		virtClient.EXPECT().VirtualMachineRestore(util.NamespaceTestDefault).Return(client.SnapshotV1alpha1().VirtualMachineRestores(util.NamespaceTestDefault)).AnyTimes()
-		virtClient.EXPECT().VirtualMachineSnapshotContent(util.NamespaceTestDefault).Return(client.SnapshotV1alpha1().VirtualMachineSnapshotContents(util.NamespaceTestDefault)).AnyTimes()
-
-		client.Fake.PrependReactor("*", "*", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
-			Expect(action).To(BeNil())
-			return true, nil, nil
-		})
-
-		k8sClient = k8sfake.NewSimpleClientset()
-		k8sClient.Fake.PrependReactor("*", "*", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
-			Expect(action).To(BeNil())
-			return true, nil, nil
-		})
-		virtClient.EXPECT().AppsV1().Return(k8sClient.AppsV1()).AnyTimes()
-
-		syncCaches(stop)
-	})
-
-	BeforeEach(func() {
+	setupResources := func() {
 		sourceVMI := libvmi.New(
 			libvmi.WithInterface(libvmi.InterfaceDeviceWithMasqueradeBinding()),
 			libvmi.WithNetwork(virtv1.DefaultPodNetwork()),
 		)
-		sourceVMI.Namespace = testNamespace
-		sourceVM = tests.NewRandomVirtualMachine(sourceVMI, false)
-		sourceVM.Spec.Running = nil
-		runStrategy := virtv1.RunStrategyHalted
-		sourceVM.Spec.RunStrategy = &runStrategy
+		sourceVMI.Namespace = metav1.NamespaceDefault
+		sourceVM = libvmi.NewVirtualMachine(sourceVMI)
 
-		vmClone = kubecli.NewMinimalCloneWithNS("testclone", util.NamespaceTestDefault)
+		vmClone = kubecli.NewMinimalCloneWithNS("testclone", metav1.NamespaceDefault)
 		cloneSourceRef := &k8sv1.TypedLocalObjectReference{
-			APIGroup: pointer.String(vmAPIGroup),
+			APIGroup: pointer.P(vmAPIGroup),
 			Kind:     "VirtualMachine",
 			Name:     sourceVM.Name,
 		}
@@ -281,15 +197,55 @@ var _ = Describe("Clone", func() {
 
 		vmClone.Spec.Source = cloneSourceRef
 		vmClone.Spec.Target = cloneTargetRef
-		vmClone.UID = "clone-uid"
+		vmClone.UID = testCloneUID
 		updateCloneConditions(vmClone,
 			newProgressingCondition(k8sv1.ConditionTrue, "Still processing"),
 			newReadyCondition(k8sv1.ConditionFalse, "Still processing"),
 		)
+	}
+
+	BeforeEach(func() {
+		ctrl := gomock.NewController(GinkgoT())
+		vmInformer, _ := testutils.NewFakeInformerFor(&virtv1.VirtualMachine{})
+		snapshotInformer, _ := testutils.NewFakeInformerFor(&snapshotv1.VirtualMachineSnapshot{})
+		restoreInformer, _ := testutils.NewFakeInformerFor(&snapshotv1.VirtualMachineRestore{})
+		cloneInformer, _ := testutils.NewFakeInformerFor(&clonev1alpha1.VirtualMachineClone{})
+		snapshotContentInformer, _ := testutils.NewFakeInformerFor(&snapshotv1.VirtualMachineSnapshotContent{})
+		pvcInformer, _ := testutils.NewFakeInformerFor(&k8sv1.PersistentVolumeClaim{})
+
+		recorder = record.NewFakeRecorder(100)
+		recorder.IncludeObject = true
+		virtClient := kubecli.NewMockKubevirtClient(ctrl)
+		controller, _ = NewVmCloneController(
+			virtClient,
+			cloneInformer,
+			snapshotInformer,
+			restoreInformer,
+			vmInformer,
+			snapshotContentInformer,
+			pvcInformer,
+			recorder)
+		mockQueue = testutils.NewMockWorkQueue(controller.vmCloneQueue)
+		controller.vmCloneQueue = mockQueue
+
+		setupResources()
+
+		client = kubevirtfake.NewSimpleClientset()
+
+		virtClient.EXPECT().VirtualMachineClone(metav1.NamespaceDefault).Return(client.CloneV1alpha1().VirtualMachineClones(metav1.NamespaceDefault)).AnyTimes()
+		virtClient.EXPECT().VirtualMachineSnapshot(metav1.NamespaceDefault).Return(client.SnapshotV1beta1().VirtualMachineSnapshots(metav1.NamespaceDefault)).AnyTimes()
+		virtClient.EXPECT().VirtualMachineRestore(metav1.NamespaceDefault).Return(client.SnapshotV1beta1().VirtualMachineRestores(metav1.NamespaceDefault)).AnyTimes()
+		virtClient.EXPECT().VirtualMachineSnapshotContent(metav1.NamespaceDefault).Return(client.SnapshotV1beta1().VirtualMachineSnapshotContents(metav1.NamespaceDefault)).AnyTimes()
+
+		k8sClient = k8sfake.NewSimpleClientset()
+		k8sClient.Fake.PrependReactor("*", "*", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
+			Expect(action).To(BeNil())
+			return true, nil, nil
+		})
+		virtClient.EXPECT().AppsV1().Return(k8sClient.AppsV1()).AnyTimes()
 	})
 
 	Context("basic controller operations", func() {
-
 		Context("with source VM", func() {
 			DescribeTable("should create snapshot if not exists yet", func(phase clonev1alpha1.VirtualMachineClonePhase) {
 				vmClone.Status.Phase = phase
@@ -297,199 +253,371 @@ var _ = Describe("Clone", func() {
 				addVM(sourceVM)
 				addClone(vmClone)
 
-				expectSnapshotCreate(sourceVM.Name, vmClone)
-				expectCloneUpdate(clonev1alpha1.SnapshotInProgress)
-
 				controller.Execute()
 				expectEvent(SnapshotCreated)
+				expectSnapshotExists()
+				expectCloneBeInPhase(clonev1alpha1.SnapshotInProgress)
 			},
 				Entry("with phase unset", clonev1alpha1.PhaseUnset),
 				Entry("with phase snapshot in progress", clonev1alpha1.SnapshotInProgress),
 			)
 
-			It("when snapshot is not ready yet - should not do anything", func() {
-				snapshot := createVirtualMachineSnapshot(sourceVM)
-				snapshot.Status.ReadyToUse = pointer.Bool(false)
+			When("snapshot is created", func() {
+				var snapshot *snapshotv1.VirtualMachineSnapshot
 
-				vmClone.Status.SnapshotName = pointer.String(snapshot.Name)
-				vmClone.Status.Phase = clonev1alpha1.SnapshotInProgress
+				BeforeEach(func() {
+					snapshot = createVirtualMachineSnapshot(sourceVM)
+				})
 
-				addVM(sourceVM)
-				addClone(vmClone)
-				addSnapshot(snapshot)
+				It("and is not ready yet - should not do anything", func() {
+					snapshot.Status.ReadyToUse = pointer.P(false)
 
-				controller.Execute()
+					vmClone.Status.SnapshotName = pointer.P(snapshot.Name)
+					vmClone.Status.Phase = clonev1alpha1.SnapshotInProgress
+
+					addVM(sourceVM)
+					addClone(vmClone)
+					addSnapshot(snapshot)
+
+					controller.Execute()
+					Expect(recorder.Events).To(BeEmpty())
+					expectCloneBeInPhase(clonev1alpha1.SnapshotInProgress)
+					expectRestoreDoesNotExist()
+				})
+
+				It("and is ready - should update status and create restore", func() {
+					snapshotContent := createVirtualMachineSnapshotContent(sourceVM)
+
+					snapshot.Status.ReadyToUse = pointer.P(true)
+
+					vmClone.Status.SnapshotName = pointer.P(snapshot.Name)
+					vmClone.Status.Phase = clonev1alpha1.SnapshotInProgress
+
+					addVM(sourceVM)
+					addClone(vmClone)
+					addSnapshot(snapshot)
+					addSnapshotContent(snapshotContent)
+
+					controller.Execute()
+					expectEvent(SnapshotReady)
+					expectEvent(RestoreCreated)
+					expectCloneBeInPhase(clonev1alpha1.RestoreInProgress)
+					expectRestoreExists()
+				})
 			})
 
-			It("when snapshot is ready - should update status and create restore", func() {
-				snapshot := createVirtualMachineSnapshot(sourceVM)
-				snapshot.Status.ReadyToUse = pointer.Bool(true)
+			When("restore is created", func() {
+				var (
+					snapshot *snapshotv1.VirtualMachineSnapshot
+					restore  *snapshotv1.VirtualMachineRestore
+				)
 
-				vmClone.Status.SnapshotName = pointer.String(snapshot.Name)
-				vmClone.Status.Phase = clonev1alpha1.SnapshotInProgress
+				BeforeEach(func() {
+					snapshot = createVirtualMachineSnapshot(sourceVM)
+					snapshot.Status.ReadyToUse = pointer.P(true)
+					restore = createVirtualMachineRestore(sourceVM, snapshot.Name)
+				})
 
-				addVM(sourceVM)
-				addClone(vmClone)
-				addSnapshot(snapshot)
+				It("and is not ready yet - should do nothing", func() {
+					restore.Status.Complete = pointer.P(false)
 
-				expectCloneUpdate(clonev1alpha1.RestoreInProgress)
-				expectRestoreCreate(snapshot.Name, vmClone)
+					vmClone.Status.SnapshotName = pointer.P(snapshot.Name)
+					vmClone.Status.RestoreName = pointer.P(restore.Name)
+					vmClone.Status.Phase = clonev1alpha1.RestoreInProgress
 
-				controller.Execute()
-				expectEvent(SnapshotReady)
-				expectEvent(RestoreCreated)
+					addVM(sourceVM)
+					addClone(vmClone)
+					addSnapshot(snapshot)
+					addRestore(restore)
+
+					controller.Execute()
+					Expect(recorder.Events).To(BeEmpty())
+					expectCloneBeInPhase(clonev1alpha1.RestoreInProgress)
+				})
+
+				It("and is ready - should update status", func() {
+					restore.Status.Complete = pointer.P(true)
+
+					vmClone.Status.SnapshotName = pointer.P(snapshot.Name)
+					vmClone.Status.RestoreName = pointer.P(restore.Name)
+					vmClone.Status.Phase = clonev1alpha1.RestoreInProgress
+
+					addVM(sourceVM)
+					addClone(vmClone)
+					addSnapshot(snapshot)
+					addRestore(restore)
+
+					controller.Execute()
+					expectEvent(RestoreReady)
+					expectCloneBeInPhase(clonev1alpha1.CreatingTargetVM)
+				})
 			})
 
-			It("when restore is not ready yet - should do nothing", func() {
-				snapshot := createVirtualMachineSnapshot(sourceVM)
-				snapshot.Status.ReadyToUse = pointer.Bool(true)
+			When("snapshot and restore are finished", func() {
+				var (
+					snapshot *snapshotv1.VirtualMachineSnapshot
+					restore  *snapshotv1.VirtualMachineRestore
+				)
 
-				restore := createVirtualMachineRestore(sourceVM, snapshot.Name)
-				restore.Status.Complete = pointer.Bool(false)
+				BeforeEach(func() {
+					snapshot = createVirtualMachineSnapshot(sourceVM)
+					snapshot.Status.ReadyToUse = pointer.P(true)
+					restore = createVirtualMachineRestore(sourceVM, snapshot.Name)
+					restore.Status.Complete = pointer.P(true)
+					vmClone.Status.SnapshotName = pointer.P(snapshot.Name)
+					vmClone.Status.RestoreName = pointer.P(restore.Name)
+					vmClone.Status.Phase = clonev1alpha1.CreatingTargetVM
+				})
 
-				vmClone.Status.SnapshotName = pointer.String(snapshot.Name)
-				vmClone.Status.RestoreName = pointer.String(restore.Name)
-				vmClone.Status.Phase = clonev1alpha1.RestoreInProgress
+				It("and the target VM is not ready - should do nothing", func() {
+					addVM(sourceVM)
+					addClone(vmClone)
+					addSnapshot(snapshot)
+					addRestore(restore)
 
-				addVM(sourceVM)
-				addClone(vmClone)
-				addSnapshot(snapshot)
-				addRestore(restore)
+					controller.Execute()
+					Expect(recorder.Events).To(BeEmpty())
+					expectCloneBeInPhase(clonev1alpha1.CreatingTargetVM)
+				})
 
-				controller.Execute()
+				It("and the target VM ready should move to Succeeded phase", func() {
+					targetVM := sourceVM.DeepCopy()
+					targetVM.Name = vmClone.Spec.Target.Name
+
+					addVM(sourceVM)
+					addVM(targetVM)
+					addClone(vmClone)
+					addSnapshot(snapshot)
+					addRestore(restore)
+
+					controller.Execute()
+					expectEvent(TargetVMCreated)
+					expectCloneBeInPhase(clonev1alpha1.Succeeded)
+					expectSnapshotDoesNotExist()
+					expectRestoreDoesNotExist()
+				})
 			})
 
-			It("when restore is ready - should update status", func() {
-				snapshot := createVirtualMachineSnapshot(sourceVM)
-				snapshot.Status.ReadyToUse = pointer.Bool(true)
+			When("the clone process is finished and involves one or more PVCs", func() {
+				var (
+					pvc      *k8sv1.PersistentVolumeClaim
+					snapshot *snapshotv1.VirtualMachineSnapshot
+					restore  *snapshotv1.VirtualMachineRestore
+				)
 
-				restore := createVirtualMachineRestore(sourceVM, snapshot.Name)
-				restore.Status.Complete = pointer.Bool(true)
+				BeforeEach(func() {
+					snapshot = createVirtualMachineSnapshot(sourceVM, createOwnerReference(vmClone))
+					snapshot.Status.ReadyToUse = pointer.P(true)
 
-				vmClone.Status.SnapshotName = pointer.String(snapshot.Name)
-				vmClone.Status.RestoreName = pointer.String(restore.Name)
-				vmClone.Status.Phase = clonev1alpha1.RestoreInProgress
+					pvc = createPVC(sourceVM.Namespace, k8sv1.ClaimPending)
 
-				addVM(sourceVM)
-				addClone(vmClone)
-				addSnapshot(snapshot)
-				addRestore(restore)
+					restore = createVirtualMachineRestore(sourceVM, snapshot.Name, createOwnerReference(vmClone))
+					restore.Status.Complete = pointer.P(true)
+					restore.Status.Restores = []snapshotv1.VolumeRestore{
+						{PersistentVolumeClaimName: pvc.Name},
+					}
 
-				expectCloneUpdate(clonev1alpha1.CreatingTargetVM)
+					vmClone.Status.SnapshotName = pointer.P(snapshot.Name)
+					vmClone.Status.RestoreName = pointer.P(restore.Name)
+					vmClone.Status.Phase = clonev1alpha1.Succeeded
+					vmClone.Status.TargetName = pointer.P(vmClone.Spec.Target.Name)
 
-				controller.Execute()
-				expectEvent(RestoreReady)
-			})
+					targetVM := sourceVM.DeepCopy()
+					targetVM.Name = vmClone.Spec.Target.Name
 
-			It("when target VM is not ready - should do nothing", func() {
-				snapshot := createVirtualMachineSnapshot(sourceVM)
-				snapshot.Status.ReadyToUse = pointer.Bool(true)
+					addVM(sourceVM)
+					addVM(targetVM)
+					addClone(vmClone)
+					addSnapshot(snapshot)
+					addRestore(restore)
+					addPVC(pvc)
+				})
 
-				restore := createVirtualMachineRestore(sourceVM, snapshot.Name)
-				restore.Status.Complete = pointer.Bool(true)
+				It("if not all the PVCs are bound, nothing should happen", func() {
+					controller.Execute()
+					Expect(recorder.Events).To(BeEmpty())
+					expectCloneBeInPhase(clonev1alpha1.Succeeded)
+					expectSnapshotExists()
+					expectRestoreExists()
+				})
 
-				vmClone.Status.SnapshotName = pointer.String(snapshot.Name)
-				vmClone.Status.RestoreName = pointer.String(restore.Name)
-				vmClone.Status.Phase = clonev1alpha1.CreatingTargetVM
-
-				addVM(sourceVM)
-				addClone(vmClone)
-				addSnapshot(snapshot)
-				addRestore(restore)
-
-				controller.Execute()
-			})
-
-			It("when clone is done (target VM ready) should move to Succeeded phase", func() {
-				snapshot := createVirtualMachineSnapshot(sourceVM)
-				snapshot.Status.ReadyToUse = pointer.Bool(true)
-
-				restore := createVirtualMachineRestore(sourceVM, snapshot.Name)
-				restore.Status.Complete = pointer.Bool(true)
-
-				vmClone.Status.SnapshotName = pointer.String(snapshot.Name)
-				vmClone.Status.RestoreName = pointer.String(restore.Name)
-				vmClone.Status.Phase = clonev1alpha1.CreatingTargetVM
-
-				targetVM := sourceVM.DeepCopy()
-				targetVM.Name = vmClone.Spec.Target.Name
-
-				addVM(sourceVM)
-				addVM(targetVM)
-				addClone(vmClone)
-				addSnapshot(snapshot)
-				addRestore(restore)
-
-				expectCloneUpdate(clonev1alpha1.Succeeded)
-				expectSnapshotDelete(snapshot.Name)
-				expectRestoreDelete(restore.Name)
-
-				controller.Execute()
-				expectEvent(TargetVMCreated)
+				It("if all the pvc are bound, snapshot and restore should be deleted", func() {
+					pvc = createPVC(sourceVM.Namespace, k8sv1.ClaimBound)
+					addPVC(pvc)
+					controller.Execute()
+					expectEvent(PVCBound)
+					expectSnapshotDoesNotExist()
+					expectRestoreDoesNotExist()
+				})
 			})
 
 			It("when snapshot is deleted before restore is ready - should fail", func() {
-				const snapshotThatDoesntExistName = "snapshot-that-does-not-exist"
+				restore := createVirtualMachineRestore(sourceVM, testSnapshotName)
+				restore.Status.Complete = pointer.P(false)
 
-				restore := createVirtualMachineRestore(sourceVM, snapshotThatDoesntExistName)
-				restore.Status.Complete = pointer.Bool(false)
-
-				vmClone.Status.SnapshotName = pointer.String(snapshotThatDoesntExistName)
-				vmClone.Status.RestoreName = pointer.String(restore.Name)
+				vmClone.Status.SnapshotName = pointer.P(testSnapshotName)
+				vmClone.Status.RestoreName = pointer.P(restore.Name)
 				vmClone.Status.Phase = clonev1alpha1.RestoreInProgress
 
 				addVM(sourceVM)
 				addClone(vmClone)
 				addRestore(restore)
 
-				expectCloneUpdate(clonev1alpha1.Failed)
-
 				controller.Execute()
 				expectEvent(SnapshotDeleted)
+				expectCloneBeInPhase(clonev1alpha1.Failed)
+				expectSnapshotDoesNotExist()
 			})
+
+			It("when snapshot already exists and vmclone is not update yet- should update the clone phase", func() {
+				vmClone.Status.Phase = clonev1alpha1.PhaseUnset
+
+				addVM(sourceVM)
+				addClone(vmClone)
+
+				snapshot := createVirtualMachineSnapshot(sourceVM)
+				addSnapshot(snapshot)
+
+				controller.Execute()
+				expectCloneBeInPhase(clonev1alpha1.SnapshotInProgress)
+			})
+
+			When("restore already exists and vmclone is not updated yet", func() {
+				It("should update the clone phase", func() {
+					snapshot := createVirtualMachineSnapshot(sourceVM)
+					snapshot.Status.ReadyToUse = pointer.P(true)
+
+					restore := createVirtualMachineRestore(sourceVM, snapshot.Name)
+
+					vmClone.Status.SnapshotName = pointer.P(snapshot.Name)
+
+					vmClone.Status.Phase = clonev1alpha1.SnapshotInProgress
+
+					addVM(sourceVM)
+					addClone(vmClone)
+					addSnapshot(snapshot)
+					addRestore(restore)
+
+					controller.Execute()
+					expectCloneBeInPhase(clonev1alpha1.RestoreInProgress)
+					expectEvent(SnapshotReady)
+				})
+			})
+
+			When("target VM already exists", func() {
+				It("should fire the related event", func() {
+					snapshot := createVirtualMachineSnapshot(sourceVM)
+					snapshotContent := createVirtualMachineSnapshotContent(sourceVM)
+					snapshot.Status.ReadyToUse = pointer.P(true)
+					restore := createVirtualMachineRestore(sourceVM, snapshot.Name)
+
+					vmClone.Status.SnapshotName = pointer.P(snapshot.Name)
+
+					vmClone.Status.Phase = clonev1alpha1.SnapshotInProgress
+
+					expectRestoreCreationFailure(snapshot.Name, vmClone, restore.Name)
+					addVM(sourceVM)
+					addClone(vmClone)
+					addSnapshot(snapshot)
+					addSnapshotContent(snapshotContent)
+
+					controller.Execute()
+					expectCloneBeInPhase(clonev1alpha1.RestoreInProgress)
+					expectEvent(SnapshotReady)
+					expectEvent(RestoreCreationFailed)
+				})
+			})
+
+			When("target VM is deleted", func() {
+				It("should delete the vm clone resource", func() {
+					vmClone.Status.TargetName = pointer.P("target-vm-name")
+					vmClone.Status.Phase = clonev1alpha1.Succeeded
+
+					addVM(sourceVM)
+					addClone(vmClone)
+					//no target vm added => target vm deleted
+
+					controller.Execute()
+					expectCloneDeletion()
+				})
+			})
+
 		})
 
 		Context("with source snapshot", func() {
 			It("when snapshot is not ready yet - should not do anything", func() {
 				snapshot := createVirtualMachineSnapshot(sourceVM)
-				snapshot.Status.ReadyToUse = pointer.Bool(false)
+				snapshot.Status.ReadyToUse = pointer.P(false)
 
 				setSnapshotSource(vmClone, snapshot.Name)
 
-				vmClone.Status.SnapshotName = pointer.String(snapshot.Name)
+				vmClone.Status.SnapshotName = pointer.P(snapshot.Name)
 				vmClone.Status.Phase = clonev1alpha1.SnapshotInProgress
 
-				addVM(sourceVM)
 				addClone(vmClone)
 				addSnapshot(snapshot)
 
 				controller.Execute()
+				Expect(recorder.Events).To(BeEmpty())
+				expectCloneBeInPhase(clonev1alpha1.SnapshotInProgress)
+				expectRestoreDoesNotExist()
+			})
+
+			It("when snapshot is ready - should update status and create restore", func() {
+				snapshot := createVirtualMachineSnapshot(sourceVM)
+				snapshot.Status.ReadyToUse = pointer.P(true)
+				setSnapshotSource(vmClone, snapshot.Name)
+				snapshotContent := createVirtualMachineSnapshotContent(sourceVM)
+
+				addClone(vmClone)
+				addSnapshot(snapshot)
+				addSnapshotContent(snapshotContent)
+
+				controller.Execute()
+				expectEvent(SnapshotReady)
+				expectEvent(RestoreCreated)
+				expectCloneBeInPhase(clonev1alpha1.RestoreInProgress)
+				expectRestoreExists()
+			})
+
+			It("when restore already exists and vmclone is not update yet - should update the clone phase", func() {
+				snapshot := createVirtualMachineSnapshot(sourceVM)
+				snapshot.Status.ReadyToUse = pointer.P(true)
+
+				setSnapshotSource(vmClone, snapshot.Name)
+
+				restore := createVirtualMachineRestore(sourceVM, snapshot.Name)
+
+				vmClone.Status.SnapshotName = pointer.P(snapshot.Name)
+				vmClone.Status.Phase = clonev1alpha1.PhaseUnset
+
+				addClone(vmClone)
+				addSnapshot(snapshot)
+				addRestore(restore)
+
+				controller.Execute()
+				expectCloneBeInPhase(clonev1alpha1.RestoreInProgress)
 			})
 		})
-
 	})
 
 	Context("generation of target VM", func() {
-
-		var snapshotName string
-
 		BeforeEach(func() {
 			snapshot := createVirtualMachineSnapshot(sourceVM)
-			snapshotName = snapshot.Name
-			snapshot.Status.ReadyToUse = pointer.BoolPtr(true)
+			snapshot.Status.ReadyToUse = pointer.P(true)
 
-			vmClone.Status.SnapshotName = pointer.String(snapshot.Name)
+			vmClone.Status.SnapshotName = pointer.P(snapshot.Name)
 			vmClone.Status.Phase = clonev1alpha1.RestoreInProgress
 
 			addVM(sourceVM)
 			addSnapshot(snapshot)
-
-			// update to restore name is expected, although phase remains the same
-			expectCloneUpdate(clonev1alpha1.RestoreInProgress)
+			content := createVirtualMachineSnapshotContent(sourceVM)
+			addSnapshotContent(content)
 		})
 
 		AfterEach(func() {
 			expectEvent(RestoreCreated)
+			expectCloneBeInPhase(clonev1alpha1.RestoreInProgress)
 		})
 
 		offlinePatchVM := func(vm *virtv1.VirtualMachine, patches []string) (virtv1.VirtualMachine, error) {
@@ -521,18 +649,12 @@ var _ = Describe("Clone", func() {
 		}
 
 		expectVMCreationFromPatches := func(expectedVM *virtv1.VirtualMachine) {
-			client.Fake.PrependReactor("create", restoreResource, func(action testing.Action) (handled bool, ret runtime.Object, err error) {
-				create, ok := action.(testing.CreateAction)
-				Expect(ok).To(BeTrue())
-
-				restore := create.GetObject().(*snapshotv1alpha1.VirtualMachineRestore)
-				Expect(restore.Spec.VirtualMachineSnapshotName).To(Equal(snapshotName))
-
-				patchedVM, err := offlinePatchVM(sourceVM, restore.Spec.Patches)
-				Expect(patchedVM.Spec).To(Equal(patchedVM.Spec))
-
-				return true, create.GetObject(), nil
-			})
+			restore, err := client.SnapshotV1beta1().VirtualMachineRestores(metav1.NamespaceDefault).Get(context.TODO(), testRestoreName, metav1.GetOptions{})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(restore.Spec.VirtualMachineSnapshotName).To(Equal(testSnapshotName))
+			patchedVM, err := offlinePatchVM(sourceVM, restore.Spec.Patches)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(patchedVM.Spec).To(Equal(expectedVM.Spec))
 		}
 
 		Context("MAC address", func() {
@@ -564,9 +686,8 @@ var _ = Describe("Clone", func() {
 				expectedInterfaces := expectedVM.Spec.Template.Spec.Domain.Devices.Interfaces
 				expectedInterfaces[0].MacAddress = ""
 
-				expectVMCreationFromPatches(expectedVM)
-
 				controller.Execute()
+				expectVMCreationFromPatches(expectedVM)
 			})
 
 			It("if mac is defined in clone spec - should use the one in clone spec", func() {
@@ -584,9 +705,8 @@ var _ = Describe("Clone", func() {
 				expectedInterfaces := expectedVM.Spec.Template.Spec.Domain.Devices.Interfaces
 				expectedInterfaces[0].MacAddress = newMacAddress
 
-				expectVMCreationFromPatches(expectedVM)
-
 				controller.Execute()
+				expectVMCreationFromPatches(expectedVM)
 			})
 
 			It("should handle multiple patches", func() {
@@ -608,8 +728,11 @@ var _ = Describe("Clone", func() {
 					if i%2 == 0 {
 						iface.MacAddress = generateNewMacAddress()
 						newMacAddresses[iface.Name] = iface.MacAddress
-						expectedInterfaces[i] = iface
+					} else {
+						// empty MAC for others
+						iface.MacAddress = ""
 					}
+					expectedInterfaces[i] = iface
 				}
 
 				sourceVM.Spec.Template.Spec.Domain.Devices.Interfaces = originalInterfaces
@@ -620,11 +743,9 @@ var _ = Describe("Clone", func() {
 				expectedVM := sourceVM.DeepCopy()
 				expectedVM.Spec.Template.Spec.Domain.Devices.Interfaces = expectedInterfaces
 
-				expectVMCreationFromPatches(expectedVM)
-
 				controller.Execute()
+				expectVMCreationFromPatches(expectedVM)
 			})
-
 		})
 
 		Context("SMBios Serial", func() {
@@ -647,24 +768,20 @@ var _ = Describe("Clone", func() {
 
 			It("should delete smbios serial if serial is not provided", func() {
 				addClone(vmClone)
-				expectSMbiosSerial(emptySerial)
 
 				controller.Execute()
+				expectSMbiosSerial(emptySerial)
 			})
 
 			It("if serial is defined in clone spec - should use the one in clone spec", func() {
-				vmClone.Spec.NewSMBiosSerial = pointer.String(manuallySetSerial)
+				vmClone.Spec.NewSMBiosSerial = pointer.P(manuallySetSerial)
 				addClone(vmClone)
-
-				expectSMbiosSerial(manuallySetSerial)
-
 				controller.Execute()
+				expectSMbiosSerial(manuallySetSerial)
 			})
-
 		})
 
 		Context("Labels and annotations", func() {
-
 			type mapType string
 			const labels mapType = "labels"
 			const annotations mapType = "annotations"
@@ -707,22 +824,60 @@ var _ = Describe("Clone", func() {
 					vmClone.Spec.AnnotationFilters = filters
 				}
 				addClone(vmClone)
-
+				controller.Execute()
 				expectLabelsOrAnnotations(map[string]string{
 					"prefix1/something1":    trueStr,
 					"somePrefix2/something": trueStr,
 				}, labelOrAnnotation)
-
-				controller.Execute()
 			},
 				Entry("with labels", labels),
 				Entry("with annotations", annotations),
 			)
 
+			It("should not strip lastRestoreUID annotation from newly created VM", func() {
+				if sourceVM.Annotations == nil {
+					sourceVM.Annotations = make(map[string]string)
+				}
+				sourceVM.Annotations["restore.kubevirt.io/lastRestoreUID"] = "bar"
+				// controller mutates original ptrs annotations
+				sourceVMCpy := sourceVM.DeepCopy()
+				vmClone.Spec.AnnotationFilters = []string{"somekey/*"}
+				addVM(sourceVM)
+				addClone(vmClone)
+
+				controller.Execute()
+				restore, err := client.SnapshotV1beta1().VirtualMachineRestores(metav1.NamespaceDefault).Get(context.TODO(), testRestoreName, metav1.GetOptions{})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(restore.Spec.VirtualMachineSnapshotName).To(Equal(testSnapshotName))
+				expectedPatches, err := generateStringPatchOperations(patch.New(patch.WithReplace("/spec/template/spec/domain/devices/interfaces/0/macAddress", "")))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(restore.Spec.Patches).To(Equal(expectedPatches))
+				patchedVM, err := offlinePatchVM(sourceVMCpy, restore.Spec.Patches)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(patchedVM.Annotations).To(HaveKey("restore.kubevirt.io/lastRestoreUID"))
+			})
+
+			It("should generate patches from the vmsnapshotcontent, instead of the current VM", func() {
+				if sourceVM.Annotations == nil {
+					sourceVM.Annotations = make(map[string]string)
+				}
+				// add annotation to create dis-alignment between vm and vmsnapshotcontent
+				sourceVM.Annotations["new_annotation_matching_filter"] = "ok"
+				vmClone.Spec.AnnotationFilters = []string{"somekey/*"}
+				addVM(sourceVM)
+				addClone(vmClone)
+
+				controller.Execute()
+				restore, err := client.SnapshotV1beta1().VirtualMachineRestores(metav1.NamespaceDefault).Get(context.TODO(), testRestoreName, metav1.GetOptions{})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(restore.Spec.VirtualMachineSnapshotName).To(Equal(testSnapshotName))
+				partialExpectedPatches, err := generateStringPatchOperations(patch.New(patch.WithRemove("/metadata/annotations/new_annotation_matching_filter")))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(restore.Spec.Patches).ToNot(ContainElement(partialExpectedPatches[0]))
+			})
 		})
 
 		Context("Firmware UUID", func() {
-
 			const sourceFakeUUID = "source-fake-uuid"
 
 			BeforeEach(func() {
@@ -738,67 +893,82 @@ var _ = Describe("Clone", func() {
 				Expect(expectedFirmware).ShouldNot(BeNil())
 
 				expectedFirmware.UUID = ""
-
-				expectVMCreationFromPatches(expectedVM)
 				controller.Execute()
+				expectVMCreationFromPatches(expectedVM)
 			})
-
 		})
 
-	})
-
-	Context("different sources", func() {
-		It("should support snapshot source", func() {
-			snapshot := createVirtualMachineSnapshot(sourceVM)
-
-			setSnapshotSource(vmClone, snapshot.Name)
-
-			addClone(vmClone)
-			addSnapshot(snapshot)
-
-			expectSnapshotContentGet(sourceVM)
-			expectRestoreCreate(snapshot.Name, vmClone)
-
-			_, err := controller.sync(vmClone)
-			Expect(err).ToNot(HaveOccurred())
-		})
 	})
 })
 
-func createVirtualMachineSnapshot(vm *virtv1.VirtualMachine) *snapshotv1alpha1.VirtualMachineSnapshot {
-	return &snapshotv1alpha1.VirtualMachineSnapshot{
+func createVirtualMachineSnapshot(vm *virtv1.VirtualMachine, owner ...metav1.OwnerReference) *snapshotv1.VirtualMachineSnapshot {
+	return &snapshotv1.VirtualMachineSnapshot{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-snapshot",
-			Namespace: vm.Namespace,
-			UID:       "snapshot-UID",
+			Name:            testSnapshotName,
+			Namespace:       vm.Namespace,
+			UID:             "snapshot-UID",
+			OwnerReferences: owner,
 		},
-		Spec: snapshotv1alpha1.VirtualMachineSnapshotSpec{
+		Spec: snapshotv1.VirtualMachineSnapshotSpec{
 			Source: k8sv1.TypedLocalObjectReference{
-				APIGroup: pointer.String(vmAPIGroup),
+				APIGroup: pointer.P(vmAPIGroup),
 				Kind:     "VirtualMachine",
 				Name:     vm.Name,
 			},
 		},
-		Status: &snapshotv1alpha1.VirtualMachineSnapshotStatus{},
+		Status: &snapshotv1.VirtualMachineSnapshotStatus{},
 	}
 }
 
-func createVirtualMachineRestore(vm *virtv1.VirtualMachine, snapshotName string) *snapshotv1alpha1.VirtualMachineRestore {
-	return &snapshotv1alpha1.VirtualMachineRestore{
+func createVirtualMachineSnapshotContent(vm *virtv1.VirtualMachine) *snapshotv1.VirtualMachineSnapshotContent {
+	return &snapshotv1.VirtualMachineSnapshotContent{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-restore",
+			Name:      testSnapshotContentName,
 			Namespace: vm.Namespace,
-			UID:       "restore-UID",
+			UID:       "snapshotcontent-UID",
 		},
-		Spec: snapshotv1alpha1.VirtualMachineRestoreSpec{
+		Spec: snapshotv1.VirtualMachineSnapshotContentSpec{
+			Source: snapshotv1.SourceSpec{
+				VirtualMachine: &snapshotv1.VirtualMachine{
+					ObjectMeta: vm.ObjectMeta,
+					Spec:       vm.Spec,
+					Status:     vm.Status,
+				},
+			},
+		},
+	}
+}
+
+func createVirtualMachineRestore(vm *virtv1.VirtualMachine, snapshotName string, owner ...metav1.OwnerReference) *snapshotv1.VirtualMachineRestore {
+	return &snapshotv1.VirtualMachineRestore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            testRestoreName,
+			Namespace:       vm.Namespace,
+			UID:             "restore-UID",
+			OwnerReferences: owner,
+		},
+		Spec: snapshotv1.VirtualMachineRestoreSpec{
 			Target: k8sv1.TypedLocalObjectReference{
-				APIGroup: pointer.String(vmAPIGroup),
+				APIGroup: pointer.P(vmAPIGroup),
 				Kind:     "VirtualMachine",
 				Name:     vm.Name,
 			},
 			VirtualMachineSnapshotName: snapshotName,
 		},
-		Status: &snapshotv1alpha1.VirtualMachineRestoreStatus{},
+		Status: &snapshotv1.VirtualMachineRestoreStatus{},
+	}
+}
+
+func createPVC(namespace string, phase k8sv1.PersistentVolumeClaimPhase) *k8sv1.PersistentVolumeClaim {
+	return &k8sv1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "restore-pvc",
+			Namespace: namespace,
+			UID:       "pvc-UID",
+		},
+		Status: k8sv1.PersistentVolumeClaimStatus{
+			Phase: phase,
+		},
 	}
 }
 
@@ -813,4 +983,15 @@ func validateOwnerReference(ownerRef metav1.OwnerReference, expectedOwner metav1
 	Expect(*ownerRef.BlockOwnerDeletion).To(BeTrue(), err)
 	Expect(ownerRef.Controller).ToNot(BeNil(), err)
 	Expect(*ownerRef.Controller).To(BeTrue(), err)
+}
+
+func createOwnerReference(owner metav1.Object) metav1.OwnerReference {
+	return metav1.OwnerReference{
+		UID:                owner.GetUID(),
+		Name:               owner.GetName(),
+		Kind:               clonev1alpha1.VirtualMachineCloneKind.Kind,
+		APIVersion:         clonev1alpha1.VirtualMachineCloneKind.GroupVersion().String(),
+		BlockOwnerDeletion: pointer.P(true),
+		Controller:         pointer.P(true),
+	}
 }

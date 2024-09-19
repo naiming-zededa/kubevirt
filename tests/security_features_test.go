@@ -25,33 +25,31 @@ import (
 	"strings"
 	"time"
 
-	"kubevirt.io/kubevirt/tests/libmigration"
-
-	"kubevirt.io/kubevirt/pkg/virt-operator/resource/generate/components"
-	"kubevirt.io/kubevirt/tests/libnode"
-
-	"kubevirt.io/kubevirt/tests/decorators"
-
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
 	k8sv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"kubevirt.io/kubevirt/tests/exec"
-	"kubevirt.io/kubevirt/tests/framework/checks"
-	"kubevirt.io/kubevirt/tests/framework/kubevirt"
-	"kubevirt.io/kubevirt/tests/testsuite"
-	"kubevirt.io/kubevirt/tests/util"
 
 	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
 
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
+	"kubevirt.io/kubevirt/pkg/virt-operator/resource/generate/components"
 	"kubevirt.io/kubevirt/tests"
 	"kubevirt.io/kubevirt/tests/console"
-	cd "kubevirt.io/kubevirt/tests/containerdisk"
-	"kubevirt.io/kubevirt/tests/libvmi"
+	"kubevirt.io/kubevirt/tests/decorators"
+	"kubevirt.io/kubevirt/tests/exec"
+	"kubevirt.io/kubevirt/tests/framework/checks"
+	"kubevirt.io/kubevirt/tests/framework/kubevirt"
+	"kubevirt.io/kubevirt/tests/libkubevirt"
+	"kubevirt.io/kubevirt/tests/libmigration"
+	"kubevirt.io/kubevirt/tests/libnet"
+	"kubevirt.io/kubevirt/tests/libnode"
+	"kubevirt.io/kubevirt/tests/libpod"
+	"kubevirt.io/kubevirt/tests/libvmifact"
 	"kubevirt.io/kubevirt/tests/libwait"
+	"kubevirt.io/kubevirt/tests/testsuite"
 )
 
 const (
@@ -71,7 +69,7 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 		var kubevirtConfiguration *v1.KubeVirtConfiguration
 
 		BeforeEach(func() {
-			kv := util.GetCurrentKv(virtClient)
+			kv := libkubevirt.GetCurrentKv(virtClient)
 			kubevirtConfiguration = &kv.Spec.Configuration
 		})
 
@@ -84,7 +82,7 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 				config.SELinuxLauncherType = "container_t"
 				tests.UpdateKubeVirtConfigValueAndWait(*config)
 
-				vmi = libvmi.NewCirros()
+				vmi = libvmifact.NewCirros()
 
 				// VMIs with selinuxLauncherType container_t cannot have network interfaces, since that requires
 				// the `virt_launcher.process` selinux context
@@ -97,24 +95,28 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 			It("[test_id:2953]Ensure virt-launcher pod securityContext type is correctly set", func() {
 
 				By("Starting a VirtualMachineInstance")
-				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), vmi)
+				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), vmi, metav1.CreateOptions{})
 				Expect(err).ToNot(HaveOccurred())
 				libwait.WaitForSuccessfulVMIStart(vmi)
 
 				By("Check virt-launcher pod SecurityContext values")
-				vmiPod := tests.GetRunningPodByVirtualMachineInstance(vmi, testsuite.GetTestNamespace(vmi))
+				vmiPod, err := libpod.GetPodByVirtualMachineInstance(vmi, vmi.Namespace)
+				Expect(err).NotTo(HaveOccurred())
+
 				Expect(vmiPod.Spec.SecurityContext.SELinuxOptions).To(Equal(&k8sv1.SELinuxOptions{Type: "container_t"}))
 			})
 
 			It("[test_id:2895]Make sure the virt-launcher pod is not priviledged", func() {
 
 				By("Starting a VirtualMachineInstance")
-				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), vmi)
+				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), vmi, metav1.CreateOptions{})
 				Expect(err).ToNot(HaveOccurred())
 				libwait.WaitForSuccessfulVMIStart(vmi)
 
 				By("Check virt-launcher pod SecurityContext values")
-				vmiPod := tests.GetRunningPodByVirtualMachineInstance(vmi, testsuite.GetTestNamespace(vmi))
+				vmiPod, err := libpod.GetPodByVirtualMachineInstance(vmi, vmi.Namespace)
+				Expect(err).NotTo(HaveOccurred())
+
 				for _, containerSpec := range vmiPod.Spec.Containers {
 					if containerSpec.Name == "compute" {
 						container = containerSpec
@@ -127,17 +129,19 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 			It("[test_id:4297]Make sure qemu processes are MCS constrained", func() {
 
 				By("Starting a VirtualMachineInstance")
-				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), vmi)
+				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), vmi, metav1.CreateOptions{})
 				Expect(err).ToNot(HaveOccurred())
 				libwait.WaitForSuccessfulVMIStart(vmi)
 
-				emulator, err := tests.GetRunningVMIEmulator(vmi)
+				domSpec, err := tests.GetRunningVMIDomainSpec(vmi)
 				Expect(err).ToNot(HaveOccurred())
-				emulator = "[/]" + strings.TrimPrefix(emulator, "/")
 
-				pod := tests.GetRunningPodByVirtualMachineInstance(vmi, testsuite.GetTestNamespace(vmi))
+				emulator := "[/]" + strings.TrimPrefix(domSpec.Devices.Emulator, "/")
+
+				pod, err := libpod.GetPodByVirtualMachineInstance(vmi, vmi.Namespace)
+				Expect(err).NotTo(HaveOccurred())
+
 				qemuProcessSelinuxContext, err := exec.ExecuteCommandOnPod(
-					virtClient,
 					pod,
 					"compute",
 					[]string{"/usr/bin/bash", "-c", fmt.Sprintf("ps -efZ | grep %s | awk '{print $1}'", emulator)},
@@ -150,7 +154,7 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 				By("Checking that qemu process has SELinux category_set")
 				Expect(strings.Split(qemuProcessSelinuxContext, ":")).To(HaveLen(5))
 
-				err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Delete(context.Background(), vmi.Name, &metav1.DeleteOptions{})
+				err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(vmi)).Delete(context.Background(), vmi.Name, metav1.DeleteOptions{})
 				Expect(err).ToNot(HaveOccurred())
 			})
 		})
@@ -163,11 +167,10 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 				config.SELinuxLauncherType = superPrivilegedType
 				tests.UpdateKubeVirtConfigValueAndWait(*config)
 
-				vmi = tests.NewRandomVMIWithEphemeralDisk(cd.ContainerDiskFor(cd.ContainerDiskAlpine))
-				vmi.Namespace = testsuite.NamespacePrivileged
+				vmi = libvmifact.NewAlpine()
 
 				By("Starting a New VMI")
-				vmi, err = virtClient.VirtualMachineInstance(testsuite.NamespacePrivileged).Create(context.Background(), vmi)
+				vmi, err = virtClient.VirtualMachineInstance(testsuite.NamespacePrivileged).Create(context.Background(), vmi, metav1.CreateOptions{})
 				Expect(err).ToNot(HaveOccurred())
 				libwait.WaitForSuccessfulVMIStart(vmi)
 
@@ -175,14 +178,14 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 				libwait.WaitUntilVMIReady(vmi, console.LoginToAlpine)
 
 				By("Fetching virt-launcher Pod")
-				pod, err := libvmi.GetPodByVirtualMachineInstance(vmi, testsuite.NamespacePrivileged)
+				pod, err := libpod.GetPodByVirtualMachineInstance(vmi, testsuite.NamespacePrivileged)
 				Expect(err).ToNot(HaveOccurred())
 
 				By("Verifying SELinux context contains custom type")
 				Expect(pod.Spec.SecurityContext.SELinuxOptions.Type).To(Equal(superPrivilegedType))
 
 				By("Deleting the VMI")
-				err = virtClient.VirtualMachineInstance(testsuite.NamespacePrivileged).Delete(context.Background(), vmi.Name, &metav1.DeleteOptions{})
+				err = virtClient.VirtualMachineInstance(testsuite.NamespacePrivileged).Delete(context.Background(), vmi.Name, metav1.DeleteOptions{})
 				Expect(err).ToNot(HaveOccurred())
 			})
 		})
@@ -195,11 +198,10 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 				config.SELinuxLauncherType = launcherType
 				tests.UpdateKubeVirtConfigValueAndWait(*config)
 
-				vmi = tests.NewRandomVMIWithEphemeralDisk(cd.ContainerDiskFor(cd.ContainerDiskAlpine))
-				vmi.Namespace = testsuite.NamespacePrivileged
+				vmi = libvmifact.NewAlpine()
 
 				By("Starting a New VMI")
-				vmi, err = virtClient.VirtualMachineInstance(testsuite.NamespacePrivileged).Create(context.Background(), vmi)
+				vmi, err = virtClient.VirtualMachineInstance(testsuite.NamespacePrivileged).Create(context.Background(), vmi, metav1.CreateOptions{})
 				Expect(err).ToNot(HaveOccurred())
 				libwait.WaitForSuccessfulVMIStart(vmi)
 
@@ -207,14 +209,14 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 				libwait.WaitUntilVMIReady(vmi, console.LoginToAlpine)
 
 				By("Fetching virt-launcher Pod")
-				emulator, err := tests.GetRunningVMIEmulator(vmi)
+				domSpec, err := tests.GetRunningVMIDomainSpec(vmi)
 				Expect(err).ToNot(HaveOccurred())
-				emulator = "[/]" + strings.TrimPrefix(emulator, "/")
 
-				pod, err := libvmi.GetPodByVirtualMachineInstance(vmi, testsuite.NamespacePrivileged)
+				emulator := "[/]" + strings.TrimPrefix(domSpec.Devices.Emulator, "/")
+
+				pod, err := libpod.GetPodByVirtualMachineInstance(vmi, testsuite.NamespacePrivileged)
 				Expect(err).ToNot(HaveOccurred())
 				qemuProcessSelinuxContext, err := exec.ExecuteCommandOnPod(
-					virtClient,
 					pod,
 					"compute",
 					[]string{"/usr/bin/bash", "-c", fmt.Sprintf("ps -efZ | grep %s | awk '{print $1}'", emulator)},
@@ -228,7 +230,7 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 				Expect(pod.Spec.SecurityContext.SELinuxOptions.Type).To(Equal(launcherType))
 
 				By("Deleting the VMI")
-				err = virtClient.VirtualMachineInstance(testsuite.NamespacePrivileged).Delete(context.Background(), vmi.Name, &metav1.DeleteOptions{})
+				err = virtClient.VirtualMachineInstance(testsuite.NamespacePrivileged).Delete(context.Background(), vmi.Name, metav1.DeleteOptions{})
 				Expect(err).ToNot(HaveOccurred())
 			})
 		})
@@ -236,13 +238,12 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 
 	Context("Check virt-launcher capabilities", func() {
 		var container k8sv1.Container
-		var vmi *v1.VirtualMachineInstance
 
 		It("[test_id:4300]has precisely the documented extra capabilities relative to a regular user pod", func() {
-			vmi = tests.NewRandomVMIWithEphemeralDisk(cd.ContainerDiskFor(cd.ContainerDiskAlpine))
+			vmi := libvmifact.NewAlpine()
 
 			By("Starting a New VMI")
-			vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), vmi)
+			vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), vmi, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 			libwait.WaitForSuccessfulVMIStart(vmi)
 
@@ -250,7 +251,7 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 			libwait.WaitUntilVMIReady(vmi, console.LoginToAlpine)
 
 			By("Fetching virt-launcher Pod")
-			pod, err := libvmi.GetPodByVirtualMachineInstance(vmi, testsuite.GetTestNamespace(vmi))
+			pod, err := libpod.GetPodByVirtualMachineInstance(vmi, testsuite.GetTestNamespace(vmi))
 			Expect(err).ToNot(HaveOccurred())
 
 			for _, containerSpec := range pod.Spec.Containers {
@@ -314,10 +315,10 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 	})
 	Context("The VMI SELinux context status", func() {
 		It("Should get set and stay the the same after a migration", decorators.RequiresTwoSchedulableNodes, func() {
-			vmi := libvmi.NewAlpine(libvmi.WithMasqueradeNetworking()...)
+			vmi := libvmifact.NewAlpine(libnet.WithMasqueradeNetworking())
 
 			By("Starting a New VMI")
-			vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), vmi)
+			vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Create(context.Background(), vmi, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 			libwait.WaitForSuccessfulVMIStart(vmi)
 
@@ -327,22 +328,22 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 			By("Ensuring the VMI SELinux context status gets set")
 			seContext := ""
 			Eventually(func() string {
-				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Get(context.Background(), vmi.Name, &metav1.GetOptions{})
+				vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Get(context.Background(), vmi.Name, metav1.GetOptions{})
 				Expect(err).NotTo(HaveOccurred())
 				seContext = vmi.Status.SelinuxContext
 				return seContext
 			}, 30*time.Second, 10*time.Second).ShouldNot(BeEmpty(), "VMI SELinux context status never got set")
 
 			By("Ensuring the VMI SELinux context status matches the virt-launcher pod files")
-			stdout := tests.RunCommandOnVmiPod(vmi, []string{"ls", "-lZd", "/"})
+			stdout := libpod.RunCommandOnVmiPod(vmi, []string{"ls", "-lZd", "/"})
 			Expect(stdout).To(ContainSubstring(seContext))
 
 			By("Migrating the VMI")
-			migration := tests.NewRandomMigration(vmi.Name, vmi.Namespace)
+			migration := libmigration.New(vmi.Name, vmi.Namespace)
 			libmigration.RunMigrationAndExpectToCompleteWithDefaultTimeout(virtClient, migration)
 
 			By("Ensuring the VMI SELinux context status didn't change")
-			vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Get(context.Background(), vmi.Name, &metav1.GetOptions{})
+			vmi, err = virtClient.VirtualMachineInstance(testsuite.GetTestNamespace(nil)).Get(context.Background(), vmi.Name, metav1.GetOptions{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(vmi.Status.SelinuxContext).To(Equal(seContext))
 
@@ -358,7 +359,7 @@ var _ = Describe("[Serial][sig-compute]SecurityFeatures", Serial, decorators.Sig
 			Expect(pod.Spec.SecurityContext.SELinuxOptions.Level).To(Equal(strings.Join(ctx[3:], ":")))
 
 			By("Ensuring the target virt-launcher has the same SELinux context as the source")
-			stdout = tests.RunCommandOnVmiPod(vmi, []string{"ls", "-lZd", "/"})
+			stdout = libpod.RunCommandOnVmiPod(vmi, []string{"ls", "-lZd", "/"})
 			Expect(stdout).To(ContainSubstring(seContext))
 		})
 	})
@@ -371,7 +372,7 @@ func runOnAllSchedulableNodes(virtClient kubecli.KubevirtClient, command []strin
 		if err != nil {
 			return err
 		}
-		stdout, stderr, err := exec.ExecuteCommandOnPodWithResults(virtClient, pod, components.VirtHandlerName, command)
+		stdout, stderr, err := exec.ExecuteCommandOnPodWithResults(pod, components.VirtHandlerName, command)
 		if err != nil {
 			_, _ = GinkgoWriter.Write([]byte(stderr))
 			return err

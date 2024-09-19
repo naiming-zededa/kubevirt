@@ -9,13 +9,15 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 
 	"kubevirt.io/kubevirt/pkg/controller"
-	apimetrics "kubevirt.io/kubevirt/pkg/monitoring/api"
+	apimetrics "kubevirt.io/kubevirt/pkg/monitoring/metrics/virt-api"
 )
 
 func (app *SubresourceAPIApp) PortForwardRequestHandler(fetcher vmiFetcher) restful.RouteFunction {
 	return func(request *restful.Request, response *restful.Response) {
 		activeTunnelMetric := apimetrics.NewActivePortForwardTunnel(request.PathParameter("namespace"), request.PathParameter("name"))
 		defer activeTunnelMetric.Dec()
+
+		defer apimetrics.SetVMILastConnectionTimestamp(request.PathParameter("namespace"), request.PathParameter("name"))
 
 		streamer := NewWebsocketStreamer(
 			fetcher,

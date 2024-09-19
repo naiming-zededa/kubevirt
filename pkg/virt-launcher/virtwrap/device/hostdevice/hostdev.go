@@ -52,9 +52,30 @@ func CreatePCIHostDevices(hostDevicesData []HostDeviceMetaData, pciAddrPool Addr
 	return createHostDevices(hostDevicesData, pciAddrPool, createPCIHostDevice)
 }
 
+func isVgpuDisplaySet(hostDevicesData []HostDeviceMetaData) bool {
+	for _, hostDeviceData := range hostDevicesData {
+		if hostDeviceData.VirtualGPUOptions != nil &&
+			hostDeviceData.VirtualGPUOptions.Display != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func CreateMDEVHostDevices(hostDevicesData []HostDeviceMetaData, mdevAddrPool AddressPooler, enableDefaultDisplay bool) ([]api.HostDevice, error) {
 	if enableDefaultDisplay {
-		return createHostDevices(hostDevicesData, mdevAddrPool, createMDEVHostDeviceWithDisplay)
+		devices, err := createHostDevices(hostDevicesData, mdevAddrPool, createMDEVHostDeviceWithDisplay)
+		if err != nil {
+			return devices, err
+		}
+		// add a default single display option with enabled ramfb
+		// only if no vgpuDisplay option was configured.
+		if !isVgpuDisplaySet(hostDevicesData) && len(devices) > 0 {
+			devices[0].Display = "on"
+			devices[0].RamFB = "on"
+		}
+		return devices, nil
+
 	}
 	return createHostDevices(hostDevicesData, mdevAddrPool, createMDEVHostDevice)
 }
@@ -130,9 +151,6 @@ func createMDEVHostDeviceWithDisplay(hostDeviceData HostDeviceMetaData, mdevUUID
 				}
 			}
 		}
-	} else {
-		mdev.Display = "on"
-		mdev.RamFB = "on"
 	}
 	return mdev, nil
 }
@@ -160,7 +178,7 @@ func createUSBHostDevice(device HostDeviceMetaData, usbAddress string) (*api.Hos
 	bus, deviceNumber := strs[0], strs[1]
 
 	return &api.HostDevice{
-		Type:  "usb",
+		Type:  api.HostDeviceUSB,
 		Mode:  "subsystem",
 		Alias: api.NewUserDefinedAlias("usb-host-" + device.Name),
 		Source: api.HostDeviceSource{

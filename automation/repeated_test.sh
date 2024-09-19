@@ -176,7 +176,7 @@ fi
 # for some tests we need three nodes aka two nodes with cpu manager installed, thus we grep whether the skip is present
 KUBEVIRT_NUM_NODES=2
 # shellcheck disable=SC2046
-if grep -q 'SkipTestIfNotEnoughNodesWithCPUManager' $(echo "${NEW_TESTS}" | tr '|' ' '); then
+if grep -q 'RequiresTwoWorkerNodesWithCPUManager' $(echo "${NEW_TESTS}" | tr '|' ' '); then
     KUBEVIRT_NUM_NODES=3
 fi
 
@@ -192,10 +192,11 @@ export KUBEVIRT_NUM_SECONDARY_NICS=1
 export KUBEVIRT_STORAGE="rook-ceph-default"
 export KUBEVIRT_DEPLOY_NFS_CSI=true
 export KUBEVIRT_DEPLOY_PROMETHEUS=true
+export KUBEVIRT_DEPLOY_NET_BINDING_CNI=true
 
 export KUBEVIRT_PROVIDER="${TEST_LANE}"
 
-ginko_params="$ginko_params -no-color -succinct --label-filter=!QUARANTINE -randomize-all"
+ginko_params="$ginko_params -no-color -succinct --label-filter=(!QUARANTINE)&&(!exclude-native-ssh) -randomize-all"
 for test_file in $(echo "${NEW_TESTS}" | tr '|' '\n'); do
     ginko_params+=" -focus-file=${test_file}"
 done
@@ -206,6 +207,8 @@ if [[ ! "$ginko_params" =~ -dry-run ]]; then
     make cluster-up
     make cluster-sync
 else
+    # Ginkgo only performs -dryRun in serial mode.
+    export KUBEVIRT_E2E_PARALLEL="false"
     NUM_TESTS=1
 fi
 

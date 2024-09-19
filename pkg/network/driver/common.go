@@ -27,8 +27,6 @@ import (
 
 	"github.com/vishvananda/netlink"
 
-	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter"
-
 	netutils "k8s.io/utils/net"
 
 	v1 "kubevirt.io/api/core/v1"
@@ -121,7 +119,7 @@ func (h *NetworkUtilsHandler) HasIPv6GlobalUnicastAddress(interfaceName string) 
 func (h *NetworkUtilsHandler) IsIpv4Primary() (bool, error) {
 	podIP, exist := os.LookupEnv("MY_POD_IP")
 	if !exist {
-		return false, fmt.Errorf("MY_POD_IP doesnt exists")
+		return false, fmt.Errorf("MY_POD_IP doesn't exist")
 	}
 
 	return !netutils.IsIPv6String(podIP), nil
@@ -137,7 +135,7 @@ func (h *NetworkUtilsHandler) ReadIPAddressesFromLink(interfaceName string) (str
 	// get IP address
 	addrList, err := h.AddrList(link, netlink.FAMILY_ALL)
 	if err != nil {
-		log.Log.Reason(err).Errorf("failed to get a address for interface: %s", interfaceName)
+		log.Log.Reason(err).Errorf("failed to get an address for interface: %s", interfaceName)
 		return "", "", err
 	}
 
@@ -162,7 +160,7 @@ func (h *NetworkUtilsHandler) ReadIPAddressesFromLink(interfaceName string) (str
 
 func (h *NetworkUtilsHandler) StartDHCP(nic *cache.DHCPConfig, bridgeInterfaceName string, dhcpOptions *v1.DHCPOptions) error {
 	log.Log.V(4).Infof("StartDHCP network Nic: %+v", nic)
-	nameservers, searchDomains, err := converter.GetResolvConfDetailsFromPod()
+	nameservers, searchDomains, err := dns.GetResolvConfDetailsFromPod()
 	if err != nil {
 		return fmt.Errorf("Failed to get DNS servers from resolv.conf: %v", err)
 	}
@@ -189,7 +187,7 @@ func (h *NetworkUtilsHandler) StartDHCP(nic *cache.DHCPConfig, bridgeInterfaceNa
 				nic.Mtu,
 				dhcpOptions,
 			); err != nil {
-				log.Log.Errorf("failed to run DHCP: %v", err)
+				log.Log.Errorf("failed to run DHCP Server: %v", err)
 				panic(err)
 			}
 		}()
@@ -201,7 +199,7 @@ func (h *NetworkUtilsHandler) StartDHCP(nic *cache.DHCPConfig, bridgeInterfaceNa
 				nic.IPv6.IP,
 				bridgeInterfaceName,
 			); err != nil {
-				log.Log.Reason(err).Error("failed to run DHCPv6")
+				log.Log.Reason(err).Error("failed to run DHCPv6 Server")
 				panic(err)
 			}
 		}()

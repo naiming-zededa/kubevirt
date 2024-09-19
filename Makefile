@@ -1,7 +1,14 @@
 export GO15VENDOREXPERIMENT := 1
 
+ifeq (${CI}, true)
+  # If we're running under a test lane, enable timestamps and disable progress output
+  TIMESTAMP=1
+  ifeq (,$(wildcard ci.bazelrc))
+    $(shell echo 'build --noshow_progress' > ci.bazelrc)
+  endif
+endif
+
 ifeq (${TIMESTAMP}, 1)
-  $(info "Timestamp is enabled")
   SHELL = ./hack/timestamps.sh
 endif
 
@@ -45,10 +52,12 @@ gen-proto:
 	hack/dockerized "DOCKER_PREFIX=${DOCKER_PREFIX} DOCKER_TAG=${DOCKER_TAG} IMAGE_PULL_POLICY=${IMAGE_PULL_POLICY} VERBOSITY=${VERBOSITY} ./hack/gen-proto.sh"
 
 generate:
+	hack/dockerized hack/build-ginkgo.sh
 	hack/dockerized "DOCKER_PREFIX=${DOCKER_PREFIX} DOCKER_TAG=${DOCKER_TAG} IMAGE_PULL_POLICY=${IMAGE_PULL_POLICY} VERBOSITY=${VERBOSITY} ./hack/generate.sh"
 	SYNC_VENDOR=true hack/dockerized "./hack/bazel-generate.sh && hack/bazel-fmt.sh"
 	hack/dockerized hack/sync-kubevirtci.sh
 	hack/dockerized hack/sync-common-instancetypes.sh
+	./hack/update-generated-api-testdata.sh
 
 generate-verify: generate
 	./hack/verify-generate.sh
@@ -205,23 +214,44 @@ format:
 fmt: format
 
 lint:
-	if [ $$(wc -l < tests/utils.go) -gt 2813 ]; then echo >&2 "do not make tests/utils longer"; exit 1; fi
-
+	if [ $$(wc -l < tests/utils.go) -gt 1401 ]; then echo >&2 "do not make tests/utils longer"; exit 1; fi
 	hack/dockerized "golangci-lint run --timeout 20m --verbose \
 	  pkg/instancetype/... \
+	  pkg/libvmi/... \
+	  pkg/network/admitter/... \
 	  pkg/network/namescheme/... \
 	  pkg/network/domainspec/... \
-	  pkg/network/sriov/... \
+	  pkg/network/deviceinfo/... \
+	  pkg/network/pod/annotations/... \
+	  pkg/storage/pod/annotations/... \
+	  pkg/virtctl/credentials/... \
 	  tests/console/... \
+	  tests/instancetype/... \
+	  tests/libinstancetype/... \
 	  tests/libnet/... \
-	  tests/libvmi/... \
+	  tests/libnode/... \
+	  tests/libconfigmap/... \
+	  tests/libpod/... \
+	  tests/libvmifact/... \
+	  tests/libsecret/... \
+	  && \
+	  golangci-lint run --disable-all -E ginkgolinter --timeout 10m --verbose --no-config \
+	  ./pkg/... \
+	  ./tests/... \
 	"
+	hack/dockerized "monitoringlinter ./pkg/..."
 
 lint-metrics:
 	hack/dockerized "./hack/prom-metric-linter/metrics_collector.sh > metrics.json"
 	./hack/prom-metric-linter/metric_name_linter.sh --operator-name="kubevirt" --sub-operator-name="kubevirt" --metrics-file=metrics.json
 	rm metrics.json
 
+gofumpt:
+	./hack/dockerized "hack/gofumpt.sh"
+
+update-generated-api-testdata:
+	./hack/update-generated-api-testdata.sh
+    
 .PHONY: \
 	build-verify \
 	conformance \
@@ -258,5 +288,6 @@ lint-metrics:
 	format \
 	fmt \
 	lint \
-	lint-metrics\
+	lint-metrics \
+	update-generated-api-testdata \
 	$(NULL)

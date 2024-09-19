@@ -210,21 +210,20 @@ var _ = Describe("Virt remote commands", func() {
 		})
 
 		It("should return domain stats", func() {
-			var list []*stats.DomainStats
 			dom := api.NewMinimalDomain("testvmstats1")
-			list = append(list, &stats.DomainStats{
+			domainStats := &stats.DomainStats{
 				Name: dom.Spec.Name,
 				UUID: dom.Spec.UUID,
-			})
+			}
 
-			domainManager.EXPECT().GetDomainStats().Return(list, nil)
+			domainManager.EXPECT().GetDomainStats().Return(domainStats, nil)
 			domStats, exists, err := client.GetDomainStats()
 			Expect(err).ToNot(HaveOccurred())
 
 			Expect(exists).To(BeTrue())
 			Expect(domStats).ToNot(BeNil())
-			Expect(domStats.Name).To(Equal(list[0].Name))
-			Expect(domStats.UUID).To(Equal(list[0].UUID))
+			Expect(domStats.Name).To(Equal(domainStats.Name))
+			Expect(domStats.UUID).To(Equal(domainStats.UUID))
 		})
 
 		It("should return full user list", func() {
@@ -249,6 +248,12 @@ var _ = Describe("Virt remote commands", func() {
 					FileSystemType: "EXT4",
 					UsedBytes:      3333,
 					TotalBytes:     9999,
+					Disk: []v1.VirtualMachineInstanceFileSystemDisk{
+						{
+							BusType: "scsi",
+							Serial:  "testserial-1234",
+						},
+					},
 				},
 			}
 
@@ -261,16 +266,16 @@ var _ = Describe("Virt remote commands", func() {
 
 		It("should finalize VM migration", func() {
 			vmi := v1.NewVMIReferenceFromName("testvmi")
-			domainManager.EXPECT().FinalizeVirtualMachineMigration(vmi).Return(nil)
+			domainManager.EXPECT().FinalizeVirtualMachineMigration(vmi, &cmdv1.VirtualMachineOptions{}).Return(nil)
 
-			Expect(client.FinalizeVirtualMachineMigration(vmi)).Should(Succeed())
+			Expect(client.FinalizeVirtualMachineMigration(vmi, &cmdv1.VirtualMachineOptions{})).Should(Succeed())
 		})
 
 		It("should fail to finalize VM migration", func() {
 			vmi := v1.NewVMIReferenceFromName("testvmi")
-			domainManager.EXPECT().FinalizeVirtualMachineMigration(vmi).Return(errors.New("error"))
+			domainManager.EXPECT().FinalizeVirtualMachineMigration(vmi, &cmdv1.VirtualMachineOptions{}).Return(errors.New("error"))
 
-			Expect(client.FinalizeVirtualMachineMigration(vmi)).ToNot(Succeed())
+			Expect(client.FinalizeVirtualMachineMigration(vmi, &cmdv1.VirtualMachineOptions{})).ToNot(Succeed())
 		})
 
 		It("should get the qemu version", func() {
